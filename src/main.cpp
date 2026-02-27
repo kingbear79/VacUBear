@@ -23,6 +23,11 @@ static const uint32_t SHOW_LENGTH_MIN_MS = 1000UL;
 static const uint32_t SHOW_LENGTH_MAX_MS = 3600000UL;
 static const uint32_t SHOW_NACHLAUF_MIN_MS = 0UL;
 static const uint32_t SHOW_NACHLAUF_MAX_MS = 3600000UL;
+static const uint16_t PUMP_PWM_MAX = 1023;
+static const uint16_t PUMP_PWM_FREQ_HZ = 1000;
+static const uint32_t PUMP_SOFTSTART_MS = 2500UL;
+static const uint32_t PUMP_SOFTSTOP_MS = 1200UL;
+static const uint32_t PUMP_PWM_UPDATE_MS = 20UL;
 
 static const char *CONFIG_FILE = "/config.json";
 static const char *DEVICE_PREFIX = "vacubear";
@@ -82,6 +87,18 @@ public:
   }
 };
 
+struct PumpSoftControl
+{
+  uint16_t currentPwm;
+  uint16_t targetPwm;
+  unsigned long lastUpdateAt;
+
+  PumpSoftControl()
+      : currentPwm(0), targetPwm(0), lastUpdateAt(0)
+  {
+  }
+};
+
 Button button(TASTER, 25, true);
 ShowStatus showStatus;
 AppConfig config;
@@ -105,10 +122,15 @@ String topicShowState;
 String topicLightSet;
 String topicLightState;
 String topicAvailability;
+PumpSoftControl pumpControl;
 
 void startShow(void);
 void stopShow(void);
 void handleShow(void);
+void setupPumpControl(void);
+void setPumpTarget(bool enabled);
+void updatePumpControl(void);
+void applyPumpPwm(uint16_t pwm);
 void setupWiFi(void);
 void setupWebServer(void);
 void setupMqtt(void);
@@ -148,8 +170,7 @@ void setup()
   pinMode(PUMPE1, OUTPUT);
   pinMode(PUMPE2, OUTPUT);
   pinMode(VENTIL, OUTPUT);
-  digitalWrite(PUMPE1, LOW);
-  digitalWrite(PUMPE2, LOW);
+  setupPumpControl();
   digitalWrite(VENTIL, LOW);
 
   button.begin();
@@ -185,6 +206,7 @@ void loop()
   }
 
   handleShow();
+  updatePumpControl();
 
   if (showStatus.isRunning != lastShowRunningState)
   {
@@ -255,31 +277,93 @@ void handleShow()
   {
     if (millis() < showStatus.endAt)
     {
-      digitalWrite(PUMPE1, HIGH);
-      digitalWrite(PUMPE2, HIGH);
+      setPumpTarget(true);
       digitalWrite(VENTIL, HIGH);
     }
     else if (millis() < showStatus.openValveAt)
     {
-      digitalWrite(PUMPE1, LOW);
-      digitalWrite(PUMPE2, LOW);
+      setPumpTarget(false);
       digitalWrite(VENTIL, HIGH);
     }
     else
     {
-      digitalWrite(PUMPE1, LOW);
-      digitalWrite(PUMPE2, LOW);
+      setPumpTarget(false);
       digitalWrite(VENTIL, LOW);
       showStatus.isRunning = false;
     }
   }
   else
   {
-    digitalWrite(PUMPE1, LOW);
-    digitalWrite(PUMPE2, LOW);
+    setPumpTarget(false);
     digitalWrite(VENTIL, LOW);
     showStatus.isRunning = false;
   }
+}
+
+void setupPumpControl()
+{
+  analogWriteRange(PUMP_PWM_MAX);
+  analogWriteFreq(PUMP_PWM_FREQ_HZ);
+  applyPumpPwm(0);
+}
+
+void setPumpTarget(bool enabled)
+{
+  pumpControl.targetPwm = enabled ? PUMP_PWM_MAX : 0;
+}
+
+void updatePumpControl()
+{
+  unsigned long now = millis();
+  if (now - pumpControl.lastUpdateAt < PUMP_PWM_UPDATE_MS)
+  {
+    return;
+  }
+  pumpControl.lastUpdateAt = now;
+
+  if (pumpControl.currentPwm == pumpControl.targetPwm)
+  {
+    return;
+  }
+
+  uint16_t upStep = (uint16_t)(((uint32_t)PUMP_PWM_MAX * PUMP_PWM_UPDATE_MS + PUMP_SOFTSTART_MS - 1) / PUMP_SOFTSTART_MS);
+  if (upStep == 0)
+  {
+    upStep = 1;
+  }
+
+  uint16_t downStep = (uint16_t)(((uint32_t)PUMP_PWM_MAX * PUMP_PWM_UPDATE_MS + PUMP_SOFTSTOP_MS - 1) / PUMP_SOFTSTOP_MS);
+  if (downStep == 0)
+  {
+    downStep = 1;
+  }
+
+  if (pumpControl.currentPwm < pumpControl.targetPwm)
+  {
+    uint32_t next = pumpControl.currentPwm + upStep;
+    if (next > pumpControl.targetPwm)
+    {
+      next = pumpControl.targetPwm;
+    }
+    pumpControl.currentPwm = (uint16_t)next;
+  }
+  else
+  {
+    int32_t next = (int32_t)pumpControl.currentPwm - downStep;
+    if (next < (int32_t)pumpControl.targetPwm)
+    {
+      next = pumpControl.targetPwm;
+    }
+    pumpControl.currentPwm = (uint16_t)next;
+  }
+
+  applyPumpPwm(pumpControl.currentPwm);
+}
+
+void applyPumpPwm(uint16_t pwm)
+{
+  analogWrite(PUMPE1, pwm);
+  analogWrite(PUMPE2, pwm);
 }
 
 void setupMqtt()
@@ -723,6 +807,8 @@ void handleStatus()
   status["show_running"] = showStatus.isRunning;
   status["show_length"] = config.showLengthMs;
   status["show_nachlauf"] = config.showNachlaufMs;
+  status["pump_pwm"] = pumpControl.currentPwm;
+  status["pump_target_pwm"] = pumpControl.targetPwm;
 
   JsonObject color = status["light"].to<JsonObject>();
   color["r"] = config.lightR;
