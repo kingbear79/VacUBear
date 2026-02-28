@@ -657,16 +657,23 @@ bool otaCheckForUpdate(const char *reason)
   }
 
   otaStatus.checkInProgress = true;
-  LOGI("OTA check (%s): %s", reason, config.otaManifestUrl.c_str());
+  String requestUrl = config.otaManifestUrl;
+  requestUrl += requestUrl.indexOf('?') >= 0 ? "&nocache=" : "?nocache=";
+  requestUrl += String(millis());
+  LOGI("OTA check (%s): %s", reason, requestUrl.c_str());
 
   BearSSL::WiFiClientSecure secureClient;
   secureClient.setInsecure();
 
   HTTPClient http;
   http.setTimeout(OTA_HTTP_TIMEOUT_MS);
+  http.setReuse(false);
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  http.addHeader("Cache-Control", "no-cache, no-store, max-age=0");
+  http.addHeader("Pragma", "no-cache");
+  http.addHeader("User-Agent", "VacUBear-OTA");
 
-  if (!http.begin(secureClient, config.otaManifestUrl))
+  if (!http.begin(secureClient, requestUrl))
   {
     otaStatus.lastError = "Manifest-Request konnte nicht gestartet werden";
     otaStatus.checkInProgress = false;
@@ -687,6 +694,13 @@ bool otaCheckForUpdate(const char *reason)
 
   String payload = http.getString();
   http.end();
+  String payloadPreview = payload;
+  payloadPreview.replace('\n', ' ');
+  if (payloadPreview.length() > 220)
+  {
+    payloadPreview = payloadPreview.substring(0, 220) + "...";
+  }
+  LOGI("OTA manifest preview: %s", payloadPreview.c_str());
 
   StaticJsonDocument<1024> doc;
   DeserializationError err = deserializeJson(doc, payload);
