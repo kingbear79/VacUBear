@@ -242,6 +242,7 @@ bool handleCaptivePortalRedirect(void);
 String htmlEscape(const String &input);
 String buildHtmlPage(const String &message = "");
 bool isIpAddress(const String &host);
+bool isLegacyOtaManifestUrl(const String &url);
 String defaultApSsid(void);
 String defaultDeviceId(void);
 uint32_t clampU32(uint32_t value, uint32_t minValue, uint32_t maxValue);
@@ -503,50 +504,85 @@ void setSafeOutputState()
   digitalWrite(VENTIL, LOW);
 }
 
-static uint32_t parseVersionPart(const String &version, int &index)
+static bool isDigitChar(char c)
 {
-  while (index < (int)version.length())
+  return c >= '0' && c <= '9';
+}
+
+static size_t extractVersionNumbers(const String &version, uint32_t *outParts, size_t maxParts)
+{
+  size_t count = 0;
+  int index = 0;
+  int len = (int)version.length();
+
+  while (index < len && count < maxParts)
   {
-    char c = version[index];
-    if (c >= '0' && c <= '9')
+    while (index < len && !isDigitChar(version[index]))
+    {
+      index++;
+    }
+    if (index >= len)
     {
       break;
     }
-    index++;
-  }
 
-  uint32_t value = 0;
-  while (index < (int)version.length())
-  {
-    char c = version[index];
-    if (c < '0' || c > '9')
+    uint32_t value = 0;
+    while (index < len && isDigitChar(version[index]))
     {
-      break;
+      value = (value * 10UL) + (uint32_t)(version[index] - '0');
+      index++;
     }
-    value = (value * 10UL) + (uint32_t)(c - '0');
-    index++;
+    outParts[count++] = value;
   }
 
-  while (index < (int)version.length() && version[index] != '.')
+  return count;
+}
+
+static int versionQualifierRank(const String &version)
+{
+  String lower = version;
+  lower.toLowerCase();
+
+  int separatorPos = lower.indexOf('-');
+  if (separatorPos < 0)
   {
-    index++;
-  }
-  if (index < (int)version.length() && version[index] == '.')
-  {
-    index++;
+    return 4;
   }
 
-  return value;
+  if (lower.indexOf("rc", separatorPos) >= 0)
+  {
+    return 3;
+  }
+  if (lower.indexOf("beta", separatorPos) >= 0)
+  {
+    return 2;
+  }
+  if (lower.indexOf("alpha", separatorPos) >= 0)
+  {
+    return 1;
+  }
+  if (lower.indexOf("dev", separatorPos) >= 0 || lower.indexOf("snapshot", separatorPos) >= 0)
+  {
+    return 0;
+  }
+
+  // Unknown prerelease tag stays below stable.
+  return 0;
 }
 
 int compareVersionStrings(const String &lhs, const String &rhs)
 {
-  int leftIndex = 0;
-  int rightIndex = 0;
-  for (int i = 0; i < 4; i++)
+  const size_t MAX_PARTS = 8;
+  uint32_t leftParts[MAX_PARTS] = {0};
+  uint32_t rightParts[MAX_PARTS] = {0};
+  size_t leftCount = extractVersionNumbers(lhs, leftParts, MAX_PARTS);
+  size_t rightCount = extractVersionNumbers(rhs, rightParts, MAX_PARTS);
+  size_t count = leftCount > rightCount ? leftCount : rightCount;
+
+  for (size_t i = 0; i < count; i++)
   {
-    uint32_t leftValue = parseVersionPart(lhs, leftIndex);
-    uint32_t rightValue = parseVersionPart(rhs, rightIndex);
+    uint32_t leftValue = i < leftCount ? leftParts[i] : 0;
+    uint32_t rightValue = i < rightCount ? rightParts[i] : 0;
     if (leftValue < rightValue)
     {
       return -1;
@@ -556,6 +592,27 @@ int compareVersionStrings(const String &lhs, const String &rhs)
       return 1;
     }
   }
+
+  int leftRank = versionQualifierRank(lhs);
+  int rightRank = versionQualifierRank(rhs);
+  if (leftRank < rightRank)
+  {
+    return -1;
+  }
+  if (leftRank > rightRank)
+  {
+    return 1;
+  }
+
+  int textCmp = lhs.compareTo(rhs);
+  if (textCmp < 0)
+  {
+    return -1;
+  }
+  if (textCmp > 0)
+  {
+    return 1;
+  }
   return 0;
 }
 
@@ -564,9 +621,14 @@ void updateOtaDerivedState(const String &latestVersion, const String &firmwareUr
   otaStatus.latestVersion = latestVersion;
   otaStatus.firmwareUrl = firmwareUrl;
   otaStatus.releaseNotes = releaseNotes;
+  int versionCmp = compareVersionStrings(otaStatus.currentVersion, latestVersion);
   otaStatus.updateAvailable = latestVersion.length() > 0 &&
                               firmwareUrl.length() > 0 &&
-                              compareVersionStrings(otaStatus.currentVersion, latestVersion) < 0;
+                              versionCmp < 0;
+  LOGI("OTA compare: current=%s latest=%s cmp=%d",
+       otaStatus.currentVersion.c_str(),
+       latestVersion.c_str(),
+       versionCmp);
 }
 
 bool otaCheckForUpdate(const char *reason)
@@ -661,9 +723,10 @@ bool otaCheckForUpdate(const char *reason)
   otaStatus.checkInProgress = false;
   otaStatus.lastError = "";
 
-  LOGI("OTA check done: current=%s latest=%s available=%s",
+  LOGI("OTA check done: current=%s latest=%s fw=%s available=%s",
        otaStatus.currentVersion.c_str(),
        otaStatus.latestVersion.c_str(),
+       otaStatus.firmwareUrl.c_str(),
        otaStatus.updateAvailable ? "yes" : "no");
 
   if (mqttClient.connected())
@@ -1576,7 +1639,7 @@ void handleSave()
   config.mqttPassword.trim();
   config.mqttTopic.trim();
   config.otaManifestUrl.trim();
-  if (config.otaManifestUrl.length() == 0)
+  if (config.otaManifestUrl.length() == 0 || isLegacyOtaManifestUrl(config.otaManifestUrl))
   {
     config.otaManifestUrl = String(OTA_MANIFEST_URL);
   }
@@ -1646,6 +1709,7 @@ void handleOtaStatus()
   LOGD("HTTP GET /ota/status");
   StaticJsonDocument<768> status;
   status["configured"] = config.otaManifestUrl.length() > 0;
+  status["manifest_url"] = config.otaManifestUrl;
   status["wifi_connected"] = WiFi.status() == WL_CONNECTED;
   status["current_version"] = otaStatus.currentVersion;
   status["latest_version"] = otaStatus.latestVersion;
@@ -1824,7 +1888,7 @@ void loadConfig()
   config.mqttPassword.trim();
   config.mqttTopic.trim();
   config.otaManifestUrl.trim();
-  if (config.otaManifestUrl.length() == 0)
+  if (config.otaManifestUrl.length() == 0 || isLegacyOtaManifestUrl(config.otaManifestUrl))
   {
     config.otaManifestUrl = String(OTA_MANIFEST_URL);
   }
@@ -1950,6 +2014,14 @@ bool isIpAddress(const String &host)
     }
   }
   return true;
+}
+
+bool isLegacyOtaManifestUrl(const String &url)
+{
+  String normalized = url;
+  normalized.trim();
+  normalized.toLowerCase();
+  return normalized.endsWith("/releases/latest/download/manifest.json");
 }
 
 String defaultApSsid()
@@ -2148,6 +2220,7 @@ function renderOta(status) {
   if (!el) return;
   let text = '';
   text += 'Konfiguriert: ' + (status.configured ? 'ja' : 'nein') + '<br>';
+  text += 'Manifest URL: ' + (status.manifest_url || '-') + '<br>';
   text += 'WLAN verbunden: ' + (status.wifi_connected ? 'ja' : 'nein') + '<br>';
   text += 'Aktuell: ' + (status.current_version || '-') + '<br>';
   text += 'Neueste Version: ' + (status.latest_version || '-') + '<br>';
