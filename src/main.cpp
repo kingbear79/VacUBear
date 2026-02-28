@@ -9,6 +9,9 @@
 #include <WiFiClientSecureBearSSL.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#if LED_COUNT > 0
+#include <NeoPixelBus.h>
+#endif
 
 #ifndef ENABLE_SERIAL_LOG
 #define ENABLE_SERIAL_LOG 0
@@ -40,6 +43,26 @@
 #define OTA_MANIFEST_URL ""
 #endif
 
+#ifndef LED_COUNT
+#define LED_COUNT 0
+#endif
+
+#ifndef LED_PIN
+#define LED_PIN D1
+#endif
+
+#ifndef LED_FADE_IN_MS
+#define LED_FADE_IN_MS 1200UL
+#endif
+
+#ifndef LED_FADE_OUT_MS
+#define LED_FADE_OUT_MS 1200UL
+#endif
+
+#ifndef LED_AFTER_BELUEFTEN_MS
+#define LED_AFTER_BELUEFTEN_MS 5000UL
+#endif
+
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000UL;
 static const uint32_t WIFI_RETRY_INTERVAL_MS = 30000UL;
 static const uint32_t MQTT_RECONNECT_INTERVAL_MS = 5000UL;
@@ -58,10 +81,17 @@ static const uint16_t PUMP_PWM_FREQ_HZ = 1000;
 static const uint32_t PUMP_SOFTSTART_MS = 2500UL;
 static const uint32_t PUMP_SOFTSTOP_MS = 1200UL;
 static const uint32_t PUMP_PWM_UPDATE_MS = 20UL;
+static const uint16_t LIGHT_LEVEL_MAX = 1023;
+static const uint32_t LIGHT_UPDATE_MS = 20UL;
 static const uint32_t TELEMETRY_INTERVAL_MS = 10000UL;
 
 static const char *CONFIG_FILE = "/config.json";
 static const char *DEVICE_PREFIX = "vacubear";
+#if LED_COUNT > 0
+static const bool HAS_LED_OUTPUT = true;
+#else
+static const bool HAS_LED_OUTPUT = false;
+#endif
 
 struct AppConfig
 {
@@ -132,6 +162,32 @@ struct PumpSoftControl
   }
 };
 
+struct LightSoftControl
+{
+  uint16_t currentLevel;
+  uint16_t targetLevel;
+  unsigned long onUntilAt;
+  unsigned long lastUpdateAt;
+  uint8_t lastR;
+  uint8_t lastG;
+  uint8_t lastB;
+  uint8_t lastW;
+  bool outputInitialized;
+
+  LightSoftControl()
+      : currentLevel(0),
+        targetLevel(0),
+        onUntilAt(0),
+        lastUpdateAt(0),
+        lastR(0),
+        lastG(0),
+        lastB(0),
+        lastW(0),
+        outputInitialized(false)
+  {
+  }
+};
+
 struct OtaStatus
 {
   String currentVersion;
@@ -191,10 +247,14 @@ String topicCfgNachlaufState;
 String topicAvailability;
 String topicTeleState;
 PumpSoftControl pumpControl;
+LightSoftControl lightControl;
 OtaStatus otaStatus;
 bool otaCheckRequested = false;
 bool otaUpdateRequested = false;
 bool otaBootCheckPending = true;
+#if LED_COUNT > 0
+NeoPixelBus<NeoGrbwFeature, NeoEsp8266BitBang800KbpsMethod> lightBus(LED_COUNT, LED_PIN);
+#endif
 
 void startShow(void);
 void stopShow(void);
@@ -203,6 +263,10 @@ void setupPumpControl(void);
 void setPumpTarget(bool enabled);
 void updatePumpControl(void);
 void applyPumpPwm(uint16_t pwm);
+void setupLightControl(void);
+void updateLightControl(void);
+void setLightTargetLevel(uint16_t level);
+void applyLightOutput(bool force = false);
 void otaLoop(void);
 bool otaCheckForUpdate(const char *reason);
 bool otaApplyUpdate(void);
@@ -262,6 +326,7 @@ void setup()
   pinMode(PUMPE2, OUTPUT);
   pinMode(VENTIL, OUTPUT);
   setupPumpControl();
+  setupLightControl();
   digitalWrite(VENTIL, LOW);
 
   button.begin();
@@ -306,6 +371,7 @@ void loop()
 
   handleShow();
   updatePumpControl();
+  updateLightControl();
 
 #if ENABLE_SERIAL_LOG
   const char *phase = getShowPhase();
@@ -379,8 +445,11 @@ void stopShow()
     return;
   }
   LOGI("stopShow requested");
-  showStatus.endAt = millis() + 10;
-  showStatus.openValveAt = millis() + 10;
+  unsigned long stopAt = millis() + 10;
+  showStatus.endAt = stopAt;
+  showStatus.openValveAt = stopAt;
+  lightControl.onUntilAt = showStatus.openValveAt + LED_AFTER_BELUEFTEN_MS;
+  LOGD("Light hold updated after stop: onUntilAt=%lu", lightControl.onUntilAt);
 }
 
 void handleShow()
@@ -391,7 +460,10 @@ void handleShow()
     showStatus.openValveAt = showStatus.endAt + showStatus.showNachlauf;
     showStatus.shouldStart = false;
     showStatus.isRunning = true;
+    lightControl.onUntilAt = showStatus.openValveAt + LED_AFTER_BELUEFTEN_MS;
+    setLightTargetLevel(LIGHT_LEVEL_MAX);
     LOGI("Show started: Vakuumieren=%lu ms, Haltezeit=%lu ms", showStatus.showDuration, showStatus.showNachlauf);
+    LOGD("Light hold until %lu", lightControl.onUntilAt);
   }
 
   if (showStatus.isRunning)
@@ -494,6 +566,133 @@ void applyPumpPwm(uint16_t pwm)
   analogWrite(PUMPE2, pwm);
 }
 
+void setupLightControl()
+{
+  lightControl.currentLevel = 0;
+  lightControl.targetLevel = 0;
+  lightControl.onUntilAt = 0;
+  lightControl.lastUpdateAt = 0;
+  lightControl.outputInitialized = false;
+
+#if LED_COUNT > 0
+  lightBus.Begin();
+  lightBus.ClearTo(RgbwColor(0, 0, 0, 0));
+  lightBus.Show();
+  lightControl.outputInitialized = true;
+  LOGI("Light output configured: count=%u pin=%d", (unsigned int)LED_COUNT, (int)LED_PIN);
+#else
+  LOGI("Light output disabled: LED_COUNT=0");
+#endif
+}
+
+void setLightTargetLevel(uint16_t level)
+{
+  if (level > LIGHT_LEVEL_MAX)
+  {
+    level = LIGHT_LEVEL_MAX;
+  }
+  if (level != lightControl.targetLevel)
+  {
+    lightControl.targetLevel = level;
+    LOGD("Light target level -> %u", lightControl.targetLevel);
+  }
+}
+
+void applyLightOutput(bool force)
+{
+#if LED_COUNT > 0
+  if (!HAS_LED_OUTPUT || !lightControl.outputInitialized)
+  {
+    return;
+  }
+
+  uint8_t scaledR = (uint8_t)(((uint32_t)config.lightR * lightControl.currentLevel + (LIGHT_LEVEL_MAX / 2)) / LIGHT_LEVEL_MAX);
+  uint8_t scaledG = (uint8_t)(((uint32_t)config.lightG * lightControl.currentLevel + (LIGHT_LEVEL_MAX / 2)) / LIGHT_LEVEL_MAX);
+  uint8_t scaledB = (uint8_t)(((uint32_t)config.lightB * lightControl.currentLevel + (LIGHT_LEVEL_MAX / 2)) / LIGHT_LEVEL_MAX);
+  uint8_t scaledW = (uint8_t)(((uint32_t)config.lightW * lightControl.currentLevel + (LIGHT_LEVEL_MAX / 2)) / LIGHT_LEVEL_MAX);
+
+  if (!force &&
+      scaledR == lightControl.lastR &&
+      scaledG == lightControl.lastG &&
+      scaledB == lightControl.lastB &&
+      scaledW == lightControl.lastW)
+  {
+    return;
+  }
+
+  RgbwColor outColor(scaledR, scaledG, scaledB, scaledW);
+  for (uint16_t i = 0; i < LED_COUNT; i++)
+  {
+    lightBus.SetPixelColor(i, outColor);
+  }
+  lightBus.Show();
+
+  lightControl.lastR = scaledR;
+  lightControl.lastG = scaledG;
+  lightControl.lastB = scaledB;
+  lightControl.lastW = scaledW;
+#else
+  (void)force;
+#endif
+}
+
+void updateLightControl()
+{
+  unsigned long now = millis();
+  bool lightWindowActive = showStatus.isRunning;
+  if (!lightWindowActive && lightControl.onUntilAt > 0)
+  {
+    lightWindowActive = (int32_t)(lightControl.onUntilAt - now) > 0;
+  }
+
+  setLightTargetLevel(lightWindowActive ? LIGHT_LEVEL_MAX : 0);
+
+  if (now - lightControl.lastUpdateAt < LIGHT_UPDATE_MS)
+  {
+    return;
+  }
+  lightControl.lastUpdateAt = now;
+
+  if (lightControl.currentLevel == lightControl.targetLevel)
+  {
+    applyLightOutput(false);
+    return;
+  }
+
+  uint16_t upStep = (uint16_t)(((uint32_t)LIGHT_LEVEL_MAX * LIGHT_UPDATE_MS + LED_FADE_IN_MS - 1) / LED_FADE_IN_MS);
+  if (upStep == 0)
+  {
+    upStep = 1;
+  }
+
+  uint16_t downStep = (uint16_t)(((uint32_t)LIGHT_LEVEL_MAX * LIGHT_UPDATE_MS + LED_FADE_OUT_MS - 1) / LED_FADE_OUT_MS);
+  if (downStep == 0)
+  {
+    downStep = 1;
+  }
+
+  if (lightControl.currentLevel < lightControl.targetLevel)
+  {
+    uint32_t next = lightControl.currentLevel + upStep;
+    if (next > lightControl.targetLevel)
+    {
+      next = lightControl.targetLevel;
+    }
+    lightControl.currentLevel = (uint16_t)next;
+  }
+  else
+  {
+    int32_t next = (int32_t)lightControl.currentLevel - downStep;
+    if (next < (int32_t)lightControl.targetLevel)
+    {
+      next = lightControl.targetLevel;
+    }
+    lightControl.currentLevel = (uint16_t)next;
+  }
+
+  applyLightOutput(false);
+}
+
 void setSafeOutputState()
 {
   showStatus.shouldStart = false;
@@ -501,6 +700,10 @@ void setSafeOutputState()
   setPumpTarget(false);
   pumpControl.currentPwm = 0;
   applyPumpPwm(0);
+  lightControl.onUntilAt = 0;
+  lightControl.currentLevel = 0;
+  lightControl.targetLevel = 0;
+  applyLightOutput(true);
   digitalWrite(VENTIL, LOW);
 }
 
@@ -1153,6 +1356,7 @@ void publishDiscovery()
   lightCfg["payload_off"] = "OFF";
   lightCfg["rgbw_command_topic"] = topicLightRgbwSet;
   lightCfg["rgbw_state_topic"] = topicLightRgbwState;
+  lightCfg["enabled_by_default"] = HAS_LED_OUTPUT;
   JsonArray colorModes = lightCfg["supported_color_modes"].to<JsonArray>();
   colorModes.add("rgbw");
   lightCfg["availability_topic"] = topicAvailability;
@@ -1452,6 +1656,13 @@ void publishTelemetry(bool force)
   licht["B"] = config.lightB;
   licht["W"] = config.lightW;
 
+  JsonObject led = doc["LED"].to<JsonObject>();
+  led["Enabled"] = HAS_LED_OUTPUT;
+  led["Count"] = LED_COUNT;
+  led["Level"] = lightControl.currentLevel;
+  led["TargetLevel"] = lightControl.targetLevel;
+  led["OnUntilAt"] = lightControl.onUntilAt;
+
   JsonObject ota = doc["OTA"].to<JsonObject>();
   ota["CurrentVersion"] = otaStatus.currentVersion;
   ota["LatestVersion"] = otaStatus.latestVersion;
@@ -1694,6 +1905,11 @@ void handleStatus()
   status["show_nachlauf"] = config.showNachlaufMs;
   status["pump_pwm"] = pumpControl.currentPwm;
   status["pump_target_pwm"] = pumpControl.targetPwm;
+  status["light_enabled"] = HAS_LED_OUTPUT;
+  status["led_count"] = LED_COUNT;
+  status["light_level"] = lightControl.currentLevel;
+  status["light_target_level"] = lightControl.targetLevel;
+  status["light_on_until_at"] = lightControl.onUntilAt;
 
   JsonObject color = status["light"].to<JsonObject>();
   color["r"] = config.lightR;

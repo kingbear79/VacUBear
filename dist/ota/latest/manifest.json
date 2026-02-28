@@ -1,5 +1,5 @@
 {
-  "version": "0.0.2-dev",
+  "version": "0.0.3-dev",
   "firmware_url": "https://raw.githubusercontent.com/kingbear79/VacUBear/master/dist/ota/latest/firmware.bin",
-  "notes": "Commit 6649a1e6cd54"
+  "notes": "Commit bbfb0674d89c"
 }
