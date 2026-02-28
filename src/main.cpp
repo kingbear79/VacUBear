@@ -669,9 +669,6 @@ bool otaCheckForUpdate(const char *reason)
   http.setTimeout(OTA_HTTP_TIMEOUT_MS);
   http.setReuse(false);
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
-  http.addHeader("Cache-Control", "no-cache, no-store, max-age=0");
-  http.addHeader("Pragma", "no-cache");
-  http.addHeader("User-Agent", "VacUBear-OTA");
 
   if (!http.begin(secureClient, requestUrl))
   {
