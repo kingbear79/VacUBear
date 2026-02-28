@@ -4,6 +4,9 @@
 #include <ESP8266WebServer.h>
 #include <DNSServer.h>
 #include <LittleFS.h>
+#include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
+#include <WiFiClientSecureBearSSL.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 
@@ -29,10 +32,20 @@
 #define SHOW_LENGTH 50000UL
 #define SHOW_NACHLAUF 50000UL
 
+#ifndef FW_VERSION
+#define FW_VERSION "0.0.0-dev"
+#endif
+
+#ifndef OTA_MANIFEST_URL
+#define OTA_MANIFEST_URL ""
+#endif
+
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000UL;
 static const uint32_t WIFI_RETRY_INTERVAL_MS = 30000UL;
 static const uint32_t MQTT_RECONNECT_INTERVAL_MS = 5000UL;
 static const uint32_t CONFIG_SAVE_DELAY_MS = 2000UL;
+static const uint32_t OTA_CHECK_INTERVAL_MS = 3600000UL;
+static const uint32_t OTA_HTTP_TIMEOUT_MS = 12000UL;
 // Developer limits (not user editable)
 static const uint32_t SHOW_LENGTH_MIN_S = 10UL;
 static const uint32_t SHOW_LENGTH_MAX_S = 60UL;
@@ -59,6 +72,7 @@ struct AppConfig
   String mqttUser;
   String mqttPassword;
   String mqttTopic;
+  String otaManifestUrl;
   uint32_t showLengthMs;
   uint32_t showNachlaufMs;
   uint8_t lightR;
@@ -74,6 +88,7 @@ struct AppConfig
         mqttUser(""),
         mqttPassword(""),
         mqttTopic(""),
+        otaManifestUrl(OTA_MANIFEST_URL),
         showLengthMs(SHOW_LENGTH),
         showNachlaufMs(SHOW_NACHLAUF),
         lightR(255),
@@ -117,6 +132,32 @@ struct PumpSoftControl
   }
 };
 
+struct OtaStatus
+{
+  String currentVersion;
+  String latestVersion;
+  String firmwareUrl;
+  String releaseNotes;
+  String lastError;
+  bool updateAvailable;
+  bool checkInProgress;
+  bool updateInProgress;
+  unsigned long lastCheckAt;
+
+  OtaStatus()
+      : currentVersion(FW_VERSION),
+        latestVersion(""),
+        firmwareUrl(""),
+        releaseNotes(""),
+        lastError(""),
+        updateAvailable(false),
+        checkInProgress(false),
+        updateInProgress(false),
+        lastCheckAt(0)
+  {
+  }
+};
+
 Button button(TASTER, 25, true);
 ShowStatus showStatus;
 AppConfig config;
@@ -150,6 +191,10 @@ String topicCfgNachlaufState;
 String topicAvailability;
 String topicTeleState;
 PumpSoftControl pumpControl;
+OtaStatus otaStatus;
+bool otaCheckRequested = false;
+bool otaUpdateRequested = false;
+bool otaBootCheckPending = true;
 
 void startShow(void);
 void stopShow(void);
@@ -158,6 +203,12 @@ void setupPumpControl(void);
 void setPumpTarget(bool enabled);
 void updatePumpControl(void);
 void applyPumpPwm(uint16_t pwm);
+void otaLoop(void);
+bool otaCheckForUpdate(const char *reason);
+bool otaApplyUpdate(void);
+void setSafeOutputState(void);
+int compareVersionStrings(const String &lhs, const String &rhs);
+void updateOtaDerivedState(const String &latestVersion, const String &firmwareUrl, const String &releaseNotes);
 void setupWiFi(void);
 void setupWebServer(void);
 void setupMqtt(void);
@@ -184,6 +235,9 @@ void handleRoot(void);
 void handleSave(void);
 void handleNotFound(void);
 void handleStatus(void);
+void handleOtaStatus(void);
+void handleOtaCheck(void);
+void handleOtaUpdate(void);
 bool handleCaptivePortalRedirect(void);
 String htmlEscape(const String &input);
 String buildHtmlPage(const String &message = "");
@@ -201,6 +255,7 @@ void setup()
 {
   Serial.begin(115200);
   LOGI("Booting VacUBear firmware");
+  otaStatus.currentVersion = String(FW_VERSION);
 
   pinMode(PUMPE1, OUTPUT);
   pinMode(PUMPE2, OUTPUT);
@@ -221,6 +276,12 @@ void setup()
   setupWiFi();
   setupWebServer();
   setupMqtt();
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    otaCheckForUpdate("boot");
+    otaBootCheckPending = false;
+  }
 
   lastShowRunningState = showStatus.isRunning;
   LOGI("Setup complete");
@@ -288,6 +349,8 @@ void loop()
   {
     publishTelemetry(false);
   }
+
+  otaLoop();
 
   if (configSavePending && millis() >= configSaveAt)
   {
@@ -428,6 +491,287 @@ void applyPumpPwm(uint16_t pwm)
 {
   analogWrite(PUMPE1, pwm);
   analogWrite(PUMPE2, pwm);
+}
+
+void setSafeOutputState()
+{
+  showStatus.shouldStart = false;
+  showStatus.isRunning = false;
+  setPumpTarget(false);
+  pumpControl.currentPwm = 0;
+  applyPumpPwm(0);
+  digitalWrite(VENTIL, LOW);
+}
+
+static uint32_t parseVersionPart(const String &version, int &index)
+{
+  while (index < (int)version.length())
+  {
+    char c = version[index];
+    if (c >= '0' && c <= '9')
+    {
+      break;
+    }
+    index++;
+  }
+
+  uint32_t value = 0;
+  while (index < (int)version.length())
+  {
+    char c = version[index];
+    if (c < '0' || c > '9')
+    {
+      break;
+    }
+    value = (value * 10UL) + (uint32_t)(c - '0');
+    index++;
+  }
+
+  while (index < (int)version.length() && version[index] != '.')
+  {
+    index++;
+  }
+  if (index < (int)version.length() && version[index] == '.')
+  {
+    index++;
+  }
+
+  return value;
+}
+
+int compareVersionStrings(const String &lhs, const String &rhs)
+{
+  int leftIndex = 0;
+  int rightIndex = 0;
+  for (int i = 0; i < 4; i++)
+  {
+    uint32_t leftValue = parseVersionPart(lhs, leftIndex);
+    uint32_t rightValue = parseVersionPart(rhs, rightIndex);
+    if (leftValue < rightValue)
+    {
+      return -1;
+    }
+    if (leftValue > rightValue)
+    {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+void updateOtaDerivedState(const String &latestVersion, const String &firmwareUrl, const String &releaseNotes)
+{
+  otaStatus.latestVersion = latestVersion;
+  otaStatus.firmwareUrl = firmwareUrl;
+  otaStatus.releaseNotes = releaseNotes;
+  otaStatus.updateAvailable = latestVersion.length() > 0 &&
+                              firmwareUrl.length() > 0 &&
+                              compareVersionStrings(otaStatus.currentVersion, latestVersion) < 0;
+}
+
+bool otaCheckForUpdate(const char *reason)
+{
+  if (otaStatus.checkInProgress || otaStatus.updateInProgress)
+  {
+    return false;
+  }
+
+  otaStatus.lastCheckAt = millis();
+  otaStatus.lastError = "";
+
+  if (config.otaManifestUrl.length() == 0)
+  {
+    otaStatus.lastError = "OTA-Manifest-URL nicht gesetzt";
+    updateOtaDerivedState("", "", "");
+    LOGW("OTA check skipped (%s): manifest URL missing", reason);
+    return false;
+  }
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    otaStatus.lastError = "WLAN nicht verbunden";
+    LOGW("OTA check skipped (%s): WiFi not connected", reason);
+    return false;
+  }
+
+  otaStatus.checkInProgress = true;
+  LOGI("OTA check (%s): %s", reason, config.otaManifestUrl.c_str());
+
+  BearSSL::WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+
+  HTTPClient http;
+  http.setTimeout(OTA_HTTP_TIMEOUT_MS);
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+
+  if (!http.begin(secureClient, config.otaManifestUrl))
+  {
+    otaStatus.lastError = "Manifest-Request konnte nicht gestartet werden";
+    otaStatus.checkInProgress = false;
+    LOGW("OTA check failed: begin() failed");
+    return false;
+  }
+
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK)
+  {
+    otaStatus.lastError = "HTTP-Fehler " + String(httpCode);
+    updateOtaDerivedState("", "", "");
+    otaStatus.checkInProgress = false;
+    http.end();
+    LOGW("OTA check failed: http=%d", httpCode);
+    return false;
+  }
+
+  String payload = http.getString();
+  http.end();
+
+  StaticJsonDocument<1024> doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err)
+  {
+    otaStatus.lastError = "Manifest JSON ungueltig";
+    updateOtaDerivedState("", "", "");
+    otaStatus.checkInProgress = false;
+    LOGW("OTA check failed: invalid JSON");
+    return false;
+  }
+
+  String latestVersion = doc["version"] | "";
+  String firmwareUrl = doc["firmware_url"] | "";
+  if (firmwareUrl.length() == 0)
+  {
+    firmwareUrl = doc["url"] | "";
+  }
+  String releaseNotes = doc["notes"] | "";
+  latestVersion.trim();
+  firmwareUrl.trim();
+  releaseNotes.trim();
+
+  if (latestVersion.length() == 0 || firmwareUrl.length() == 0)
+  {
+    otaStatus.lastError = "Manifest unvollstaendig (version/url)";
+    updateOtaDerivedState("", "", "");
+    otaStatus.checkInProgress = false;
+    LOGW("OTA check failed: manifest missing fields");
+    return false;
+  }
+
+  updateOtaDerivedState(latestVersion, firmwareUrl, releaseNotes);
+  otaStatus.checkInProgress = false;
+  otaStatus.lastError = "";
+
+  LOGI("OTA check done: current=%s latest=%s available=%s",
+       otaStatus.currentVersion.c_str(),
+       otaStatus.latestVersion.c_str(),
+       otaStatus.updateAvailable ? "yes" : "no");
+
+  if (mqttClient.connected())
+  {
+    publishTelemetry(true);
+  }
+
+  return true;
+}
+
+bool otaApplyUpdate()
+{
+  if (otaStatus.updateInProgress)
+  {
+    return false;
+  }
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    otaStatus.lastError = "WLAN nicht verbunden";
+    return false;
+  }
+  if (showStatus.isRunning)
+  {
+    otaStatus.lastError = "Show laeuft noch";
+    return false;
+  }
+  if (otaStatus.firmwareUrl.length() == 0)
+  {
+    otaStatus.lastError = "Keine Firmware-URL verfuegbar";
+    return false;
+  }
+
+  otaStatus.updateInProgress = true;
+  otaStatus.lastError = "";
+  LOGI("Starting OTA update from %s", otaStatus.firmwareUrl.c_str());
+
+  setSafeOutputState();
+  if (mqttClient.connected())
+  {
+    publishTelemetry(true);
+    publishAvailability("offline", true);
+  }
+  mqttClient.disconnect();
+
+  BearSSL::WiFiClientSecure secureClient;
+  secureClient.setInsecure();
+
+  ESPhttpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  t_httpUpdate_return result = ESPhttpUpdate.update(secureClient, otaStatus.firmwareUrl);
+
+  otaStatus.updateInProgress = false;
+
+  if (result == HTTP_UPDATE_OK)
+  {
+    // In this mode ESPhttpUpdate reboots after successful flash.
+    return true;
+  }
+
+  if (result == HTTP_UPDATE_NO_UPDATES)
+  {
+    otaStatus.lastError = "Kein neues Update verfuegbar";
+    LOGW("OTA update returned: no updates");
+  }
+  else
+  {
+    otaStatus.lastError = ESPhttpUpdate.getLastErrorString();
+    LOGW("OTA update failed (%d): %s", ESPhttpUpdate.getLastError(), otaStatus.lastError.c_str());
+  }
+
+  if (mqttClient.connected())
+  {
+    publishTelemetry(true);
+  }
+
+  return false;
+}
+
+void otaLoop()
+{
+  if (otaBootCheckPending && WiFi.status() == WL_CONNECTED)
+  {
+    otaBootCheckPending = false;
+    otaCheckForUpdate("boot-delayed");
+  }
+
+  if (otaCheckRequested)
+  {
+    otaCheckRequested = false;
+    otaCheckForUpdate("manual");
+  }
+
+  if (otaUpdateRequested)
+  {
+    otaUpdateRequested = false;
+    otaApplyUpdate();
+  }
+
+  if (WiFi.status() != WL_CONNECTED || otaStatus.lastCheckAt == 0)
+  {
+    return;
+  }
+
+  if (!otaStatus.checkInProgress &&
+      !otaStatus.updateInProgress &&
+      (millis() - otaStatus.lastCheckAt) >= OTA_CHECK_INTERVAL_MS)
+  {
+    otaCheckForUpdate("hourly");
+  }
 }
 
 void setupMqtt()
@@ -916,6 +1260,53 @@ void publishSensorDiscovery()
     mqttClient.publish((String("homeassistant/number/") + deviceId + "/nachlaufzeit_setzen/config").c_str(), payload.c_str(), true);
   }
 
+  {
+    StaticJsonDocument<384> cfg;
+    cfg["name"] = "Firmware Version";
+    cfg["object_id"] = "firmware_version";
+    cfg["unique_id"] = deviceId + "-firmware-version";
+    cfg["state_topic"] = topicTeleState;
+    cfg["value_template"] = "{{ value_json.OTA.CurrentVersion }}";
+    cfg["icon"] = "mdi:chip";
+    cfg["availability_topic"] = topicAvailability;
+    addDevice(cfg.as<JsonObject>());
+    String payload;
+    serializeJson(cfg, payload);
+    mqttClient.publish((String("homeassistant/sensor/") + deviceId + "/firmware_version/config").c_str(), payload.c_str(), true);
+  }
+
+  {
+    StaticJsonDocument<384> cfg;
+    cfg["name"] = "Firmware Verfuegbar";
+    cfg["object_id"] = "firmware_verfuegbar";
+    cfg["unique_id"] = deviceId + "-firmware-verfuegbar";
+    cfg["state_topic"] = topicTeleState;
+    cfg["value_template"] = "{{ value_json.OTA.LatestVersion }}";
+    cfg["icon"] = "mdi:update";
+    cfg["availability_topic"] = topicAvailability;
+    addDevice(cfg.as<JsonObject>());
+    String payload;
+    serializeJson(cfg, payload);
+    mqttClient.publish((String("homeassistant/sensor/") + deviceId + "/firmware_verfuegbar/config").c_str(), payload.c_str(), true);
+  }
+
+  {
+    StaticJsonDocument<384> cfg;
+    cfg["name"] = "Update verfuegbar";
+    cfg["object_id"] = "update_verfuegbar";
+    cfg["unique_id"] = deviceId + "-update-verfuegbar";
+    cfg["state_topic"] = topicTeleState;
+    cfg["value_template"] = "{{ 'ON' if value_json.OTA.UpdateAvailable else 'OFF' }}";
+    cfg["payload_on"] = "ON";
+    cfg["payload_off"] = "OFF";
+    cfg["icon"] = "mdi:download";
+    cfg["availability_topic"] = topicAvailability;
+    addDevice(cfg.as<JsonObject>());
+    String payload;
+    serializeJson(cfg, payload);
+    mqttClient.publish((String("homeassistant/binary_sensor/") + deviceId + "/update_verfuegbar/config").c_str(), payload.c_str(), true);
+  }
+
   LOGI("Published Home Assistant sensor discovery");
 }
 
@@ -956,7 +1347,7 @@ void publishTelemetry(bool force)
   }
   lastTelemetryAt = now;
 
-  StaticJsonDocument<768> doc;
+  StaticJsonDocument<1024> doc;
   doc["UptimeSec"] = now / 1000;
 
   JsonObject wifi = doc["WiFi"].to<JsonObject>();
@@ -986,6 +1377,15 @@ void publishTelemetry(bool force)
   licht["G"] = config.lightG;
   licht["B"] = config.lightB;
   licht["W"] = config.lightW;
+
+  JsonObject ota = doc["OTA"].to<JsonObject>();
+  ota["CurrentVersion"] = otaStatus.currentVersion;
+  ota["LatestVersion"] = otaStatus.latestVersion;
+  ota["UpdateAvailable"] = otaStatus.updateAvailable;
+  ota["CheckInProgress"] = otaStatus.checkInProgress;
+  ota["UpdateInProgress"] = otaStatus.updateInProgress;
+  ota["LastError"] = otaStatus.lastError;
+  ota["LastCheckMs"] = otaStatus.lastCheckAt;
 
   String payload;
   serializeJson(doc, payload);
@@ -1090,6 +1490,9 @@ void setupWebServer()
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/status", HTTP_GET, handleStatus);
+  server.on("/ota/status", HTTP_GET, handleOtaStatus);
+  server.on("/ota/check", HTTP_POST, handleOtaCheck);
+  server.on("/ota/update", HTTP_POST, handleOtaUpdate);
   server.onNotFound(handleNotFound);
   server.begin();
 
@@ -1137,6 +1540,10 @@ void handleSave()
   {
     config.mqttTopic = server.arg("mqtt_topic");
   }
+  if (server.hasArg("ota_manifest_url"))
+  {
+    config.otaManifestUrl = server.arg("ota_manifest_url");
+  }
   if (server.hasArg("show_length"))
   {
     config.showLengthMs = clampU32((uint32_t)server.arg("show_length").toInt(), SHOW_LENGTH_MIN_MS, SHOW_LENGTH_MAX_MS);
@@ -1168,6 +1575,11 @@ void handleSave()
   config.mqttUser.trim();
   config.mqttPassword.trim();
   config.mqttTopic.trim();
+  config.otaManifestUrl.trim();
+  if (config.otaManifestUrl.length() == 0)
+  {
+    config.otaManifestUrl = String(OTA_MANIFEST_URL);
+  }
 
   if (config.mqttPort == 0)
   {
@@ -1198,7 +1610,7 @@ void handleSave()
 void handleStatus()
 {
   LOGD("HTTP GET /status");
-  StaticJsonDocument<512> status;
+  StaticJsonDocument<768> status;
   status["wifi_connected"] = WiFi.status() == WL_CONNECTED;
   status["sta_ip"] = WiFi.localIP().toString();
   status["ap_enabled"] = captivePortalEnabled;
@@ -1215,9 +1627,91 @@ void handleStatus()
   color["b"] = config.lightB;
   color["w"] = config.lightW;
 
+  JsonObject ota = status["ota"].to<JsonObject>();
+  ota["current_version"] = otaStatus.currentVersion;
+  ota["latest_version"] = otaStatus.latestVersion;
+  ota["update_available"] = otaStatus.updateAvailable;
+  ota["check_in_progress"] = otaStatus.checkInProgress;
+  ota["update_in_progress"] = otaStatus.updateInProgress;
+  ota["last_error"] = otaStatus.lastError;
+  ota["last_check_ms"] = otaStatus.lastCheckAt;
+
   String out;
   serializeJson(status, out);
   server.send(200, "application/json", out);
+}
+
+void handleOtaStatus()
+{
+  LOGD("HTTP GET /ota/status");
+  StaticJsonDocument<768> status;
+  status["configured"] = config.otaManifestUrl.length() > 0;
+  status["wifi_connected"] = WiFi.status() == WL_CONNECTED;
+  status["current_version"] = otaStatus.currentVersion;
+  status["latest_version"] = otaStatus.latestVersion;
+  status["firmware_url"] = otaStatus.firmwareUrl;
+  status["release_notes"] = otaStatus.releaseNotes;
+  status["update_available"] = otaStatus.updateAvailable;
+  status["check_in_progress"] = otaStatus.checkInProgress;
+  status["update_in_progress"] = otaStatus.updateInProgress;
+  status["last_error"] = otaStatus.lastError;
+  status["last_check_ms"] = otaStatus.lastCheckAt;
+  status["interval_ms"] = OTA_CHECK_INTERVAL_MS;
+
+  String out;
+  serializeJson(status, out);
+  server.send(200, "application/json", out);
+}
+
+void handleOtaCheck()
+{
+  LOGI("HTTP POST /ota/check");
+  if (config.otaManifestUrl.length() == 0)
+  {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"OTA-Manifest-URL fehlt\"}");
+    return;
+  }
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"WLAN nicht verbunden\"}");
+    return;
+  }
+  if (otaStatus.checkInProgress || otaStatus.updateInProgress)
+  {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"OTA bereits aktiv\"}");
+    return;
+  }
+
+  otaCheckRequested = true;
+  server.send(202, "application/json", "{\"ok\":true,\"queued\":true}");
+}
+
+void handleOtaUpdate()
+{
+  LOGI("HTTP POST /ota/update");
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"WLAN nicht verbunden\"}");
+    return;
+  }
+  if (showStatus.isRunning)
+  {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"Show laeuft noch\"}");
+    return;
+  }
+  if (otaStatus.updateInProgress || otaStatus.checkInProgress)
+  {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"OTA bereits aktiv\"}");
+    return;
+  }
+  if (!otaStatus.updateAvailable || otaStatus.firmwareUrl.length() == 0)
+  {
+    server.send(409, "application/json", "{\"ok\":false,\"error\":\"Kein Update verfuegbar\"}");
+    return;
+  }
+
+  otaUpdateRequested = true;
+  server.send(202, "application/json", "{\"ok\":true,\"queued\":true}");
 }
 
 void handleNotFound()
@@ -1293,7 +1787,7 @@ void loadConfig()
 
   if (trimmed[0] == '{')
   {
-    StaticJsonDocument<768> doc;
+    StaticJsonDocument<1024> doc;
     DeserializationError err = deserializeJson(doc, raw);
     if (!err)
     {
@@ -1304,6 +1798,7 @@ void loadConfig()
       config.mqttUser = doc["mqtt"]["user"] | config.mqttUser;
       config.mqttPassword = doc["mqtt"]["password"] | config.mqttPassword;
       config.mqttTopic = doc["mqtt"]["topic"] | config.mqttTopic;
+      config.otaManifestUrl = doc["ota"]["manifest_url"] | config.otaManifestUrl;
       config.showLengthMs = doc["show"]["length_ms"] | config.showLengthMs;
       config.showNachlaufMs = doc["show"]["nachlauf_ms"] | config.showNachlaufMs;
       config.lightR = doc["light"]["r"] | config.lightR;
@@ -1328,6 +1823,11 @@ void loadConfig()
   config.mqttUser.trim();
   config.mqttPassword.trim();
   config.mqttTopic.trim();
+  config.otaManifestUrl.trim();
+  if (config.otaManifestUrl.length() == 0)
+  {
+    config.otaManifestUrl = String(OTA_MANIFEST_URL);
+  }
 
   if (config.mqttPort == 0)
   {
@@ -1400,7 +1900,7 @@ void loadLegacyConfig(const String &raw)
 
 bool saveConfig()
 {
-  StaticJsonDocument<768> doc;
+  StaticJsonDocument<1024> doc;
 
   JsonObject wifi = doc["wifi"].to<JsonObject>();
   wifi["ssid"] = config.wifiSsid;
@@ -1412,6 +1912,9 @@ bool saveConfig()
   mqtt["user"] = config.mqttUser;
   mqtt["password"] = config.mqttPassword;
   mqtt["topic"] = config.mqttTopic;
+
+  JsonObject ota = doc["ota"].to<JsonObject>();
+  ota["manifest_url"] = config.otaManifestUrl;
 
   JsonObject show = doc["show"].to<JsonObject>();
   show["length_ms"] = config.showLengthMs;
@@ -1575,7 +2078,7 @@ String buildHtmlPage(const String &message)
                          : "Kein STA-Link. Captive Portal im AP-Modus aktiv.";
 
   String html;
-  html.reserve(7000);
+  html.reserve(12000);
   html += "<!doctype html><html><head><meta charset='utf-8'>";
   html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<title>VacUBear Setup</title>";
@@ -1585,8 +2088,11 @@ String buildHtmlPage(const String &message)
   html += "label{display:block;font-weight:600;margin-top:12px;}";
   html += "input{width:100%;padding:10px;border-radius:8px;border:1px solid #c8d1db;margin-top:6px;box-sizing:border-box;}";
   html += "button{margin-top:16px;padding:11px 16px;background:#005bbb;color:#fff;border:0;border-radius:8px;font-weight:700;cursor:pointer;}";
+  html += ".btn-secondary{background:#4b5563;margin-right:10px;}";
+  html += ".btn-danger{background:#b91c1c;}";
   html += ".status{background:#eef6ff;border-left:4px solid #005bbb;padding:10px;border-radius:8px;margin-bottom:14px;}";
   html += ".msg{background:#e8f8ed;border-left:4px solid #16853f;padding:10px;border-radius:8px;margin-bottom:14px;}";
+  html += "hr{border:0;border-top:1px solid #d7dee6;margin:18px 0;}";
   html += ".small{color:#5a6978;font-size:.9rem;margin-top:10px;}</style></head><body><div class='wrap'><div class='card'>";
   html += "<h2>VacUBear WiFi / MQTT Setup</h2>";
   html += "<div class='status'>" + stateText + "<br>AP SSID: <strong>" + htmlEscape(apSsid) + "</strong>";
@@ -1610,6 +2116,7 @@ String buildHtmlPage(const String &message)
   html += "<label>MQTT User</label><input name='mqtt_user' value='" + htmlEscape(config.mqttUser) + "'>";
   html += "<label>MQTT Passwort</label><input name='mqtt_password' type='password' value='" + htmlEscape(config.mqttPassword) + "'>";
   html += "<label>MQTT Basis-Topic</label><input name='mqtt_topic' value='" + htmlEscape(config.mqttTopic) + "'>";
+  html += "<label>OTA Manifest URL</label><input name='ota_manifest_url' value='" + htmlEscape(config.otaManifestUrl) + "' placeholder='https://.../manifest.json'>";
   html += "<label>Laenge der Show (ms)</label><input name='show_length' type='number' min='" + String(SHOW_LENGTH_MIN_MS) + "' max='" + String(SHOW_LENGTH_MAX_MS) + "' value='" + String(config.showLengthMs) + "'>";
   html += "<label>Nachlaufzeit (ms)</label><input name='show_nachlauf' type='number' min='" + String(SHOW_NACHLAUF_MIN_MS) + "' value='" + String(config.showNachlaufMs) + "'>";
   html += "<label>Lichtfarbe R (0-255)</label><input name='light_r' type='number' min='0' max='255' value='" + String(config.lightR) + "'>";
@@ -1617,7 +2124,77 @@ String buildHtmlPage(const String &message)
   html += "<label>Lichtfarbe B (0-255)</label><input name='light_b' type='number' min='0' max='255' value='" + String(config.lightB) + "'>";
   html += "<label>Lichtfarbe W (0-255)</label><input name='light_w' type='number' min='0' max='255' value='" + String(config.lightW) + "'>";
   html += "<button type='submit'>Speichern & Neustart</button></form>";
+  html += "<hr><h3>OTA Firmware</h3>";
+  html += "<div id='ota-box' class='status'>Lade OTA-Status...</div>";
+  html += "<button type='button' class='btn-secondary' onclick='otaCheck()'>Nach Update suchen</button>";
+  html += "<button type='button' class='btn-danger' onclick='otaUpdate()'>Firmware installieren</button>";
+  html += "<div class='small'>Aktuelle Firmware: " + String(FW_VERSION) + "</div>";
   html += "<div class='small'>Bei gueltigem WLAN im lokalen Netz erreichbar. Bei Fehler startet AP + Captive Portal.</div>";
+  html += R"rawliteral(
+<script>
+async function apiJson(path, method) {
+  const res = await fetch(path, {method: method || 'GET'});
+  const text = await res.text();
+  let json = {};
+  try { json = text ? JSON.parse(text) : {}; } catch (_) {}
+  if (!res.ok) {
+    throw new Error(json.error || ('HTTP ' + res.status));
+  }
+  return json;
+}
+
+function renderOta(status) {
+  const el = document.getElementById('ota-box');
+  if (!el) return;
+  let text = '';
+  text += 'Konfiguriert: ' + (status.configured ? 'ja' : 'nein') + '<br>';
+  text += 'WLAN verbunden: ' + (status.wifi_connected ? 'ja' : 'nein') + '<br>';
+  text += 'Aktuell: ' + (status.current_version || '-') + '<br>';
+  text += 'Neueste Version: ' + (status.latest_version || '-') + '<br>';
+  text += 'Update verfuegbar: ' + (status.update_available ? 'ja' : 'nein') + '<br>';
+  if (status.last_error) {
+    text += 'Letzter Fehler: ' + status.last_error + '<br>';
+  }
+  if (status.release_notes) {
+    text += 'Hinweis: ' + status.release_notes + '<br>';
+  }
+  el.innerHTML = text;
+}
+
+async function refreshOta() {
+  try {
+    const status = await apiJson('/ota/status');
+    renderOta(status);
+  } catch (e) {
+    const el = document.getElementById('ota-box');
+    if (el) el.textContent = 'OTA-Status konnte nicht geladen werden: ' + e.message;
+  }
+}
+
+async function otaCheck() {
+  try {
+    await apiJson('/ota/check', 'POST');
+    setTimeout(refreshOta, 300);
+    setTimeout(refreshOta, 1500);
+  } catch (e) {
+    alert('OTA-Check fehlgeschlagen: ' + e.message);
+  }
+}
+
+async function otaUpdate() {
+  if (!confirm('Firmware-Update jetzt starten?')) return;
+  try {
+    await apiJson('/ota/update', 'POST');
+    alert('OTA-Update gestartet. Das Geraet startet nach erfolgreichem Flash neu.');
+  } catch (e) {
+    alert('OTA-Update fehlgeschlagen: ' + e.message);
+  }
+}
+
+refreshOta();
+setInterval(refreshOta, 10000);
+</script>
+)rawliteral";
   html += "</div></div></body></html>";
 
   return html;
