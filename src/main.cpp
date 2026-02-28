@@ -7,6 +7,20 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 
+#ifndef ENABLE_SERIAL_LOG
+#define ENABLE_SERIAL_LOG 0
+#endif
+
+#if ENABLE_SERIAL_LOG
+#define LOGI(fmt, ...) Serial.printf("[INFO] " fmt "\n", ##__VA_ARGS__)
+#define LOGW(fmt, ...) Serial.printf("[WARN] " fmt "\n", ##__VA_ARGS__)
+#define LOGD(fmt, ...) Serial.printf("[DBG] " fmt "\n", ##__VA_ARGS__)
+#else
+#define LOGI(...)
+#define LOGW(...)
+#define LOGD(...)
+#endif
+
 #define PUMPE1 D5
 #define PUMPE2 D6
 #define VENTIL D7
@@ -19,15 +33,19 @@ static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000UL;
 static const uint32_t WIFI_RETRY_INTERVAL_MS = 30000UL;
 static const uint32_t MQTT_RECONNECT_INTERVAL_MS = 5000UL;
 static const uint32_t CONFIG_SAVE_DELAY_MS = 2000UL;
-static const uint32_t SHOW_LENGTH_MIN_MS = 1000UL;
-static const uint32_t SHOW_LENGTH_MAX_MS = 3600000UL;
-static const uint32_t SHOW_NACHLAUF_MIN_MS = 0UL;
-static const uint32_t SHOW_NACHLAUF_MAX_MS = 3600000UL;
+// Developer limits (not user editable)
+static const uint32_t SHOW_LENGTH_MIN_S = 10UL;
+static const uint32_t SHOW_LENGTH_MAX_S = 60UL;
+static const uint32_t SHOW_NACHLAUF_MIN_S = 5UL;
+static const uint32_t SHOW_LENGTH_MIN_MS = SHOW_LENGTH_MIN_S * 1000UL;
+static const uint32_t SHOW_LENGTH_MAX_MS = SHOW_LENGTH_MAX_S * 1000UL;
+static const uint32_t SHOW_NACHLAUF_MIN_MS = SHOW_NACHLAUF_MIN_S * 1000UL;
 static const uint16_t PUMP_PWM_MAX = 1023;
 static const uint16_t PUMP_PWM_FREQ_HZ = 1000;
 static const uint32_t PUMP_SOFTSTART_MS = 2500UL;
 static const uint32_t PUMP_SOFTSTOP_MS = 1200UL;
 static const uint32_t PUMP_PWM_UPDATE_MS = 20UL;
+static const uint32_t TELEMETRY_INTERVAL_MS = 10000UL;
 
 static const char *CONFIG_FILE = "/config.json";
 static const char *DEVICE_PREFIX = "vacubear";
@@ -112,16 +130,25 @@ String deviceId;
 bool captivePortalEnabled = false;
 unsigned long lastWifiRetryAt = 0;
 unsigned long lastMqttReconnectAt = 0;
+unsigned long lastTelemetryAt = 0;
 bool lastShowRunningState = false;
 bool configSavePending = false;
 unsigned long configSaveAt = 0;
+String lastPhaseLog = "";
 
 String topicBase;
 String topicShowSet;
 String topicShowState;
 String topicLightSet;
 String topicLightState;
+String topicLightRgbwSet;
+String topicLightRgbwState;
+String topicCfgShowLengthSet;
+String topicCfgShowLengthState;
+String topicCfgNachlaufSet;
+String topicCfgNachlaufState;
 String topicAvailability;
+String topicTeleState;
 PumpSoftControl pumpControl;
 
 void startShow(void);
@@ -141,7 +168,11 @@ void updateMqttTopics(void);
 void publishAvailability(const char *state, bool retained = true);
 void publishShowState(bool retained = true);
 void publishLightState(bool retained = true);
+void publishConfigState(bool retained = true);
 void publishDiscovery(void);
+void publishSensorDiscovery(void);
+void publishTelemetry(bool force = false);
+const char *getShowPhase(void);
 
 void loadConfig(void);
 bool saveConfig(void);
@@ -160,12 +191,16 @@ bool isIpAddress(const String &host);
 String defaultApSsid(void);
 String defaultDeviceId(void);
 uint32_t clampU32(uint32_t value, uint32_t minValue, uint32_t maxValue);
+uint32_t clampMinU32(uint32_t value, uint32_t minValue);
+uint32_t secToMs(uint32_t seconds);
+uint32_t msToSec(uint32_t milliseconds);
 uint8_t clampU8(int value);
 void scheduleConfigSave(void);
 
 void setup()
 {
   Serial.begin(115200);
+  LOGI("Booting VacUBear firmware");
 
   pinMode(PUMPE1, OUTPUT);
   pinMode(PUMPE2, OUTPUT);
@@ -177,17 +212,18 @@ void setup()
 
   if (!LittleFS.begin())
   {
-    Serial.println("LittleFS mount failed");
+    LOGW("LittleFS mount failed");
   }
 
   deviceId = defaultDeviceId();
+  LOGI("Device ID: %s", deviceId.c_str());
   loadConfig();
   setupWiFi();
   setupWebServer();
   setupMqtt();
 
   lastShowRunningState = showStatus.isRunning;
-  Serial.println("Setup complete");
+  LOGI("Setup complete");
 }
 
 void loop()
@@ -195,6 +231,7 @@ void loop()
   button.read();
   if (button.wasPressed())
   {
+    LOGI("Button pressed");
     if (showStatus.isRunning)
     {
       stopShow();
@@ -208,6 +245,15 @@ void loop()
   handleShow();
   updatePumpControl();
 
+#if ENABLE_SERIAL_LOG
+  const char *phase = getShowPhase();
+  if (String(phase) != lastPhaseLog)
+  {
+    lastPhaseLog = phase;
+    LOGI("Show phase changed -> %s", phase);
+  }
+#endif
+
   if (showStatus.isRunning != lastShowRunningState)
   {
     lastShowRunningState = showStatus.isRunning;
@@ -215,6 +261,7 @@ void loop()
     {
       publishShowState(true);
       publishLightState(true);
+      publishTelemetry(true);
     }
   }
 
@@ -231,11 +278,16 @@ void loop()
     {
       lastWifiRetryAt = millis();
       WiFi.begin(config.wifiSsid.c_str(), config.wifiPassword.c_str());
-      Serial.println("Retrying WiFi STA connection...");
+      LOGI("Retrying WiFi STA connection...");
     }
   }
 
   mqttLoop();
+
+  if (mqttClient.connected())
+  {
+    publishTelemetry(false);
+  }
 
   if (configSavePending && millis() >= configSaveAt)
   {
@@ -248,8 +300,10 @@ void startShow()
 {
   if (showStatus.isRunning)
   {
+    LOGD("startShow ignored: already running");
     return;
   }
+  LOGI("startShow requested");
   showStatus.shouldStart = true;
 }
 
@@ -257,8 +311,10 @@ void stopShow()
 {
   if (!showStatus.isRunning)
   {
+    LOGD("stopShow ignored: not running");
     return;
   }
+  LOGI("stopShow requested");
   showStatus.endAt = millis() + 10;
   showStatus.openValveAt = millis() + 10;
 }
@@ -271,6 +327,7 @@ void handleShow()
     showStatus.openValveAt = showStatus.endAt + showStatus.showNachlauf;
     showStatus.shouldStart = false;
     showStatus.isRunning = true;
+    LOGI("Show started: Vakuumieren=%lu ms, Haltezeit=%lu ms", showStatus.showDuration, showStatus.showNachlauf);
   }
 
   if (showStatus.isRunning)
@@ -290,6 +347,7 @@ void handleShow()
       setPumpTarget(false);
       digitalWrite(VENTIL, LOW);
       showStatus.isRunning = false;
+      LOGI("Show finished");
     }
   }
   else
@@ -305,11 +363,17 @@ void setupPumpControl()
   analogWriteRange(PUMP_PWM_MAX);
   analogWriteFreq(PUMP_PWM_FREQ_HZ);
   applyPumpPwm(0);
+  LOGI("Pump PWM configured: range=%u freq=%u", PUMP_PWM_MAX, PUMP_PWM_FREQ_HZ);
 }
 
 void setPumpTarget(bool enabled)
 {
-  pumpControl.targetPwm = enabled ? PUMP_PWM_MAX : 0;
+  uint16_t newTarget = enabled ? PUMP_PWM_MAX : 0;
+  if (newTarget != pumpControl.targetPwm)
+  {
+    pumpControl.targetPwm = newTarget;
+    LOGD("Pump target PWM -> %u", pumpControl.targetPwm);
+  }
 }
 
 void updatePumpControl()
@@ -372,6 +436,7 @@ void setupMqtt()
   mqttClient.setBufferSize(1024);
   mqttClient.setCallback(mqttCallback);
   updateMqttTopics();
+  LOGI("MQTT setup: broker=%s:%u", config.mqttHost.c_str(), config.mqttPort);
 }
 
 void mqttLoop()
@@ -394,6 +459,7 @@ void mqttEnsureConnected()
 {
   if (config.mqttHost.length() == 0)
   {
+    LOGW("MQTT disabled: broker host empty");
     return;
   }
 
@@ -429,19 +495,23 @@ void mqttEnsureConnected()
 
   if (!connected)
   {
-    Serial.print("MQTT connect failed, rc=");
-    Serial.println(mqttClient.state());
+    LOGW("MQTT connect failed, rc=%d", mqttClient.state());
     return;
   }
 
-  Serial.println("MQTT connected");
+  LOGI("MQTT connected");
 
   mqttClient.subscribe(topicShowSet.c_str());
   mqttClient.subscribe(topicLightSet.c_str());
+  mqttClient.subscribe(topicLightRgbwSet.c_str());
+  mqttClient.subscribe(topicCfgShowLengthSet.c_str());
+  mqttClient.subscribe(topicCfgNachlaufSet.c_str());
   publishAvailability("online", true);
   publishDiscovery();
   publishShowState(true);
   publishLightState(true);
+  publishConfigState(true);
+  publishTelemetry(true);
 }
 
 void mqttCallback(char *topic, byte *payload, unsigned int length)
@@ -454,6 +524,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
     payloadStr += static_cast<char>(payload[i]);
   }
   payloadStr.trim();
+  LOGI("MQTT RX topic=%s payload=%s", topicStr.c_str(), payloadStr.c_str());
 
   if (topicStr == topicShowSet)
   {
@@ -465,6 +536,8 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
     {
       stopShow();
     }
+    publishShowState(true);
+    publishTelemetry(true);
     return;
   }
 
@@ -475,6 +548,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
     if (payloadStr == "ON" || payloadStr == "OFF")
     {
       publishLightState(true);
+      publishTelemetry(true);
       return;
     }
 
@@ -521,40 +595,113 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
 
     if (changed)
     {
+      LOGI("Lichtfarbe updated via JSON command");
       scheduleConfigSave();
     }
     publishLightState(true);
+    publishTelemetry(true);
+    return;
+  }
+
+  if (topicStr == topicLightRgbwSet)
+  {
+    int r = -1;
+    int g = -1;
+    int b = -1;
+    int w = -1;
+    int parsed = sscanf(payloadStr.c_str(), "%d,%d,%d,%d", &r, &g, &b, &w);
+    if (parsed == 4)
+    {
+      config.lightR = clampU8(r);
+      config.lightG = clampU8(g);
+      config.lightB = clampU8(b);
+      config.lightW = clampU8(w);
+      LOGI("Lichtfarbe updated via RGBW topic: %u,%u,%u,%u", config.lightR, config.lightG, config.lightB, config.lightW);
+      scheduleConfigSave();
+      publishLightState(true);
+      publishTelemetry(true);
+    }
+    else
+    {
+      LOGW("Invalid RGBW payload: %s", payloadStr.c_str());
+    }
+    return;
+  }
+
+  if (topicStr == topicCfgShowLengthSet)
+  {
+    long valueSec = payloadStr.toInt();
+    if (valueSec <= 0)
+    {
+      LOGW("Invalid show length payload: %s", payloadStr.c_str());
+      return;
+    }
+
+    uint32_t clampedSec = clampU32((uint32_t)valueSec, SHOW_LENGTH_MIN_S, SHOW_LENGTH_MAX_S);
+    config.showLengthMs = secToMs(clampedSec);
+    showStatus.showDuration = config.showLengthMs;
+    LOGI("Show length updated via MQTT: %u s (%u ms)", clampedSec, config.showLengthMs);
+    scheduleConfigSave();
+    publishConfigState(true);
+    publishTelemetry(true);
+    return;
+  }
+
+  if (topicStr == topicCfgNachlaufSet)
+  {
+    long valueSec = payloadStr.toInt();
+    if (valueSec < 0)
+    {
+      LOGW("Invalid nachlauf payload: %s", payloadStr.c_str());
+      return;
+    }
+
+    uint32_t minClampedSec = clampMinU32((uint32_t)valueSec, SHOW_NACHLAUF_MIN_S);
+    config.showNachlaufMs = secToMs(minClampedSec);
+    showStatus.showNachlauf = config.showNachlaufMs;
+    LOGI("Nachlauf updated via MQTT: %u s (%u ms)", minClampedSec, config.showNachlaufMs);
+    scheduleConfigSave();
+    publishConfigState(true);
+    publishTelemetry(true);
   }
 }
 
 void publishAvailability(const char *state, bool retained)
 {
   mqttClient.publish(topicAvailability.c_str(), state, retained);
+  LOGD("MQTT TX availability=%s", state);
 }
 
 void publishShowState(bool retained)
 {
   mqttClient.publish(topicShowState.c_str(), showStatus.isRunning ? "ON" : "OFF", retained);
+  LOGD("MQTT TX show_state=%s", showStatus.isRunning ? "ON" : "OFF");
 }
 
 void publishLightState(bool retained)
 {
-  StaticJsonDocument<192> doc;
-  doc["state"] = "ON";
-  JsonObject color = doc["color"].to<JsonObject>();
-  color["r"] = config.lightR;
-  color["g"] = config.lightG;
-  color["b"] = config.lightB;
-  color["w"] = config.lightW;
-  doc["white_value"] = config.lightW;
+  mqttClient.publish(topicLightState.c_str(), "ON", retained);
+  String rgbw = String(config.lightR) + "," + String(config.lightG) + "," + String(config.lightB) + "," + String(config.lightW);
+  mqttClient.publish(topicLightRgbwState.c_str(), rgbw.c_str(), retained);
+  LOGD("MQTT TX light_state=ON rgbw=%s", rgbw.c_str());
+}
 
-  String payload;
-  serializeJson(doc, payload);
-  mqttClient.publish(topicLightState.c_str(), payload.c_str(), retained);
+void publishConfigState(bool retained)
+{
+  if (!mqttClient.connected())
+  {
+    return;
+  }
+  String showSec = String(msToSec(config.showLengthMs));
+  String nachlaufSec = String(msToSec(config.showNachlaufMs));
+  mqttClient.publish(topicCfgShowLengthState.c_str(), showSec.c_str(), retained);
+  mqttClient.publish(topicCfgNachlaufState.c_str(), nachlaufSec.c_str(), retained);
+  LOGD("MQTT TX config show=%s s nachlauf=%s s", showSec.c_str(), nachlaufSec.c_str());
 }
 
 void publishDiscovery()
 {
+  LOGI("Publishing Home Assistant discovery");
   StaticJsonDocument<512> switchCfg;
   switchCfg["name"] = "Vakuumieren";
   switchCfg["object_id"] = "show";
@@ -582,11 +729,14 @@ void publishDiscovery()
   lightCfg["name"] = "Lichtfarbe";
   lightCfg["object_id"] = "light";
   lightCfg["unique_id"] = deviceId + "-light";
-  lightCfg["schema"] = "json";
   lightCfg["command_topic"] = topicLightSet;
   lightCfg["state_topic"] = topicLightState;
-  lightCfg["rgb"] = true;
-  lightCfg["white_value"] = true;
+  lightCfg["payload_on"] = "ON";
+  lightCfg["payload_off"] = "OFF";
+  lightCfg["rgbw_command_topic"] = topicLightRgbwSet;
+  lightCfg["rgbw_state_topic"] = topicLightRgbwState;
+  JsonArray colorModes = lightCfg["supported_color_modes"].to<JsonArray>();
+  colorModes.add("rgbw");
   lightCfg["availability_topic"] = topicAvailability;
   lightCfg["payload_available"] = "online";
   lightCfg["payload_not_available"] = "offline";
@@ -601,6 +751,246 @@ void publishDiscovery()
   serializeJson(lightCfg, lightPayload);
   String lightDiscoveryTopic = "homeassistant/light/" + deviceId + "/light/config";
   mqttClient.publish(lightDiscoveryTopic.c_str(), lightPayload.c_str(), true);
+
+  publishSensorDiscovery();
+}
+
+void publishSensorDiscovery()
+{
+  auto addDevice = [&](JsonObject obj)
+  {
+    JsonObject dev = obj["device"].to<JsonObject>();
+    JsonArray ids = dev["identifiers"].to<JsonArray>();
+    ids.add(deviceId);
+    dev["name"] = "VacUBear";
+    dev["manufacturer"] = "KingBEAR";
+    dev["model"] = "Frame-25";
+  };
+
+  {
+    StaticJsonDocument<384> cfg;
+    cfg["name"] = "Show aktiv";
+    cfg["object_id"] = "show_aktiv";
+    cfg["unique_id"] = deviceId + "-show-aktiv";
+    cfg["state_topic"] = topicTeleState;
+    cfg["value_template"] = "{{ 'ON' if value_json.Show.Aktiv else 'OFF' }}";
+    cfg["payload_on"] = "ON";
+    cfg["payload_off"] = "OFF";
+    cfg["availability_topic"] = topicAvailability;
+    addDevice(cfg.as<JsonObject>());
+    String payload;
+    serializeJson(cfg, payload);
+    mqttClient.publish((String("homeassistant/binary_sensor/") + deviceId + "/show_aktiv/config").c_str(), payload.c_str(), true);
+  }
+
+  {
+    StaticJsonDocument<384> cfg;
+    cfg["name"] = "Show Phase";
+    cfg["object_id"] = "show_phase";
+    cfg["unique_id"] = deviceId + "-show-phase";
+    cfg["state_topic"] = topicTeleState;
+    cfg["value_template"] = "{{ value_json.Show.Phase }}";
+    cfg["icon"] = "mdi:state-machine";
+    cfg["availability_topic"] = topicAvailability;
+    addDevice(cfg.as<JsonObject>());
+    String payload;
+    serializeJson(cfg, payload);
+    mqttClient.publish((String("homeassistant/sensor/") + deviceId + "/show_phase/config").c_str(), payload.c_str(), true);
+  }
+
+  {
+    StaticJsonDocument<384> cfg;
+    cfg["name"] = "WLAN RSSI";
+    cfg["object_id"] = "wifi_rssi";
+    cfg["unique_id"] = deviceId + "-wifi-rssi";
+    cfg["state_topic"] = topicTeleState;
+    cfg["value_template"] = "{{ value_json.WiFi.RSSI }}";
+    cfg["unit_of_measurement"] = "dBm";
+    cfg["icon"] = "mdi:wifi";
+    cfg["availability_topic"] = topicAvailability;
+    addDevice(cfg.as<JsonObject>());
+    String payload;
+    serializeJson(cfg, payload);
+    mqttClient.publish((String("homeassistant/sensor/") + deviceId + "/wifi_rssi/config").c_str(), payload.c_str(), true);
+  }
+
+  {
+    StaticJsonDocument<384> cfg;
+    cfg["name"] = "Uptime";
+    cfg["object_id"] = "uptime";
+    cfg["unique_id"] = deviceId + "-uptime";
+    cfg["state_topic"] = topicTeleState;
+    cfg["value_template"] = "{{ value_json.UptimeSec }}";
+    cfg["unit_of_measurement"] = "s";
+    cfg["device_class"] = "duration";
+    cfg["state_class"] = "measurement";
+    cfg["availability_topic"] = topicAvailability;
+    addDevice(cfg.as<JsonObject>());
+    String payload;
+    serializeJson(cfg, payload);
+    mqttClient.publish((String("homeassistant/sensor/") + deviceId + "/uptime/config").c_str(), payload.c_str(), true);
+  }
+
+  {
+    StaticJsonDocument<384> cfg;
+    cfg["name"] = "Pumpen PWM";
+    cfg["object_id"] = "pumpen_pwm";
+    cfg["unique_id"] = deviceId + "-pumpen-pwm";
+    cfg["state_topic"] = topicTeleState;
+    cfg["value_template"] = "{{ value_json.Pumpen.PWM }}";
+    cfg["unit_of_measurement"] = "raw";
+    cfg["icon"] = "mdi:fan";
+    cfg["availability_topic"] = topicAvailability;
+    addDevice(cfg.as<JsonObject>());
+    String payload;
+    serializeJson(cfg, payload);
+    mqttClient.publish((String("homeassistant/sensor/") + deviceId + "/pumpen_pwm/config").c_str(), payload.c_str(), true);
+  }
+
+  {
+    StaticJsonDocument<384> cfg;
+    cfg["name"] = "Show Länge";
+    cfg["object_id"] = "show_laenge";
+    cfg["unique_id"] = deviceId + "-show-laenge";
+    cfg["state_topic"] = topicTeleState;
+    cfg["value_template"] = "{{ value_json.Show.LaengeS }}";
+    cfg["unit_of_measurement"] = "s";
+    cfg["icon"] = "mdi:timer-sand";
+    cfg["availability_topic"] = topicAvailability;
+    addDevice(cfg.as<JsonObject>());
+    String payload;
+    serializeJson(cfg, payload);
+    mqttClient.publish((String("homeassistant/sensor/") + deviceId + "/show_laenge/config").c_str(), payload.c_str(), true);
+  }
+
+  {
+    StaticJsonDocument<384> cfg;
+    cfg["name"] = "Nachlaufzeit";
+    cfg["object_id"] = "nachlaufzeit";
+    cfg["unique_id"] = deviceId + "-nachlaufzeit";
+    cfg["state_topic"] = topicTeleState;
+    cfg["value_template"] = "{{ value_json.Show.NachlaufS }}";
+    cfg["unit_of_measurement"] = "s";
+    cfg["icon"] = "mdi:timer-outline";
+    cfg["availability_topic"] = topicAvailability;
+    addDevice(cfg.as<JsonObject>());
+    String payload;
+    serializeJson(cfg, payload);
+    mqttClient.publish((String("homeassistant/sensor/") + deviceId + "/nachlaufzeit/config").c_str(), payload.c_str(), true);
+  }
+
+  {
+    StaticJsonDocument<384> cfg;
+    cfg["name"] = "Vakuumier-Zeit";
+    cfg["object_id"] = "show_laenge_setzen";
+    cfg["unique_id"] = deviceId + "-show-laenge-setzen";
+    cfg["command_topic"] = topicCfgShowLengthSet;
+    cfg["state_topic"] = topicCfgShowLengthState;
+    cfg["unit_of_measurement"] = "s";
+    cfg["min"] = SHOW_LENGTH_MIN_S;
+    cfg["max"] = SHOW_LENGTH_MAX_S;
+    cfg["step"] = 1;
+    cfg["mode"] = "slider";
+    cfg["availability_topic"] = topicAvailability;
+    addDevice(cfg.as<JsonObject>());
+    String payload;
+    serializeJson(cfg, payload);
+    mqttClient.publish((String("homeassistant/number/") + deviceId + "/show_laenge_setzen/config").c_str(), payload.c_str(), true);
+  }
+
+  {
+    StaticJsonDocument<384> cfg;
+    cfg["name"] = "Nachlaufzeit";
+    cfg["object_id"] = "nachlaufzeit_setzen";
+    cfg["unique_id"] = deviceId + "-nachlaufzeit-setzen";
+    cfg["command_topic"] = topicCfgNachlaufSet;
+    cfg["state_topic"] = topicCfgNachlaufState;
+    cfg["unit_of_measurement"] = "s";
+    cfg["min"] = SHOW_NACHLAUF_MIN_S;
+    cfg["step"] = 1;
+    cfg["mode"] = "box";
+    cfg["availability_topic"] = topicAvailability;
+    addDevice(cfg.as<JsonObject>());
+    String payload;
+    serializeJson(cfg, payload);
+    mqttClient.publish((String("homeassistant/number/") + deviceId + "/nachlaufzeit_setzen/config").c_str(), payload.c_str(), true);
+  }
+
+  LOGI("Published Home Assistant sensor discovery");
+}
+
+const char *getShowPhase()
+{
+  unsigned long now = millis();
+  if (showStatus.isRunning)
+  {
+    if (now < showStatus.endAt)
+    {
+      return "Vakuumieren";
+    }
+    if (now < showStatus.openValveAt)
+    {
+      return "Haltezeit";
+    }
+    return "Belueften";
+  }
+
+  if (showStatus.openValveAt > 0 && (now - showStatus.openValveAt) < 2000UL)
+  {
+    return "Belueften";
+  }
+  return "Pause";
+}
+
+void publishTelemetry(bool force)
+{
+  if (!mqttClient.connected())
+  {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (!force && (now - lastTelemetryAt) < TELEMETRY_INTERVAL_MS)
+  {
+    return;
+  }
+  lastTelemetryAt = now;
+
+  StaticJsonDocument<768> doc;
+  doc["UptimeSec"] = now / 1000;
+
+  JsonObject wifi = doc["WiFi"].to<JsonObject>();
+  wifi["RSSI"] = WiFi.RSSI();
+  wifi["SSID"] = WiFi.SSID();
+  wifi["IP"] = WiFi.localIP().toString();
+  wifi["Host"] = deviceId;
+  wifi["Status"] = WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected";
+
+  JsonObject show = doc["Show"].to<JsonObject>();
+  show["Aktiv"] = showStatus.isRunning;
+  show["Status"] = showStatus.isRunning ? "ON" : "OFF";
+  show["Phase"] = getShowPhase();
+  show["LaengeMs"] = config.showLengthMs;
+  show["NachlaufMs"] = config.showNachlaufMs;
+  show["LaengeS"] = msToSec(config.showLengthMs);
+  show["NachlaufS"] = msToSec(config.showNachlaufMs);
+  show["EndAt"] = showStatus.endAt;
+  show["OpenValveAt"] = showStatus.openValveAt;
+
+  JsonObject pumpen = doc["Pumpen"].to<JsonObject>();
+  pumpen["PWM"] = pumpControl.currentPwm;
+  pumpen["TargetPWM"] = pumpControl.targetPwm;
+
+  JsonObject licht = doc["Lichtfarbe"].to<JsonObject>();
+  licht["R"] = config.lightR;
+  licht["G"] = config.lightG;
+  licht["B"] = config.lightB;
+  licht["W"] = config.lightW;
+
+  String payload;
+  serializeJson(doc, payload);
+  mqttClient.publish(topicTeleState.c_str(), payload.c_str(), false);
+  LOGD("MQTT TX telemetry: %s", payload.c_str());
 }
 
 void updateMqttTopics()
@@ -620,11 +1010,20 @@ void updateMqttTopics()
   topicShowState = topicBase + "/show/state";
   topicLightSet = topicBase + "/light/set";
   topicLightState = topicBase + "/light/state";
+  topicLightRgbwSet = topicBase + "/light/rgbw/set";
+  topicLightRgbwState = topicBase + "/light/rgbw/state";
+  topicCfgShowLengthSet = topicBase + "/config/show_length_s/set";
+  topicCfgShowLengthState = topicBase + "/config/show_length_s/state";
+  topicCfgNachlaufSet = topicBase + "/config/nachlauf_s/set";
+  topicCfgNachlaufState = topicBase + "/config/nachlauf_s/state";
   topicAvailability = topicBase + "/availability";
+  topicTeleState = "tele/" + deviceId + "/STATE";
+  LOGI("MQTT topics initialized: base=%s", topicBase.c_str());
 }
 
 void setupWiFi()
 {
+  LOGI("Initializing WiFi");
   apSsid = defaultApSsid();
 
   WiFi.persistent(false);
@@ -639,8 +1038,7 @@ void setupWiFi()
   }
   else
   {
-    Serial.print("STA connected. IP: ");
-    Serial.println(WiFi.localIP());
+    LOGI("STA connected. IP=%s", WiFi.localIP().toString().c_str());
   }
 }
 
@@ -648,16 +1046,14 @@ bool connectToConfiguredWifi(uint32_t timeoutMs)
 {
   if (config.wifiSsid.length() == 0)
   {
-    Serial.println("No WiFi SSID configured yet.");
+    LOGW("No WiFi SSID configured yet");
     return false;
   }
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(config.wifiSsid.c_str(), config.wifiPassword.c_str());
 
-  Serial.print("Connecting to WiFi '");
-  Serial.print(config.wifiSsid);
-  Serial.println("'...");
+  LOGI("Connecting to WiFi SSID '%s'...", config.wifiSsid.c_str());
 
   unsigned long startAt = millis();
   while (WiFi.status() != WL_CONNECTED && (millis() - startAt) < timeoutMs)
@@ -673,10 +1069,7 @@ void startAccessPoint()
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(apSsid.c_str());
 
-  Serial.print("AP started. SSID: ");
-  Serial.println(apSsid);
-  Serial.print("AP IP: ");
-  Serial.println(WiFi.softAPIP());
+  LOGI("AP started. SSID=%s AP_IP=%s", apSsid.c_str(), WiFi.softAPIP().toString().c_str());
 
   if (config.wifiSsid.length() > 0)
   {
@@ -689,7 +1082,7 @@ void setupCaptivePortal()
 {
   dnsServer.start(53, "*", WiFi.softAPIP());
   captivePortalEnabled = true;
-  Serial.println("Captive portal enabled");
+  LOGI("Captive portal enabled");
 }
 
 void setupWebServer()
@@ -700,11 +1093,12 @@ void setupWebServer()
   server.onNotFound(handleNotFound);
   server.begin();
 
-  Serial.println("Web server started on port 80");
+  LOGI("Web server started on port 80");
 }
 
 void handleRoot()
 {
+  LOGD("HTTP GET /");
   if (handleCaptivePortalRedirect())
   {
     return;
@@ -714,6 +1108,7 @@ void handleRoot()
 
 void handleSave()
 {
+  LOGI("HTTP /save requested");
   if (server.hasArg("ssid"))
   {
     config.wifiSsid = server.arg("ssid");
@@ -748,7 +1143,7 @@ void handleSave()
   }
   if (server.hasArg("show_nachlauf"))
   {
-    config.showNachlaufMs = clampU32((uint32_t)server.arg("show_nachlauf").toInt(), SHOW_NACHLAUF_MIN_MS, SHOW_NACHLAUF_MAX_MS);
+    config.showNachlaufMs = clampMinU32((uint32_t)server.arg("show_nachlauf").toInt(), SHOW_NACHLAUF_MIN_MS);
   }
   if (server.hasArg("light_r"))
   {
@@ -785,13 +1180,16 @@ void handleSave()
 
   showStatus.showDuration = config.showLengthMs;
   showStatus.showNachlauf = config.showNachlaufMs;
+  publishConfigState(true);
 
   if (!saveConfig())
   {
+    LOGW("Config save failed");
     server.send(500, "text/html", buildHtmlPage("Fehler beim Speichern."));
     return;
   }
 
+  LOGI("Config saved, restarting device");
   server.send(200, "text/html", buildHtmlPage("Gespeichert. Das Geraet startet neu..."));
   delay(500);
   ESP.restart();
@@ -799,7 +1197,8 @@ void handleSave()
 
 void handleStatus()
 {
-  StaticJsonDocument<256> status;
+  LOGD("HTTP GET /status");
+  StaticJsonDocument<512> status;
   status["wifi_connected"] = WiFi.status() == WL_CONNECTED;
   status["sta_ip"] = WiFi.localIP().toString();
   status["ap_enabled"] = captivePortalEnabled;
@@ -823,6 +1222,7 @@ void handleStatus()
 
 void handleNotFound()
 {
+  LOGD("HTTP NotFound: %s", server.uri().c_str());
   if (handleCaptivePortalRedirect())
   {
     return;
@@ -851,12 +1251,14 @@ bool handleCaptivePortalRedirect()
 
   server.sendHeader("Location", String("http://") + WiFi.softAPIP().toString(), true);
   server.send(302, "text/plain", "");
+  LOGD("Captive redirect for host=%s", host.c_str());
   return true;
 }
 
 void loadConfig()
 {
   config = AppConfig();
+  LOGI("Loading config from %s", CONFIG_FILE);
 
   if (!LittleFS.exists(CONFIG_FILE))
   {
@@ -870,7 +1272,7 @@ void loadConfig()
   File f = LittleFS.open(CONFIG_FILE, "r");
   if (!f)
   {
-    Serial.println("Could not open config file");
+    LOGW("Could not open config file");
     return;
   }
 
@@ -911,7 +1313,7 @@ void loadConfig()
     }
     else
     {
-      Serial.println("Config JSON parse failed, loading defaults.");
+      LOGW("Config JSON parse failed, loading defaults");
     }
   }
   else
@@ -937,7 +1339,7 @@ void loadConfig()
   }
 
   config.showLengthMs = clampU32(config.showLengthMs, SHOW_LENGTH_MIN_MS, SHOW_LENGTH_MAX_MS);
-  config.showNachlaufMs = clampU32(config.showNachlaufMs, SHOW_NACHLAUF_MIN_MS, SHOW_NACHLAUF_MAX_MS);
+  config.showNachlaufMs = clampMinU32(config.showNachlaufMs, SHOW_NACHLAUF_MIN_MS);
 
   showStatus.showDuration = config.showLengthMs;
   showStatus.showNachlauf = config.showNachlaufMs;
@@ -1024,12 +1426,13 @@ bool saveConfig()
   File f = LittleFS.open(CONFIG_FILE, "w");
   if (!f)
   {
-    Serial.println("Could not write config file");
+    LOGW("Could not write config file");
     return false;
   }
 
   serializeJson(doc, f);
   f.close();
+  LOGI("Config saved to LittleFS");
   return true;
 }
 
@@ -1089,6 +1492,27 @@ uint32_t clampU32(uint32_t value, uint32_t minValue, uint32_t maxValue)
   return value;
 }
 
+uint32_t clampMinU32(uint32_t value, uint32_t minValue)
+{
+  if (value < minValue)
+    return minValue;
+  return value;
+}
+
+uint32_t secToMs(uint32_t seconds)
+{
+  if (seconds > (UINT32_MAX / 1000UL))
+  {
+    return UINT32_MAX;
+  }
+  return seconds * 1000UL;
+}
+
+uint32_t msToSec(uint32_t milliseconds)
+{
+  return milliseconds / 1000UL;
+}
+
 uint8_t clampU8(int value)
 {
   if (value < 0)
@@ -1102,6 +1526,7 @@ void scheduleConfigSave()
 {
   configSavePending = true;
   configSaveAt = millis() + CONFIG_SAVE_DELAY_MS;
+  LOGD("Config save scheduled");
 }
 
 String htmlEscape(const String &input)
@@ -1185,8 +1610,8 @@ String buildHtmlPage(const String &message)
   html += "<label>MQTT User</label><input name='mqtt_user' value='" + htmlEscape(config.mqttUser) + "'>";
   html += "<label>MQTT Passwort</label><input name='mqtt_password' type='password' value='" + htmlEscape(config.mqttPassword) + "'>";
   html += "<label>MQTT Basis-Topic</label><input name='mqtt_topic' value='" + htmlEscape(config.mqttTopic) + "'>";
-  html += "<label>Laenge der Show (ms)</label><input name='show_length' type='number' min='1000' max='3600000' value='" + String(config.showLengthMs) + "'>";
-  html += "<label>Nachlaufzeit (ms)</label><input name='show_nachlauf' type='number' min='0' max='3600000' value='" + String(config.showNachlaufMs) + "'>";
+  html += "<label>Laenge der Show (ms)</label><input name='show_length' type='number' min='" + String(SHOW_LENGTH_MIN_MS) + "' max='" + String(SHOW_LENGTH_MAX_MS) + "' value='" + String(config.showLengthMs) + "'>";
+  html += "<label>Nachlaufzeit (ms)</label><input name='show_nachlauf' type='number' min='" + String(SHOW_NACHLAUF_MIN_MS) + "' value='" + String(config.showNachlaufMs) + "'>";
   html += "<label>Lichtfarbe R (0-255)</label><input name='light_r' type='number' min='0' max='255' value='" + String(config.lightR) + "'>";
   html += "<label>Lichtfarbe G (0-255)</label><input name='light_g' type='number' min='0' max='255' value='" + String(config.lightG) + "'>";
   html += "<label>Lichtfarbe B (0-255)</label><input name='light_b' type='number' min='0' max='255' value='" + String(config.lightB) + "'>";
