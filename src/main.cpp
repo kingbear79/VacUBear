@@ -9,9 +9,25 @@
 #include <WiFiClientSecureBearSSL.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include "pins.h"
 #if LED_COUNT > 0
 #include <NeoPixelBus.h>
 #endif
+
+// -----------------------------------------------------------------------------
+// VacUBear Firmware
+// -----------------------------------------------------------------------------
+// Architektur in Kurzform:
+// - Eine zeitbasierte Show-Statemachine steuert Pumpen und Ventil.
+// - Optionales RGBW-Licht (SK6812) wird synchron zur Show mit Soft-Fade gefahren.
+// - Konfiguration liegt persistent in LittleFS (/config.json).
+// - Steuerung/Monitoring via MQTT (inkl. Home Assistant Discovery).
+// - Lokales Web-Interface fuer WiFi/MQTT/Show/OTA-Parameter.
+// - OTA-Update ueber Manifest (Boot + periodischer Hintergrund-Check).
+//
+// Wichtiger Grundsatz:
+// Diese Datei ist der zentrale "Orchestrator". Einzelne Features sind als
+// logisch getrennte Funktionsbloecke organisiert, laufen aber im selben loop().
 
 #ifndef ENABLE_SERIAL_LOG
 #define ENABLE_SERIAL_LOG 0
@@ -26,11 +42,6 @@
 #define LOGW(...)
 #define LOGD(...)
 #endif
-
-#define PUMPE1 D5
-#define PUMPE2 D6
-#define VENTIL D7
-#define TASTER D2
 
 #define SHOW_LENGTH 50000UL
 #define SHOW_NACHLAUF 50000UL
@@ -47,27 +58,22 @@
 #define LED_COUNT 0
 #endif
 
-#ifndef LED_PIN
-#define LED_PIN D1
+#ifndef TELEMETRY_INTERVAL_MS_CFG
+#define TELEMETRY_INTERVAL_MS_CFG 300000UL
 #endif
 
-#ifndef LED_FADE_IN_MS
-#define LED_FADE_IN_MS 1200UL
-#endif
-
-#ifndef LED_FADE_OUT_MS
-#define LED_FADE_OUT_MS 1200UL
-#endif
-
-#ifndef LED_AFTER_BELUEFTEN_MS
-#define LED_AFTER_BELUEFTEN_MS 5000UL
-#endif
-
+// -----------------------------------------------------------------------------
+// Timing / Betriebsparameter
+// -----------------------------------------------------------------------------
+// Hinweis:
+// - *_CFG-Werte kommen aus Build-Flags (falls gesetzt).
+// - Die restlichen Konstanten sind bewusst fest im Code hinterlegt, damit
+//   Hardware-Schutz und Show-Charakter reproduzierbar bleiben.
 static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 15000UL;
 static const uint32_t WIFI_RETRY_INTERVAL_MS = 30000UL;
 static const uint32_t MQTT_RECONNECT_INTERVAL_MS = 5000UL;
 static const uint32_t CONFIG_SAVE_DELAY_MS = 2000UL;
-static const uint32_t OTA_CHECK_INTERVAL_MS = 3600000UL;
+static const uint32_t OTA_CHECK_INTERVAL_MS = 86400000UL;
 static const uint32_t OTA_HTTP_TIMEOUT_MS = 12000UL;
 // Developer limits (not user editable)
 static const uint32_t SHOW_LENGTH_MIN_S = 10UL;
@@ -81,9 +87,12 @@ static const uint16_t PUMP_PWM_FREQ_HZ = 1000;
 static const uint32_t PUMP_SOFTSTART_MS = 2500UL;
 static const uint32_t PUMP_SOFTSTOP_MS = 1200UL;
 static const uint32_t PUMP_PWM_UPDATE_MS = 20UL;
+static const uint32_t LED_FADE_IN_MS = 1200UL;
+static const uint32_t LED_FADE_OUT_MS = 1200UL;
+static const uint32_t LED_AFTER_BELUEFTEN_MS = 5000UL;
 static const uint16_t LIGHT_LEVEL_MAX = 1023;
 static const uint32_t LIGHT_UPDATE_MS = 20UL;
-static const uint32_t TELEMETRY_INTERVAL_MS = 10000UL;
+static const uint32_t TELEMETRY_INTERVAL_MS = TELEMETRY_INTERVAL_MS_CFG;
 
 static const char *CONFIG_FILE = "/config.json";
 static const char *DEVICE_PREFIX = "vacubear";
@@ -93,6 +102,7 @@ static const bool HAS_LED_OUTPUT = true;
 static const bool HAS_LED_OUTPUT = false;
 #endif
 
+// Persistente Anwender-Konfiguration (LittleFS JSON).
 struct AppConfig
 {
   String wifiSsid;
@@ -129,6 +139,12 @@ struct AppConfig
   }
 };
 
+// Laufzeitstatus der Show.
+//
+// Begriffe:
+// - now < endAt        -> "Vakuumieren" (Pumpen AN, Ventil geschlossen)
+// - endAt .. openValve -> "Haltezeit"   (Pumpen AUS, Ventil geschlossen)
+// - >= openValveAt     -> "Belueften"   (Ventil offen) bis Show-Ende
 class ShowStatus
 {
 public:
@@ -150,6 +166,7 @@ public:
   }
 };
 
+// Softstart/Softstop-Regelung fuer Pumpen per PWM.
 struct PumpSoftControl
 {
   uint16_t currentPwm;
@@ -162,6 +179,7 @@ struct PumpSoftControl
   }
 };
 
+// Soft-Fade-Regelung fuer LED-Ausgang.
 struct LightSoftControl
 {
   uint16_t currentLevel;
@@ -188,6 +206,7 @@ struct LightSoftControl
   }
 };
 
+// OTA-Zustand inkl. letzter Pruefung und Ergebnis.
 struct OtaStatus
 {
   String currentVersion;
@@ -214,7 +233,10 @@ struct OtaStatus
   }
 };
 
-Button button(TASTER, 25, true);
+// -----------------------------------------------------------------------------
+// Globale Laufzeitobjekte
+// -----------------------------------------------------------------------------
+Button button(PIN_TASTER, 25, true);
 ShowStatus showStatus;
 AppConfig config;
 ESP8266WebServer server(80);
@@ -253,9 +275,12 @@ bool otaCheckRequested = false;
 bool otaUpdateRequested = false;
 bool otaBootCheckPending = true;
 #if LED_COUNT > 0
-NeoPixelBus<NeoGrbwFeature, NeoEsp8266BitBang800KbpsMethod> lightBus(LED_COUNT, LED_PIN);
+NeoPixelBus<NeoGrbwFeature, NeoEsp8266BitBang800KbpsMethod> lightBus(LED_COUNT, PIN_LED);
 #endif
 
+// -----------------------------------------------------------------------------
+// Funktionsprototypen
+// -----------------------------------------------------------------------------
 void startShow(void);
 void stopShow(void);
 void handleShow(void);
@@ -318,16 +343,17 @@ void scheduleConfigSave(void);
 
 void setup()
 {
+  // setup() initialisiert nur. Die eigentliche Ablaufsteuerung passiert in loop().
   Serial.begin(115200);
   LOGI("Booting VacUBear firmware");
   otaStatus.currentVersion = String(FW_VERSION);
 
-  pinMode(PUMPE1, OUTPUT);
-  pinMode(PUMPE2, OUTPUT);
-  pinMode(VENTIL, OUTPUT);
+  pinMode(PIN_PUMPE1, OUTPUT);
+  pinMode(PIN_PUMPE2, OUTPUT);
+  pinMode(PIN_VENTIL, OUTPUT);
   setupPumpControl();
   setupLightControl();
-  digitalWrite(VENTIL, LOW);
+  digitalWrite(PIN_VENTIL, LOW);
 
   button.begin();
 
@@ -355,6 +381,11 @@ void setup()
 
 void loop()
 {
+  // Hauptreihenfolge:
+  // 1) lokale Eingaben einlesen
+  // 2) Show/Pumpen/Licht zeitbasiert fortschreiben
+  // 3) Netzwerkdienste (HTTP/DNS/WiFi/MQTT/OTA) bedienen
+  // 4) verzögertes Speichern ausfuehren
   button.read();
   if (button.wasPressed())
   {
@@ -388,7 +419,10 @@ void loop()
     if (mqttClient.connected())
     {
       publishShowState(true);
-      publishLightState(true);
+      if (HAS_LED_OUTPUT)
+      {
+        publishLightState(true);
+      }
       publishTelemetry(true);
     }
   }
@@ -428,6 +462,8 @@ void loop()
 
 void startShow()
 {
+  // Kein direkter Start hier: wir setzen nur ein Start-Flag.
+  // handleShow() uebernimmt dann atomar die Zeitstempelberechnung.
   if (showStatus.isRunning)
   {
     LOGD("startShow ignored: already running");
@@ -439,6 +475,8 @@ void startShow()
 
 void stopShow()
 {
+  // Stop erzwingt den fruehen Uebergang in die Belueften-Phase:
+  // endAt/openValveAt werden auf "sofort" gesetzt (kleine Sicherheitstoleranz).
   if (!showStatus.isRunning)
   {
     LOGD("stopShow ignored: not running");
@@ -454,6 +492,8 @@ void stopShow()
 
 void handleShow()
 {
+  // Zentrale Show-Statemachine, die in jedem loop()-Durchlauf getaktet wird.
+  // Alle Aktoren werden hier konsistent aus "Zeitfenster + Status" abgeleitet.
   if (showStatus.shouldStart)
   {
     showStatus.endAt = millis() + showStatus.showDuration;
@@ -471,17 +511,17 @@ void handleShow()
     if (millis() < showStatus.endAt)
     {
       setPumpTarget(true);
-      digitalWrite(VENTIL, HIGH);
+      digitalWrite(PIN_VENTIL, HIGH);
     }
     else if (millis() < showStatus.openValveAt)
     {
       setPumpTarget(false);
-      digitalWrite(VENTIL, HIGH);
+      digitalWrite(PIN_VENTIL, HIGH);
     }
     else
     {
       setPumpTarget(false);
-      digitalWrite(VENTIL, LOW);
+      digitalWrite(PIN_VENTIL, LOW);
       showStatus.isRunning = false;
       LOGI("Show finished");
     }
@@ -489,13 +529,14 @@ void handleShow()
   else
   {
     setPumpTarget(false);
-    digitalWrite(VENTIL, LOW);
+    digitalWrite(PIN_VENTIL, LOW);
     showStatus.isRunning = false;
   }
 }
 
 void setupPumpControl()
 {
+  // Einheitliche PWM-Konfiguration fuer beide Pumpen.
   analogWriteRange(PUMP_PWM_MAX);
   analogWriteFreq(PUMP_PWM_FREQ_HZ);
   applyPumpPwm(0);
@@ -514,6 +555,10 @@ void setPumpTarget(bool enabled)
 
 void updatePumpControl()
 {
+  // Zeitdiskrete Rampe:
+  // - Update nur alle PUMP_PWM_UPDATE_MS
+  // - step-Berechnung so, dass Rampenzeiten auch bei ganzzahligen Schritten
+  //   moeglichst nah an den Sollwerten bleiben.
   unsigned long now = millis();
   if (now - pumpControl.lastUpdateAt < PUMP_PWM_UPDATE_MS)
   {
@@ -562,12 +607,13 @@ void updatePumpControl()
 
 void applyPumpPwm(uint16_t pwm)
 {
-  analogWrite(PUMPE1, pwm);
-  analogWrite(PUMPE2, pwm);
+  analogWrite(PIN_PUMPE1, pwm);
+  analogWrite(PIN_PUMPE2, pwm);
 }
 
 void setupLightControl()
 {
+  // Lichtzustand immer definiert resetten, auch wenn LED_COUNT=0 ist.
   lightControl.currentLevel = 0;
   lightControl.targetLevel = 0;
   lightControl.onUntilAt = 0;
@@ -579,7 +625,7 @@ void setupLightControl()
   lightBus.ClearTo(RgbwColor(0, 0, 0, 0));
   lightBus.Show();
   lightControl.outputInitialized = true;
-  LOGI("Light output configured: count=%u pin=%d", (unsigned int)LED_COUNT, (int)LED_PIN);
+  LOGI("Light output configured: count=%u pin=%d", (unsigned int)LED_COUNT, (int)PIN_LED);
 #else
   LOGI("Light output disabled: LED_COUNT=0");
 #endif
@@ -601,6 +647,9 @@ void setLightTargetLevel(uint16_t level)
 void applyLightOutput(bool force)
 {
 #if LED_COUNT > 0
+  // RGBW aus Konfiguration wird mit aktuellem Soft-Fade-Level skaliert.
+  // Dadurch bleibt die eingestellte Farbe erhalten, waehrend nur die
+  // Helligkeit zeitlich ein-/ausgeblendet wird.
   if (!HAS_LED_OUTPUT || !lightControl.outputInitialized)
   {
     return;
@@ -638,6 +687,9 @@ void applyLightOutput(bool force)
 
 void updateLightControl()
 {
+  // Licht ist aktiv:
+  // - waehrend showStatus.isRunning
+  // - plus Nachlauf LED_AFTER_BELUEFTEN_MS nach Belueftungsbeginn
   unsigned long now = millis();
   bool lightWindowActive = showStatus.isRunning;
   if (!lightWindowActive && lightControl.onUntilAt > 0)
@@ -695,6 +747,8 @@ void updateLightControl()
 
 void setSafeOutputState()
 {
+  // Wird z. B. vor OTA aufgerufen, um alle Aktoren in sicheren Zustand
+  // zu bringen (Pumpen AUS, Ventil definiert, Licht AUS).
   showStatus.shouldStart = false;
   showStatus.isRunning = false;
   setPumpTarget(false);
@@ -704,7 +758,7 @@ void setSafeOutputState()
   lightControl.currentLevel = 0;
   lightControl.targetLevel = 0;
   applyLightOutput(true);
-  digitalWrite(VENTIL, LOW);
+  digitalWrite(PIN_VENTIL, LOW);
 }
 
 static bool isDigitChar(char c)
@@ -714,6 +768,8 @@ static bool isDigitChar(char c)
 
 static size_t extractVersionNumbers(const String &version, uint32_t *outParts, size_t maxParts)
 {
+  // Extrahiert numerische Teile aus Strings wie:
+  // "1.2.3-dev" -> [1,2,3]
   size_t count = 0;
   int index = 0;
   int len = (int)version.length();
@@ -743,6 +799,8 @@ static size_t extractVersionNumbers(const String &version, uint32_t *outParts, s
 
 static int versionQualifierRank(const String &version)
 {
+  // Reihenfolge fuer Prae-Release-Tags:
+  // dev < alpha < beta < rc < stable
   String lower = version;
   lower.toLowerCase();
 
@@ -775,6 +833,9 @@ static int versionQualifierRank(const String &version)
 
 int compareVersionStrings(const String &lhs, const String &rhs)
 {
+  // Vergleich in 2 Schritten:
+  // 1) numerische Segmente (SemVer-aehnlich)
+  // 2) Qualifier-Rang (dev/beta/rc/stable)
   const size_t MAX_PARTS = 8;
   uint32_t leftParts[MAX_PARTS] = {0};
   uint32_t rightParts[MAX_PARTS] = {0};
@@ -821,6 +882,7 @@ int compareVersionStrings(const String &lhs, const String &rhs)
 
 void updateOtaDerivedState(const String &latestVersion, const String &firmwareUrl, const String &releaseNotes)
 {
+  // Leitet "updateAvailable" ausschließlich aus Version + URL ab.
   otaStatus.latestVersion = latestVersion;
   otaStatus.firmwareUrl = firmwareUrl;
   otaStatus.releaseNotes = releaseNotes;
@@ -836,6 +898,8 @@ void updateOtaDerivedState(const String &latestVersion, const String &firmwareUr
 
 bool otaCheckForUpdate(const char *reason)
 {
+  // Holt manifest.json, validiert Pflichtfelder und aktualisiert otaStatus.
+  // reason ist nur fuer Logging/Diagnose (boot/manual/daily ...).
   if (otaStatus.checkInProgress || otaStatus.updateInProgress)
   {
     return false;
@@ -953,6 +1017,8 @@ bool otaCheckForUpdate(const char *reason)
 
 bool otaApplyUpdate()
 {
+  // Fuehrt das eigentliche OTA-Flash aus.
+  // Voraussetzung: WiFi online, Show gestoppt, gueltige Firmware-URL.
   if (otaStatus.updateInProgress)
   {
     return false;
@@ -1020,6 +1086,10 @@ bool otaApplyUpdate()
 
 void otaLoop()
 {
+  // OTA-Scheduler:
+  // - Boot-Check (sobald WLAN steht)
+  // - manuell angeforderte Checks/Updates
+  // - periodischer Check (Intervallkonstante)
   if (otaBootCheckPending && WiFi.status() == WL_CONNECTED)
   {
     otaBootCheckPending = false;
@@ -1047,12 +1117,13 @@ void otaLoop()
       !otaStatus.updateInProgress &&
       (millis() - otaStatus.lastCheckAt) >= OTA_CHECK_INTERVAL_MS)
   {
-    otaCheckForUpdate("hourly");
+    otaCheckForUpdate("daily");
   }
 }
 
 void setupMqtt()
 {
+  // Nur Client-Grundkonfiguration. Verbindungsaufbau passiert in mqttEnsureConnected().
   mqttClient.setServer(config.mqttHost.c_str(), config.mqttPort);
   mqttClient.setBufferSize(1024);
   mqttClient.setCallback(mqttCallback);
@@ -1062,6 +1133,7 @@ void setupMqtt()
 
 void mqttLoop()
 {
+  // MQTT nur bedienen, wenn STA-Link aktiv ist.
   if (WiFi.status() != WL_CONNECTED)
   {
     return;
@@ -1078,6 +1150,7 @@ void mqttLoop()
 
 void mqttEnsureConnected()
 {
+  // Nicht blockierender Reconnect mit Zeitabstand, damit loop() reaktiv bleibt.
   if (config.mqttHost.length() == 0)
   {
     LOGW("MQTT disabled: broker host empty");
@@ -1123,20 +1196,32 @@ void mqttEnsureConnected()
   LOGI("MQTT connected");
 
   mqttClient.subscribe(topicShowSet.c_str());
-  mqttClient.subscribe(topicLightSet.c_str());
-  mqttClient.subscribe(topicLightRgbwSet.c_str());
+  if (HAS_LED_OUTPUT)
+  {
+    mqttClient.subscribe(topicLightSet.c_str());
+    mqttClient.subscribe(topicLightRgbwSet.c_str());
+  }
   mqttClient.subscribe(topicCfgShowLengthSet.c_str());
   mqttClient.subscribe(topicCfgNachlaufSet.c_str());
   publishAvailability("online", true);
   publishDiscovery();
   publishShowState(true);
-  publishLightState(true);
+  if (HAS_LED_OUTPUT)
+  {
+    publishLightState(true);
+  }
   publishConfigState(true);
   publishTelemetry(true);
 }
 
 void mqttCallback(char *topic, byte *payload, unsigned int length)
 {
+  // Zentraler MQTT-Command-Dispatcher.
+  // Erwartete Payloads:
+  // - show/set: ON|OFF
+  // - light/set: ON|OFF oder JSON
+  // - light/rgbw/set: "r,g,b,w"
+  // - config/*/set: Sekundenwerte
   String topicStr(topic);
   String payloadStr;
   payloadStr.reserve(length + 1);
@@ -1162,7 +1247,13 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
     return;
   }
 
-  if (topicStr == topicLightSet)
+  if (!HAS_LED_OUTPUT && (topicStr == topicLightSet || topicStr == topicLightRgbwSet))
+  {
+    LOGD("Ignoring light MQTT command (LED_COUNT=0)");
+    return;
+  }
+
+  if (HAS_LED_OUTPUT && topicStr == topicLightSet)
   {
     bool changed = false;
 
@@ -1224,7 +1315,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
     return;
   }
 
-  if (topicStr == topicLightRgbwSet)
+  if (HAS_LED_OUTPUT && topicStr == topicLightRgbwSet)
   {
     int r = -1;
     int g = -1;
@@ -1295,12 +1386,19 @@ void publishAvailability(const char *state, bool retained)
 
 void publishShowState(bool retained)
 {
+  // Show-Entity in HA: ON nur waehrend showStatus.isRunning.
   mqttClient.publish(topicShowState.c_str(), showStatus.isRunning ? "ON" : "OFF", retained);
   LOGD("MQTT TX show_state=%s", showStatus.isRunning ? "ON" : "OFF");
 }
 
 void publishLightState(bool retained)
 {
+  // Licht-Entity ist Konfig-Interface:
+  // State bleibt ON, Farbe kommt aus persistenter Konfiguration.
+  if (!HAS_LED_OUTPUT)
+  {
+    return;
+  }
   mqttClient.publish(topicLightState.c_str(), "ON", retained);
   String rgbw = String(config.lightR) + "," + String(config.lightG) + "," + String(config.lightB) + "," + String(config.lightW);
   mqttClient.publish(topicLightRgbwState.c_str(), rgbw.c_str(), retained);
@@ -1322,6 +1420,8 @@ void publishConfigState(bool retained)
 
 void publishDiscovery()
 {
+  // Veroeffentlicht HA Discovery fuer Steuer-Entities.
+  // Bei LED_COUNT=0 wird die Light-Discovery absichtlich geloescht.
   LOGI("Publishing Home Assistant discovery");
   StaticJsonDocument<512> switchCfg;
   switchCfg["name"] = "Vakuumieren";
@@ -1346,39 +1446,55 @@ void publishDiscovery()
   String switchDiscoveryTopic = "homeassistant/switch/" + deviceId + "/show/config";
   mqttClient.publish(switchDiscoveryTopic.c_str(), switchPayload.c_str(), true);
 
-  StaticJsonDocument<512> lightCfg;
-  lightCfg["name"] = "Lichtfarbe";
-  lightCfg["object_id"] = "light";
-  lightCfg["unique_id"] = deviceId + "-light";
-  lightCfg["command_topic"] = topicLightSet;
-  lightCfg["state_topic"] = topicLightState;
-  lightCfg["payload_on"] = "ON";
-  lightCfg["payload_off"] = "OFF";
-  lightCfg["rgbw_command_topic"] = topicLightRgbwSet;
-  lightCfg["rgbw_state_topic"] = topicLightRgbwState;
-  lightCfg["enabled_by_default"] = HAS_LED_OUTPUT;
-  JsonArray colorModes = lightCfg["supported_color_modes"].to<JsonArray>();
-  colorModes.add("rgbw");
-  lightCfg["availability_topic"] = topicAvailability;
-  lightCfg["payload_available"] = "online";
-  lightCfg["payload_not_available"] = "offline";
-  JsonObject lightDevice = lightCfg["device"].to<JsonObject>();
-  JsonArray lightIds = lightDevice["identifiers"].to<JsonArray>();
-  lightIds.add(deviceId);
-  lightDevice["name"] = "VacUBear";
-  lightDevice["manufacturer"] = "KingBEAR";
-  lightDevice["model"] = "Frame-25";
-
-  String lightPayload;
-  serializeJson(lightCfg, lightPayload);
   String lightDiscoveryTopic = "homeassistant/light/" + deviceId + "/light/config";
-  mqttClient.publish(lightDiscoveryTopic.c_str(), lightPayload.c_str(), true);
+  if (HAS_LED_OUTPUT)
+  {
+    StaticJsonDocument<768> lightCfg;
+    lightCfg["name"] = "Lichtfarbe";
+    lightCfg["object_id"] = "light";
+    lightCfg["unique_id"] = deviceId + "-light";
+    lightCfg["command_topic"] = topicLightSet;
+    lightCfg["state_topic"] = topicLightState;
+    lightCfg["payload_on"] = "ON";
+    lightCfg["payload_off"] = "OFF";
+    lightCfg["rgbw_command_topic"] = topicLightRgbwSet;
+    lightCfg["rgbw_state_topic"] = topicLightRgbwState;
+    JsonArray colorModes = lightCfg["supported_color_modes"].to<JsonArray>();
+    colorModes.add("rgbw");
+    lightCfg["availability_topic"] = topicAvailability;
+    lightCfg["payload_available"] = "online";
+    lightCfg["payload_not_available"] = "offline";
+    JsonObject lightDevice = lightCfg["device"].to<JsonObject>();
+    JsonArray lightIds = lightDevice["identifiers"].to<JsonArray>();
+    lightIds.add(deviceId);
+    lightDevice["name"] = "VacUBear";
+    lightDevice["manufacturer"] = "KingBEAR";
+    lightDevice["model"] = "Frame-25";
+
+    if (lightCfg.overflowed())
+    {
+      LOGW("Light discovery payload overflowed");
+    }
+
+    String lightPayload;
+    serializeJson(lightCfg, lightPayload);
+    mqttClient.publish(lightDiscoveryTopic.c_str(), lightPayload.c_str(), true);
+    LOGD("MQTT TX light discovery: %s", lightPayload.c_str());
+  }
+  else
+  {
+    mqttClient.publish(lightDiscoveryTopic.c_str(), "", true);
+    mqttClient.publish(topicLightState.c_str(), "", true);
+    mqttClient.publish(topicLightRgbwState.c_str(), "", true);
+    LOGI("Light discovery removed (LED_COUNT=0)");
+  }
 
   publishSensorDiscovery();
 }
 
 void publishSensorDiscovery()
 {
+  // Veroeffentlicht Diagnose-/Status-Entities (Sensoren/Binary-Sensoren/Number).
   auto addDevice = [&](JsonObject obj)
   {
     JsonObject dev = obj["device"].to<JsonObject>();
@@ -1590,6 +1706,7 @@ void publishSensorDiscovery()
 
 const char *getShowPhase()
 {
+  // Menschlich lesbare Show-Phase fuer Telemetrie/UI.
   unsigned long now = millis();
   if (showStatus.isRunning)
   {
@@ -1613,6 +1730,8 @@ const char *getShowPhase()
 
 void publishTelemetry(bool force)
 {
+  // Tasmota-aehnliche Sammeltelemetrie auf tele/<deviceId>/STATE.
+  // Wird periodisch und bei relevanten Events veroeffentlicht.
   if (!mqttClient.connected())
   {
     return;
@@ -1650,18 +1769,21 @@ void publishTelemetry(bool force)
   pumpen["PWM"] = pumpControl.currentPwm;
   pumpen["TargetPWM"] = pumpControl.targetPwm;
 
-  JsonObject licht = doc["Lichtfarbe"].to<JsonObject>();
-  licht["R"] = config.lightR;
-  licht["G"] = config.lightG;
-  licht["B"] = config.lightB;
-  licht["W"] = config.lightW;
+  if (HAS_LED_OUTPUT)
+  {
+    JsonObject licht = doc["Lichtfarbe"].to<JsonObject>();
+    licht["R"] = config.lightR;
+    licht["G"] = config.lightG;
+    licht["B"] = config.lightB;
+    licht["W"] = config.lightW;
 
-  JsonObject led = doc["LED"].to<JsonObject>();
-  led["Enabled"] = HAS_LED_OUTPUT;
-  led["Count"] = LED_COUNT;
-  led["Level"] = lightControl.currentLevel;
-  led["TargetLevel"] = lightControl.targetLevel;
-  led["OnUntilAt"] = lightControl.onUntilAt;
+    JsonObject led = doc["LED"].to<JsonObject>();
+    led["Enabled"] = true;
+    led["Count"] = LED_COUNT;
+    led["Level"] = lightControl.currentLevel;
+    led["TargetLevel"] = lightControl.targetLevel;
+    led["OnUntilAt"] = lightControl.onUntilAt;
+  }
 
   JsonObject ota = doc["OTA"].to<JsonObject>();
   ota["CurrentVersion"] = otaStatus.currentVersion;
@@ -1680,6 +1802,7 @@ void publishTelemetry(bool force)
 
 void updateMqttTopics()
 {
+  // Normalisiert Basis-Topic und erzeugt daraus alle Einzel-Topics.
   topicBase = config.mqttTopic;
   topicBase.trim();
   if (topicBase.length() == 0 || topicBase == "vacubear" || topicBase.startsWith("vacubear/"))
@@ -1708,6 +1831,9 @@ void updateMqttTopics()
 
 void setupWiFi()
 {
+  // Strategie:
+  // 1) STA-Verbindung versuchen
+  // 2) bei Fehlschlag AP + Captive Portal starten
   LOGI("Initializing WiFi");
   apSsid = defaultApSsid();
 
@@ -1729,6 +1855,8 @@ void setupWiFi()
 
 bool connectToConfiguredWifi(uint32_t timeoutMs)
 {
+  // Blockierender Erstverbindungsversuch nur in setup().
+  // Spaetere Reconnects laufen nicht-blockierend in loop().
   if (config.wifiSsid.length() == 0)
   {
     LOGW("No WiFi SSID configured yet");
@@ -1751,6 +1879,9 @@ bool connectToConfiguredWifi(uint32_t timeoutMs)
 
 void startAccessPoint()
 {
+  // AP+STA erlaubt parallel:
+  // - lokale Konfiguration ueber AP
+  // - gleichzeitiger STA-Reconnect im Hintergrund
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(apSsid.c_str());
 
@@ -1765,6 +1896,7 @@ void startAccessPoint()
 
 void setupCaptivePortal()
 {
+  // DNS wildcard auf AP-IP, damit Clients automatisch auf das Web-UI landen.
   dnsServer.start(53, "*", WiFi.softAPIP());
   captivePortalEnabled = true;
   LOGI("Captive portal enabled");
@@ -1772,6 +1904,11 @@ void setupCaptivePortal()
 
 void setupWebServer()
 {
+  // Web-API:
+  // - "/"          Konfigseite
+  // - "/save"      Konfig speichern + reboot
+  // - "/status"    Laufzeitstatus JSON
+  // - "/ota/*"     OTA-Status, Check, Update
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/status", HTTP_GET, handleStatus);
@@ -1796,6 +1933,7 @@ void handleRoot()
 
 void handleSave()
 {
+  // Uebernimmt Formwerte, validiert/clamped sie, speichert und rebootet.
   LOGI("HTTP /save requested");
   if (server.hasArg("ssid"))
   {
@@ -1837,21 +1975,24 @@ void handleSave()
   {
     config.showNachlaufMs = clampMinU32((uint32_t)server.arg("show_nachlauf").toInt(), SHOW_NACHLAUF_MIN_MS);
   }
-  if (server.hasArg("light_r"))
+  if (HAS_LED_OUTPUT)
   {
-    config.lightR = clampU8(server.arg("light_r").toInt());
-  }
-  if (server.hasArg("light_g"))
-  {
-    config.lightG = clampU8(server.arg("light_g").toInt());
-  }
-  if (server.hasArg("light_b"))
-  {
-    config.lightB = clampU8(server.arg("light_b").toInt());
-  }
-  if (server.hasArg("light_w"))
-  {
-    config.lightW = clampU8(server.arg("light_w").toInt());
+    if (server.hasArg("light_r"))
+    {
+      config.lightR = clampU8(server.arg("light_r").toInt());
+    }
+    if (server.hasArg("light_g"))
+    {
+      config.lightG = clampU8(server.arg("light_g").toInt());
+    }
+    if (server.hasArg("light_b"))
+    {
+      config.lightB = clampU8(server.arg("light_b").toInt());
+    }
+    if (server.hasArg("light_w"))
+    {
+      config.lightW = clampU8(server.arg("light_w").toInt());
+    }
   }
 
   config.wifiSsid.trim();
@@ -1905,17 +2046,20 @@ void handleStatus()
   status["show_nachlauf"] = config.showNachlaufMs;
   status["pump_pwm"] = pumpControl.currentPwm;
   status["pump_target_pwm"] = pumpControl.targetPwm;
-  status["light_enabled"] = HAS_LED_OUTPUT;
-  status["led_count"] = LED_COUNT;
-  status["light_level"] = lightControl.currentLevel;
-  status["light_target_level"] = lightControl.targetLevel;
-  status["light_on_until_at"] = lightControl.onUntilAt;
+  if (HAS_LED_OUTPUT)
+  {
+    status["light_enabled"] = true;
+    status["led_count"] = LED_COUNT;
+    status["light_level"] = lightControl.currentLevel;
+    status["light_target_level"] = lightControl.targetLevel;
+    status["light_on_until_at"] = lightControl.onUntilAt;
 
-  JsonObject color = status["light"].to<JsonObject>();
-  color["r"] = config.lightR;
-  color["g"] = config.lightG;
-  color["b"] = config.lightB;
-  color["w"] = config.lightW;
+    JsonObject color = status["light"].to<JsonObject>();
+    color["r"] = config.lightR;
+    color["g"] = config.lightG;
+    color["b"] = config.lightB;
+    color["w"] = config.lightW;
+  }
 
   JsonObject ota = status["ota"].to<JsonObject>();
   ota["current_version"] = otaStatus.currentVersion;
@@ -2007,6 +2151,7 @@ void handleOtaUpdate()
 
 void handleNotFound()
 {
+  // Captive-Portal-Umleitung fuer "fremde" Hostnamen.
   LOGD("HTTP NotFound: %s", server.uri().c_str());
   if (handleCaptivePortalRedirect())
   {
@@ -2018,6 +2163,7 @@ void handleNotFound()
 
 bool handleCaptivePortalRedirect()
 {
+  // Leitet nur um, wenn Hostname keine direkte IP/AP-Adresse ist.
   if (!captivePortalEnabled)
   {
     return false;
@@ -2042,6 +2188,10 @@ bool handleCaptivePortalRedirect()
 
 void loadConfig()
 {
+  // Liest JSON-Konfiguration aus LittleFS.
+  // Fallbacks:
+  // - Datei fehlt/leer -> Defaults + sofort speichern
+  // - Legacy-Textformat -> migrieren und als JSON neu speichern
   config = AppConfig();
   LOGI("Loading config from %s", CONFIG_FILE);
 
@@ -2138,6 +2288,7 @@ void loadConfig()
 
 void loadLegacyConfig(const String &raw)
 {
+  // Alte zeilenbasierte Konfiguration wird positionsbasiert eingelesen.
   const int MAX_LINES = 16;
   String lines[MAX_LINES];
   int count = 0;
@@ -2191,6 +2342,7 @@ void loadLegacyConfig(const String &raw)
 
 bool saveConfig()
 {
+  // Persistiert die aktuelle AppConfig in /config.json.
   StaticJsonDocument<1024> doc;
 
   JsonObject wifi = doc["wifi"].to<JsonObject>();
@@ -2245,6 +2397,7 @@ bool isIpAddress(const String &host)
 
 bool isLegacyOtaManifestUrl(const String &url)
 {
+  // Erkennt fruehere OTA-URL-Variante, um auf neues Schema zu migrieren.
   String normalized = url;
   normalized.trim();
   normalized.toLowerCase();
@@ -2260,6 +2413,9 @@ String defaultApSsid()
 
 String defaultDeviceId()
 {
+  // Device-ID-Quelle:
+  // - bevorzugt komplette MAC (stabil + weltweit eindeutig)
+  // - fallback auf Chip-ID
   uint8_t mac[6] = {0, 0, 0, 0, 0, 0};
   WiFi.macAddress(mac);
 
@@ -2326,6 +2482,8 @@ uint8_t clampU8(int value)
 
 void scheduleConfigSave()
 {
+  // Entkoppelt haeufige Eingaben von Flash-Schreibzyklen.
+  // Jede neue Aenderung schiebt den Save-Zeitpunkt nach hinten.
   configSavePending = true;
   configSaveAt = millis() + CONFIG_SAVE_DELAY_MS;
   LOGD("Config save scheduled");
@@ -2356,6 +2514,8 @@ String htmlEscape(const String &input)
 
 String buildHtmlPage(const String &message)
 {
+  // Einfache, eingebettete Setup-Seite ohne externe Assets.
+  // Vorteil: laeuft auch im AP/Captive-Portal-Modus robust.
   int networkCount = WiFi.scanNetworks();
   String options;
   if (networkCount > 0)
@@ -2418,10 +2578,13 @@ String buildHtmlPage(const String &message)
   html += "<label>OTA Manifest URL</label><input name='ota_manifest_url' value='" + htmlEscape(config.otaManifestUrl) + "' placeholder='https://.../manifest.json'>";
   html += "<label>Laenge der Show (ms)</label><input name='show_length' type='number' min='" + String(SHOW_LENGTH_MIN_MS) + "' max='" + String(SHOW_LENGTH_MAX_MS) + "' value='" + String(config.showLengthMs) + "'>";
   html += "<label>Nachlaufzeit (ms)</label><input name='show_nachlauf' type='number' min='" + String(SHOW_NACHLAUF_MIN_MS) + "' value='" + String(config.showNachlaufMs) + "'>";
-  html += "<label>Lichtfarbe R (0-255)</label><input name='light_r' type='number' min='0' max='255' value='" + String(config.lightR) + "'>";
-  html += "<label>Lichtfarbe G (0-255)</label><input name='light_g' type='number' min='0' max='255' value='" + String(config.lightG) + "'>";
-  html += "<label>Lichtfarbe B (0-255)</label><input name='light_b' type='number' min='0' max='255' value='" + String(config.lightB) + "'>";
-  html += "<label>Lichtfarbe W (0-255)</label><input name='light_w' type='number' min='0' max='255' value='" + String(config.lightW) + "'>";
+  if (HAS_LED_OUTPUT)
+  {
+    html += "<label>Lichtfarbe R (0-255)</label><input name='light_r' type='number' min='0' max='255' value='" + String(config.lightR) + "'>";
+    html += "<label>Lichtfarbe G (0-255)</label><input name='light_g' type='number' min='0' max='255' value='" + String(config.lightG) + "'>";
+    html += "<label>Lichtfarbe B (0-255)</label><input name='light_b' type='number' min='0' max='255' value='" + String(config.lightB) + "'>";
+    html += "<label>Lichtfarbe W (0-255)</label><input name='light_w' type='number' min='0' max='255' value='" + String(config.lightW) + "'>";
+  }
   html += "<button type='submit'>Speichern & Neustart</button></form>";
   html += "<hr><h3>OTA Firmware</h3>";
   html += "<div id='ota-box' class='status'>Lade OTA-Status...</div>";
