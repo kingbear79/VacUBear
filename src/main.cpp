@@ -43,8 +43,8 @@
 #define LOGD(...)
 #endif
 
-#define SHOW_LENGTH 50000UL
-#define SHOW_NACHLAUF 50000UL
+#define SHOW_LENGTH 10000UL
+#define SHOW_NACHLAUF 20000UL
 
 #ifndef FW_VERSION
 #define FW_VERSION "0.0.0-dev"
