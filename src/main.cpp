@@ -254,6 +254,24 @@ struct OtaStatus
   }
 };
 
+struct ParsedHttpUrl
+{
+  bool valid;
+  bool https;
+  String host;
+  uint16_t port;
+  String path;
+
+  ParsedHttpUrl()
+      : valid(false),
+        https(false),
+        host(""),
+        port(0),
+        path("/")
+  {
+  }
+};
+
 // -----------------------------------------------------------------------------
 // Globale Laufzeitobjekte
 // -----------------------------------------------------------------------------
@@ -330,6 +348,8 @@ void otaSetProgress(size_t current, size_t total);
 void otaScheduleRestart(const String &statusText);
 void otaFinalizeFailure(const String &errorText);
 String formatHttpClientError(int httpCode, BearSSL::WiFiClientSecure *secureClient = nullptr);
+bool parseHttpUrl(const String &url, ParsedHttpUrl &parsed);
+bool configureSecureClientForUrl(BearSSL::WiFiClientSecure &secureClient, const String &url, String &tlsNote);
 void setupWiFi(void);
 void setupWebServer(void);
 void setupMqtt(void);
@@ -1066,6 +1086,93 @@ String formatHttpClientError(int httpCode, BearSSL::WiFiClientSecure *secureClie
   return message;
 }
 
+bool parseHttpUrl(const String &url, ParsedHttpUrl &parsed)
+{
+  parsed = ParsedHttpUrl();
+
+  int schemeEnd = url.indexOf("://");
+  if (schemeEnd <= 0)
+  {
+    return false;
+  }
+
+  String scheme = url.substring(0, schemeEnd);
+  scheme.toLowerCase();
+  if (scheme == "https")
+  {
+    parsed.https = true;
+    parsed.port = 443;
+  }
+  else if (scheme == "http")
+  {
+    parsed.https = false;
+    parsed.port = 80;
+  }
+  else
+  {
+    return false;
+  }
+
+  int hostStart = schemeEnd + 3;
+  int pathStart = url.indexOf('/', hostStart);
+  String authority = pathStart >= 0 ? url.substring(hostStart, pathStart) : url.substring(hostStart);
+  parsed.path = pathStart >= 0 ? url.substring(pathStart) : "/";
+
+  int atPos = authority.lastIndexOf('@');
+  if (atPos >= 0)
+  {
+    authority = authority.substring(atPos + 1);
+  }
+
+  int colonPos = authority.lastIndexOf(':');
+  if (colonPos >= 0 && authority.indexOf(']') < 0)
+  {
+    parsed.host = authority.substring(0, colonPos);
+    parsed.port = (uint16_t)authority.substring(colonPos + 1).toInt();
+  }
+  else
+  {
+    parsed.host = authority;
+  }
+
+  parsed.host.trim();
+  if (parsed.host.length() == 0 || parsed.port == 0)
+  {
+    return false;
+  }
+
+  parsed.valid = true;
+  return true;
+}
+
+bool configureSecureClientForUrl(BearSSL::WiFiClientSecure &secureClient, const String &url, String &tlsNote)
+{
+  tlsNote = "";
+  secureClient.setInsecure();
+  secureClient.setTimeout(OTA_HTTP_TIMEOUT_MS);
+
+  ParsedHttpUrl parsed;
+  if (!parseHttpUrl(url, parsed) || !parsed.https)
+  {
+    return true;
+  }
+
+  const uint16_t recvCandidates[] = {512, 1024, 2048, 4096};
+  for (size_t i = 0; i < (sizeof(recvCandidates) / sizeof(recvCandidates[0])); i++)
+  {
+    uint16_t recvSize = recvCandidates[i];
+    if (BearSSL::WiFiClientSecure::probeMaxFragmentLength(parsed.host, parsed.port, recvSize))
+    {
+      secureClient.setBufferSizes(recvSize, 512);
+      tlsNote = "TLS-MFLN aktiv (" + String(recvSize) + "/512)";
+      return true;
+    }
+  }
+
+  tlsNote = "TLS-MFLN nicht verfuegbar";
+  return true;
+}
+
 void updateOtaDerivedState(const String &latestVersion, const String &firmwareUrl, const String &releaseNotes)
 {
   // Leitet "updateAvailable" ausschließlich aus Version + URL ab.
@@ -1122,11 +1229,11 @@ bool otaCheckForUpdate(const char *reason)
     mqttClient.disconnect();
     delay(50);
   }
-  LOGI("OTA check (%s): %s heap=%u", reason, requestUrl.c_str(), ESP.getFreeHeap());
 
   BearSSL::WiFiClientSecure secureClient;
-  secureClient.setInsecure();
-  secureClient.setTimeout(OTA_HTTP_TIMEOUT_MS);
+  String tlsNote;
+  configureSecureClientForUrl(secureClient, requestUrl, tlsNote);
+  LOGI("OTA check (%s): %s heap=%u tls=%s", reason, requestUrl.c_str(), ESP.getFreeHeap(), tlsNote.c_str());
 
   HTTPClient http;
   http.setTimeout(OTA_HTTP_TIMEOUT_MS);
@@ -1142,7 +1249,7 @@ bool otaCheckForUpdate(const char *reason)
     {
       publishTelemetry(true);
     }
-    LOGW("OTA check failed: begin() failed");
+    LOGW("OTA check failed: begin() failed tls=%s", tlsNote.c_str());
     return false;
   }
 
@@ -1150,6 +1257,10 @@ bool otaCheckForUpdate(const char *reason)
   if (httpCode != HTTP_CODE_OK)
   {
     otaStatus.lastError = formatHttpClientError(httpCode, &secureClient);
+    if (httpCode == HTTPC_ERROR_CONNECTION_FAILED && tlsNote == "TLS-MFLN nicht verfuegbar")
+    {
+      otaStatus.lastError += " / Zielserver unterstuetzt keine kleinen TLS-Fragmente";
+    }
     updateOtaDerivedState("", "", "");
     otaStatus.checkInProgress = false;
     otaSetPhase("failed", otaStatus.lastError);
@@ -1158,7 +1269,7 @@ bool otaCheckForUpdate(const char *reason)
     {
       publishTelemetry(true);
     }
-    LOGW("OTA check failed: http=%d err=%s heap=%u", httpCode, otaStatus.lastError.c_str(), ESP.getFreeHeap());
+    LOGW("OTA check failed: http=%d err=%s heap=%u tls=%s", httpCode, otaStatus.lastError.c_str(), ESP.getFreeHeap(), tlsNote.c_str());
     return false;
   }
 
@@ -1277,8 +1388,9 @@ bool otaApplyUpdate()
   mqttClient.disconnect();
 
   BearSSL::WiFiClientSecure secureClient;
-  secureClient.setInsecure();
-  secureClient.setTimeout(OTA_HTTP_TIMEOUT_MS);
+  String tlsNote;
+  configureSecureClientForUrl(secureClient, otaStatus.firmwareUrl, tlsNote);
+  LOGI("OTA apply heap=%u tls=%s", ESP.getFreeHeap(), tlsNote.c_str());
 
   ESPhttpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   ESPhttpUpdate.setClientTimeout(OTA_HTTP_TIMEOUT_MS);
@@ -1316,6 +1428,10 @@ bool otaApplyUpdate()
   else
   {
     String errorText = ESPhttpUpdate.getLastErrorString();
+    if (errorText.indexOf("SSL structures and buffers") >= 0 && tlsNote == "TLS-MFLN nicht verfuegbar")
+    {
+      errorText += " / Zielserver unterstuetzt keine kleinen TLS-Fragmente";
+    }
     otaFinalizeFailure(errorText);
     LOGW("OTA update failed (%d): %s", ESPhttpUpdate.getLastError(), errorText.c_str());
   }
