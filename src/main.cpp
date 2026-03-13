@@ -6,6 +6,7 @@
 #include <LittleFS.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266httpUpdate.h>
+#include <Updater.h>
 #include <WiFiClientSecureBearSSL.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -74,7 +75,8 @@ static const uint32_t WIFI_RETRY_INTERVAL_MS = 30000UL;
 static const uint32_t MQTT_RECONNECT_INTERVAL_MS = 5000UL;
 static const uint32_t CONFIG_SAVE_DELAY_MS = 2000UL;
 static const uint32_t OTA_CHECK_INTERVAL_MS = 86400000UL;
-static const uint32_t OTA_HTTP_TIMEOUT_MS = 12000UL;
+static const uint32_t OTA_HTTP_TIMEOUT_MS = 30000UL;
+static const uint32_t OTA_RESTART_DELAY_MS = 2000UL;
 // Developer limits (not user editable)
 static const uint32_t SHOW_LENGTH_MIN_S = 10UL;
 static const uint32_t SHOW_LENGTH_MAX_S = 60UL;
@@ -217,10 +219,18 @@ struct OtaStatus
   String firmwareUrl;
   String releaseNotes;
   String lastError;
+  String phase;
+  String source;
+  String statusText;
   bool updateAvailable;
   bool checkInProgress;
   bool updateInProgress;
+  bool rebootPending;
+  uint32_t progressBytes;
+  uint32_t progressTotal;
+  uint8_t progressPercent;
   unsigned long lastCheckAt;
+  unsigned long rebootAt;
 
   OtaStatus()
       : currentVersion(FW_VERSION),
@@ -228,10 +238,18 @@ struct OtaStatus
         firmwareUrl(""),
         releaseNotes(""),
         lastError(""),
+        phase("idle"),
+        source(""),
+        statusText("Bereit"),
         updateAvailable(false),
         checkInProgress(false),
         updateInProgress(false),
-        lastCheckAt(0)
+        rebootPending(false),
+        progressBytes(0),
+        progressTotal(0),
+        progressPercent(0),
+        lastCheckAt(0),
+        rebootAt(0)
   {
   }
 };
@@ -306,6 +324,11 @@ bool otaApplyUpdate(void);
 void setSafeOutputState(void);
 int compareVersionStrings(const String &lhs, const String &rhs);
 void updateOtaDerivedState(const String &latestVersion, const String &firmwareUrl, const String &releaseNotes);
+void otaResetProgress(const String &phase, const String &source, const String &statusText = "");
+void otaSetPhase(const String &phase, const String &statusText = "");
+void otaSetProgress(size_t current, size_t total);
+void otaScheduleRestart(const String &statusText);
+void otaFinalizeFailure(const String &errorText);
 void setupWiFi(void);
 void setupWebServer(void);
 void setupMqtt(void);
@@ -336,6 +359,8 @@ void handleStatus(void);
 void handleOtaStatus(void);
 void handleOtaCheck(void);
 void handleOtaUpdate(void);
+void handleOtaUpload(void);
+void handleOtaUploadData(void);
 bool handleCaptivePortalRedirect(void);
 String htmlEscape(const String &input);
 String buildHtmlPage(const String &message = "");
@@ -950,6 +975,70 @@ int compareVersionStrings(const String &lhs, const String &rhs)
   return 0;
 }
 
+void otaResetProgress(const String &phase, const String &source, const String &statusText)
+{
+  otaStatus.phase = phase;
+  otaStatus.source = source;
+  otaStatus.statusText = statusText.length() > 0 ? statusText : phase;
+  otaStatus.progressBytes = 0;
+  otaStatus.progressTotal = 0;
+  otaStatus.progressPercent = 0;
+  otaStatus.rebootPending = false;
+  otaStatus.rebootAt = 0;
+}
+
+void otaSetPhase(const String &phase, const String &statusText)
+{
+  otaStatus.phase = phase;
+  otaStatus.statusText = statusText.length() > 0 ? statusText : phase;
+}
+
+void otaSetProgress(size_t current, size_t total)
+{
+  otaStatus.progressBytes = (uint32_t)current;
+  otaStatus.progressTotal = (uint32_t)total;
+  if (total > 0)
+  {
+    size_t percent = (current * 100U) / total;
+    if (percent > 100U)
+    {
+      percent = 100U;
+    }
+    otaStatus.progressPercent = (uint8_t)percent;
+  }
+  else
+  {
+    otaStatus.progressPercent = 0;
+  }
+}
+
+void otaScheduleRestart(const String &statusText)
+{
+  otaStatus.updateInProgress = false;
+  otaStatus.rebootPending = true;
+  otaStatus.rebootAt = millis() + OTA_RESTART_DELAY_MS;
+  otaSetPhase("rebooting", statusText);
+  otaSetProgress(otaStatus.progressTotal > 0 ? otaStatus.progressTotal : otaStatus.progressBytes,
+                 otaStatus.progressTotal);
+}
+
+void otaFinalizeFailure(const String &errorText)
+{
+  if (Update.isRunning())
+  {
+    Update.end();
+  }
+  otaStatus.updateInProgress = false;
+  otaStatus.rebootPending = false;
+  otaStatus.rebootAt = 0;
+  otaStatus.lastError = errorText;
+  otaSetPhase("failed", errorText.length() > 0 ? errorText : "OTA-Update fehlgeschlagen");
+  if (mqttClient.connected())
+  {
+    publishTelemetry(true);
+  }
+}
+
 void updateOtaDerivedState(const String &latestVersion, const String &firmwareUrl, const String &releaseNotes)
 {
   // Leitet "updateAvailable" ausschließlich aus Version + URL ab.
@@ -982,6 +1071,7 @@ bool otaCheckForUpdate(const char *reason)
   {
     otaStatus.lastError = "OTA-Manifest-URL nicht gesetzt";
     updateOtaDerivedState("", "", "");
+    otaSetPhase("failed", otaStatus.lastError);
     LOGW("OTA check skipped (%s): manifest URL missing", reason);
     return false;
   }
@@ -989,11 +1079,13 @@ bool otaCheckForUpdate(const char *reason)
   if (WiFi.status() != WL_CONNECTED)
   {
     otaStatus.lastError = "WLAN nicht verbunden";
+    otaSetPhase("failed", otaStatus.lastError);
     LOGW("OTA check skipped (%s): WiFi not connected", reason);
     return false;
   }
 
   otaStatus.checkInProgress = true;
+  otaResetProgress("checking", "manifest", "Pruefe auf neue Firmware");
   String requestUrl = config.otaManifestUrl;
   requestUrl += requestUrl.indexOf('?') >= 0 ? "&nocache=" : "?nocache=";
   requestUrl += String(millis());
@@ -1001,6 +1093,7 @@ bool otaCheckForUpdate(const char *reason)
 
   BearSSL::WiFiClientSecure secureClient;
   secureClient.setInsecure();
+  secureClient.setTimeout(OTA_HTTP_TIMEOUT_MS);
 
   HTTPClient http;
   http.setTimeout(OTA_HTTP_TIMEOUT_MS);
@@ -1011,6 +1104,7 @@ bool otaCheckForUpdate(const char *reason)
   {
     otaStatus.lastError = "Manifest-Request konnte nicht gestartet werden";
     otaStatus.checkInProgress = false;
+    otaSetPhase("failed", otaStatus.lastError);
     LOGW("OTA check failed: begin() failed");
     return false;
   }
@@ -1021,6 +1115,7 @@ bool otaCheckForUpdate(const char *reason)
     otaStatus.lastError = "HTTP-Fehler " + String(httpCode);
     updateOtaDerivedState("", "", "");
     otaStatus.checkInProgress = false;
+    otaSetPhase("failed", otaStatus.lastError);
     http.end();
     LOGW("OTA check failed: http=%d", httpCode);
     return false;
@@ -1036,13 +1131,14 @@ bool otaCheckForUpdate(const char *reason)
   }
   LOGI("OTA manifest preview: %s", payloadPreview.c_str());
 
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<1536> doc;
   DeserializationError err = deserializeJson(doc, payload);
   if (err)
   {
     otaStatus.lastError = "Manifest JSON ungueltig";
     updateOtaDerivedState("", "", "");
     otaStatus.checkInProgress = false;
+    otaSetPhase("failed", otaStatus.lastError);
     LOGW("OTA check failed: invalid JSON");
     return false;
   }
@@ -1063,6 +1159,7 @@ bool otaCheckForUpdate(const char *reason)
     otaStatus.lastError = "Manifest unvollstaendig (version/url)";
     updateOtaDerivedState("", "", "");
     otaStatus.checkInProgress = false;
+    otaSetPhase("failed", otaStatus.lastError);
     LOGW("OTA check failed: manifest missing fields");
     return false;
   }
@@ -1070,6 +1167,7 @@ bool otaCheckForUpdate(const char *reason)
   updateOtaDerivedState(latestVersion, firmwareUrl, releaseNotes);
   otaStatus.checkInProgress = false;
   otaStatus.lastError = "";
+  otaSetPhase("idle", otaStatus.updateAvailable ? "Neue Firmware verfuegbar" : "Firmware ist aktuell");
 
   LOGI("OTA check done: current=%s latest=%s fw=%s available=%s",
        otaStatus.currentVersion.c_str(),
@@ -1096,21 +1194,25 @@ bool otaApplyUpdate()
   if (WiFi.status() != WL_CONNECTED)
   {
     otaStatus.lastError = "WLAN nicht verbunden";
+    otaSetPhase("failed", otaStatus.lastError);
     return false;
   }
   if (showStatus.isRunning)
   {
     otaStatus.lastError = "Show laeuft noch";
+    otaSetPhase("failed", otaStatus.lastError);
     return false;
   }
   if (otaStatus.firmwareUrl.length() == 0)
   {
     otaStatus.lastError = "Keine Firmware-URL verfuegbar";
+    otaSetPhase("failed", otaStatus.lastError);
     return false;
   }
 
   otaStatus.updateInProgress = true;
   otaStatus.lastError = "";
+  otaResetProgress("downloading", "manifest", "Firmware wird geladen");
   LOGI("Starting OTA update from %s", otaStatus.firmwareUrl.c_str());
 
   setSafeOutputState();
@@ -1123,32 +1225,46 @@ bool otaApplyUpdate()
 
   BearSSL::WiFiClientSecure secureClient;
   secureClient.setInsecure();
+  secureClient.setTimeout(OTA_HTTP_TIMEOUT_MS);
 
   ESPhttpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  ESPhttpUpdate.setClientTimeout(OTA_HTTP_TIMEOUT_MS);
+  ESPhttpUpdate.rebootOnUpdate(false);
+  ESPhttpUpdate.onStart([]() {
+    otaSetPhase("flashing", "Firmware wird geschrieben");
+    publishTelemetry(true);
+  });
+  ESPhttpUpdate.onProgress([](int current, int total) {
+    otaSetProgress(current, total);
+    otaSetPhase("flashing", total > 0 ? "Firmware wird geschrieben" : "Firmware-Stream aktiv");
+  });
+  ESPhttpUpdate.onError([](int error) {
+    LOGW("OTA progress callback error=%d", error);
+  });
+  ESPhttpUpdate.onEnd([]() {
+    otaSetProgress(otaStatus.progressTotal > 0 ? otaStatus.progressTotal : otaStatus.progressBytes,
+                   otaStatus.progressTotal);
+  });
   t_httpUpdate_return result = ESPhttpUpdate.update(secureClient, otaStatus.firmwareUrl);
-
-  otaStatus.updateInProgress = false;
 
   if (result == HTTP_UPDATE_OK)
   {
-    // In this mode ESPhttpUpdate reboots after successful flash.
+    otaStatus.lastError = "";
+    otaScheduleRestart("Firmware erfolgreich installiert, Neustart laeuft");
+    publishTelemetry(true);
     return true;
   }
 
   if (result == HTTP_UPDATE_NO_UPDATES)
   {
-    otaStatus.lastError = "Kein neues Update verfuegbar";
+    otaFinalizeFailure("Kein neues Update verfuegbar");
     LOGW("OTA update returned: no updates");
   }
   else
   {
-    otaStatus.lastError = ESPhttpUpdate.getLastErrorString();
-    LOGW("OTA update failed (%d): %s", ESPhttpUpdate.getLastError(), otaStatus.lastError.c_str());
-  }
-
-  if (mqttClient.connected())
-  {
-    publishTelemetry(true);
+    String errorText = ESPhttpUpdate.getLastErrorString();
+    otaFinalizeFailure(errorText);
+    LOGW("OTA update failed (%d): %s", ESPhttpUpdate.getLastError(), errorText.c_str());
   }
 
   return false;
@@ -1176,6 +1292,14 @@ void otaLoop()
   {
     otaUpdateRequested = false;
     otaApplyUpdate();
+  }
+
+  if (otaStatus.rebootPending && millis() >= otaStatus.rebootAt)
+  {
+    LOGI("Restarting after OTA update");
+    delay(100);
+    ESP.restart();
+    return;
   }
 
   if (WiFi.status() != WL_CONNECTED || otaStatus.lastCheckAt == 0)
@@ -1909,7 +2033,7 @@ void publishTelemetry(bool force)
   }
   lastTelemetryAt = now;
 
-  StaticJsonDocument<1024> doc;
+  StaticJsonDocument<1536> doc;
   doc["UptimeSec"] = now / 1000;
 
   JsonObject wifi = doc["WiFi"].to<JsonObject>();
@@ -1957,8 +2081,16 @@ void publishTelemetry(bool force)
   ota["UpdateAvailable"] = otaStatus.updateAvailable;
   ota["CheckInProgress"] = otaStatus.checkInProgress;
   ota["UpdateInProgress"] = otaStatus.updateInProgress;
+  ota["Phase"] = otaStatus.phase;
+  ota["Source"] = otaStatus.source;
+  ota["StatusText"] = otaStatus.statusText;
+  ota["RebootPending"] = otaStatus.rebootPending;
+  ota["ProgressBytes"] = otaStatus.progressBytes;
+  ota["ProgressTotal"] = otaStatus.progressTotal;
+  ota["ProgressPercent"] = otaStatus.progressPercent;
   ota["LastError"] = otaStatus.lastError;
   ota["LastCheckMs"] = otaStatus.lastCheckAt;
+  ota["RebootAtMs"] = otaStatus.rebootAt;
 
   String payload;
   serializeJson(doc, payload);
@@ -2064,6 +2196,7 @@ void setupWebServer()
   server.on("/ota/status", HTTP_GET, handleOtaStatus);
   server.on("/ota/check", HTTP_POST, handleOtaCheck);
   server.on("/ota/update", HTTP_POST, handleOtaUpdate);
+  server.on("/ota/upload", HTTP_POST, handleOtaUpload, handleOtaUploadData);
   server.onNotFound(handleNotFound);
   server.begin();
 
@@ -2185,7 +2318,7 @@ void handleSave()
 void handleStatus()
 {
   LOGD("HTTP GET /status");
-  StaticJsonDocument<768> status;
+  StaticJsonDocument<1536> status;
   status["wifi_connected"] = WiFi.status() == WL_CONNECTED;
   status["sta_ip"] = WiFi.localIP().toString();
   status["ap_enabled"] = captivePortalEnabled;
@@ -2216,8 +2349,16 @@ void handleStatus()
   ota["update_available"] = otaStatus.updateAvailable;
   ota["check_in_progress"] = otaStatus.checkInProgress;
   ota["update_in_progress"] = otaStatus.updateInProgress;
+  ota["phase"] = otaStatus.phase;
+  ota["source"] = otaStatus.source;
+  ota["status_text"] = otaStatus.statusText;
+  ota["reboot_pending"] = otaStatus.rebootPending;
+  ota["progress_bytes"] = otaStatus.progressBytes;
+  ota["progress_total"] = otaStatus.progressTotal;
+  ota["progress_percent"] = otaStatus.progressPercent;
   ota["last_error"] = otaStatus.lastError;
   ota["last_check_ms"] = otaStatus.lastCheckAt;
+  ota["reboot_at_ms"] = otaStatus.rebootAt;
 
   String out;
   serializeJson(status, out);
@@ -2227,7 +2368,7 @@ void handleStatus()
 void handleOtaStatus()
 {
   LOGD("HTTP GET /ota/status");
-  StaticJsonDocument<768> status;
+  StaticJsonDocument<1536> status;
   status["configured"] = config.otaManifestUrl.length() > 0;
   status["manifest_url"] = config.otaManifestUrl;
   status["wifi_connected"] = WiFi.status() == WL_CONNECTED;
@@ -2238,8 +2379,16 @@ void handleOtaStatus()
   status["update_available"] = otaStatus.updateAvailable;
   status["check_in_progress"] = otaStatus.checkInProgress;
   status["update_in_progress"] = otaStatus.updateInProgress;
+  status["phase"] = otaStatus.phase;
+  status["source"] = otaStatus.source;
+  status["status_text"] = otaStatus.statusText;
+  status["reboot_pending"] = otaStatus.rebootPending;
+  status["progress_bytes"] = otaStatus.progressBytes;
+  status["progress_total"] = otaStatus.progressTotal;
+  status["progress_percent"] = otaStatus.progressPercent;
   status["last_error"] = otaStatus.lastError;
   status["last_check_ms"] = otaStatus.lastCheckAt;
+  status["reboot_at_ms"] = otaStatus.rebootAt;
   status["interval_ms"] = OTA_CHECK_INTERVAL_MS;
 
   String out;
@@ -2296,6 +2445,132 @@ void handleOtaUpdate()
 
   otaUpdateRequested = true;
   server.send(202, "application/json", "{\"ok\":true,\"queued\":true}");
+}
+
+void handleOtaUpload()
+{
+  LOGI("HTTP POST /ota/upload");
+  StaticJsonDocument<256> doc;
+
+  if (otaStatus.rebootPending && otaStatus.source == "browser")
+  {
+    doc["ok"] = true;
+    doc["rebooting"] = true;
+    doc["status"] = otaStatus.statusText;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+    return;
+  }
+
+  if (otaStatus.phase == "failed" && otaStatus.source == "browser")
+  {
+    doc["ok"] = false;
+    doc["error"] = otaStatus.lastError.length() > 0 ? otaStatus.lastError : "Firmware-Upload fehlgeschlagen";
+    String out;
+    serializeJson(doc, out);
+    server.send(500, "application/json", out);
+    return;
+  }
+
+  doc["ok"] = otaStatus.updateInProgress && otaStatus.source == "browser";
+  doc["queued"] = otaStatus.updateInProgress;
+  doc["status"] = otaStatus.statusText;
+  String out;
+  serializeJson(doc, out);
+  server.send(otaStatus.updateInProgress ? 202 : 409, "application/json", out);
+}
+
+void handleOtaUploadData()
+{
+  HTTPUpload &upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START)
+  {
+    LOGI("OTA upload start: %s", upload.filename.c_str());
+
+    if (showStatus.isRunning)
+    {
+      otaResetProgress("failed", "browser", "Show laeuft noch");
+      otaStatus.lastError = "Show laeuft noch";
+      return;
+    }
+    if (otaStatus.checkInProgress || otaStatus.updateInProgress)
+    {
+      otaResetProgress("failed", "browser", "OTA bereits aktiv");
+      otaStatus.lastError = "OTA bereits aktiv";
+      return;
+    }
+
+    otaStatus.updateInProgress = true;
+    otaStatus.lastError = "";
+    otaResetProgress("uploading", "browser", "Firmware wird hochgeladen");
+    otaStatus.progressTotal = (uint32_t)upload.contentLength;
+    setSafeOutputState();
+
+    if (mqttClient.connected())
+    {
+      publishTelemetry(true);
+      publishAvailability("offline", true);
+    }
+    mqttClient.disconnect();
+
+    size_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+    if (!Update.begin(maxSketchSpace))
+    {
+      otaFinalizeFailure(Update.getErrorString());
+      LOGW("OTA upload begin failed: %s", otaStatus.lastError.c_str());
+      return;
+    }
+  }
+
+  if (upload.status == UPLOAD_FILE_WRITE)
+  {
+    if (!otaStatus.updateInProgress || otaStatus.source != "browser")
+    {
+      return;
+    }
+
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
+    {
+      otaFinalizeFailure(Update.getErrorString());
+      LOGW("OTA upload write failed: %s", otaStatus.lastError.c_str());
+      return;
+    }
+
+    size_t written = upload.totalSize + upload.currentSize;
+    otaSetProgress(written, otaStatus.progressTotal);
+    otaSetPhase("uploading", "Firmware wird hochgeladen");
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_END)
+  {
+    if (!otaStatus.updateInProgress || otaStatus.source != "browser")
+    {
+      return;
+    }
+
+    if (!Update.end(true))
+    {
+      otaFinalizeFailure(Update.getErrorString());
+      LOGW("OTA upload finalize failed: %s", otaStatus.lastError.c_str());
+      return;
+    }
+
+    otaStatus.lastError = "";
+    otaSetProgress(upload.totalSize, upload.totalSize);
+    otaScheduleRestart("Upload abgeschlossen, Neustart laeuft");
+    publishTelemetry(true);
+    LOGI("OTA upload done: %u bytes", (unsigned int)upload.totalSize);
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_ABORTED)
+  {
+    otaFinalizeFailure("Firmware-Upload abgebrochen");
+    LOGW("OTA upload aborted");
+  }
 }
 
 void handleNotFound()
@@ -2686,7 +2961,7 @@ String buildHtmlPage(const String &message)
                          : "Kein STA-Link. Captive Portal im AP-Modus aktiv.";
 
   String html;
-  html.reserve(12000);
+  html.reserve(17000);
   html += "<!doctype html><html><head><meta charset='utf-8'>";
   html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<title>VacUBear Setup</title>";
@@ -2698,8 +2973,14 @@ String buildHtmlPage(const String &message)
   html += "button{margin-top:16px;padding:11px 16px;background:#005bbb;color:#fff;border:0;border-radius:8px;font-weight:700;cursor:pointer;}";
   html += ".btn-secondary{background:#4b5563;margin-right:10px;}";
   html += ".btn-danger{background:#b91c1c;}";
+  html += ".btn-upload{background:#0f766e;}";
   html += ".status{background:#eef6ff;border-left:4px solid #005bbb;padding:10px;border-radius:8px;margin-bottom:14px;}";
   html += ".msg{background:#e8f8ed;border-left:4px solid #16853f;padding:10px;border-radius:8px;margin-bottom:14px;}";
+  html += ".row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}";
+  html += ".row button{margin-top:0;}";
+  html += ".upload-box{border:1px dashed #9fb4c7;border-radius:10px;padding:12px;margin-top:14px;background:#f8fbff;}";
+  html += ".progress{height:12px;background:#d7dee6;border-radius:999px;overflow:hidden;margin:10px 0 6px;}";
+  html += ".progress-bar{height:100%;width:0;background:linear-gradient(90deg,#005bbb,#0f766e);transition:width .25s ease;}";
   html += "hr{border:0;border-top:1px solid #d7dee6;margin:18px 0;}";
   html += ".small{color:#5a6978;font-size:.9rem;margin-top:10px;}</style></head><body><div class='wrap'><div class='card'>";
   html += "<h2>VacUBear WiFi / MQTT Setup</h2>";
@@ -2737,8 +3018,18 @@ String buildHtmlPage(const String &message)
   html += "<button type='submit'>Speichern & Neustart</button></form>";
   html += "<hr><h3>OTA Firmware</h3>";
   html += "<div id='ota-box' class='status'>Lade OTA-Status...</div>";
+  html += "<div class='progress'><div id='ota-progress-bar' class='progress-bar'></div></div>";
+  html += "<div id='ota-progress-text' class='small'>Kein Update aktiv.</div>";
+  html += "<div class='row'>";
   html += "<button type='button' class='btn-secondary' onclick='otaCheck()'>Nach Update suchen</button>";
   html += "<button type='button' class='btn-danger' onclick='otaUpdate()'>Firmware installieren</button>";
+  html += "</div>";
+  html += "<div class='upload-box'>";
+  html += "<label for='ota-file'>Firmware lokal hochladen (.bin)</label>";
+  html += "<input id='ota-file' type='file' accept='.bin,application/octet-stream'>";
+  html += "<button type='button' class='btn-upload' onclick='otaUploadFile()'>Datei hochladen & installieren</button>";
+  html += "<div class='small'>Der Browser-Upload ergaenzt die Manifest-OTA und eignet sich fuer manuelle Tests oder lokale Release-Dateien.</div>";
+  html += "</div>";
   html += "<div class='small'>Aktuelle Firmware: " + String(FW_VERSION) + "</div>";
   html += "<div class='small'>Bei gueltigem WLAN im lokalen Netz erreichbar. Bei Fehler startet AP + Captive Portal.</div>";
   html += R"rawliteral(
@@ -2754,6 +3045,26 @@ async function apiJson(path, method) {
   return json;
 }
 
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!bytes) return '0 B';
+  if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return bytes + ' B';
+}
+
+function setOtaProgress(percent, text) {
+  const bar = document.getElementById('ota-progress-bar');
+  const label = document.getElementById('ota-progress-text');
+  if (bar) {
+    const safePercent = Math.max(0, Math.min(100, Number(percent || 0)));
+    bar.style.width = safePercent + '%';
+  }
+  if (label) {
+    label.textContent = text || '';
+  }
+}
+
 function renderOta(status) {
   const el = document.getElementById('ota-box');
   if (!el) return;
@@ -2764,6 +3075,8 @@ function renderOta(status) {
   text += 'Aktuell: ' + (status.current_version || '-') + '<br>';
   text += 'Neueste Version: ' + (status.latest_version || '-') + '<br>';
   text += 'Update verfuegbar: ' + (status.update_available ? 'ja' : 'nein') + '<br>';
+  text += 'Quelle: ' + (status.source || '-') + '<br>';
+  text += 'Status: ' + (status.status_text || status.phase || '-') + '<br>';
   if (status.last_error) {
     text += 'Letzter Fehler: ' + status.last_error + '<br>';
   }
@@ -2771,6 +3084,18 @@ function renderOta(status) {
     text += 'Hinweis: ' + status.release_notes + '<br>';
   }
   el.innerHTML = text;
+
+  let progressText = status.status_text || status.phase || 'Bereit';
+  if (status.progress_total > 0) {
+    progressText += ' (' + (status.progress_percent || 0) + '% / ' +
+      formatBytes(status.progress_bytes) + ' von ' + formatBytes(status.progress_total) + ')';
+  } else if (status.progress_bytes > 0) {
+    progressText += ' (' + formatBytes(status.progress_bytes) + ')';
+  }
+  if (status.reboot_pending) {
+    progressText += ' - Neustart ausstehend';
+  }
+  setOtaProgress(status.progress_percent || 0, progressText);
 }
 
 async function refreshOta() {
@@ -2797,14 +3122,59 @@ async function otaUpdate() {
   if (!confirm('Firmware-Update jetzt starten?')) return;
   try {
     await apiJson('/ota/update', 'POST');
-    alert('OTA-Update gestartet. Das Geraet startet nach erfolgreichem Flash neu.');
+    setTimeout(refreshOta, 200);
   } catch (e) {
     alert('OTA-Update fehlgeschlagen: ' + e.message);
   }
 }
 
+async function otaUploadFile() {
+  const input = document.getElementById('ota-file');
+  if (!input || !input.files || !input.files.length) {
+    alert('Bitte zuerst eine Firmware-Datei auswaehlen.');
+    return;
+  }
+
+  const file = input.files[0];
+  if (!confirm('Firmware-Datei jetzt hochladen und installieren?')) return;
+
+  const form = new FormData();
+  form.append('firmware', file, file.name);
+
+  setOtaProgress(0, 'Upload wird gestartet...');
+
+  try {
+    await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/ota/upload');
+      xhr.upload.onprogress = (event) => {
+        if (!event.lengthComputable) return;
+        const percent = Math.round((event.loaded / event.total) * 100);
+        setOtaProgress(percent, 'Upload laeuft (' + percent + '% / ' +
+          formatBytes(event.loaded) + ' von ' + formatBytes(event.total) + ')');
+      };
+      xhr.onload = () => {
+        let json = {};
+        try { json = xhr.responseText ? JSON.parse(xhr.responseText) : {}; } catch (_) {}
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve(json);
+          return;
+        }
+        reject(new Error(json.error || ('HTTP ' + xhr.status)));
+      };
+      xhr.onerror = () => reject(new Error('Upload-Verbindung fehlgeschlagen'));
+      xhr.send(form);
+    });
+    input.value = '';
+    setTimeout(refreshOta, 200);
+  } catch (e) {
+    alert('Firmware-Upload fehlgeschlagen: ' + e.message);
+    setTimeout(refreshOta, 200);
+  }
+}
+
 refreshOta();
-setInterval(refreshOta, 10000);
+setInterval(refreshOta, 1000);
 </script>
 )rawliteral";
   html += "</div></div></body></html>";
