@@ -1,5 +1,5 @@
 {
   "version": "0.0.6-dev",
-  "firmware_url": "https://raw.githubusercontent.com/kingbear79/VacUBear/ha-update-boot-cleanup/dist/ota/latest/firmware.bin",
-  "notes": "Commit 1c95ff5f2074"
+  "firmware_url": "http://ota.kinkbear.de/ha-update-boot-cleanup/firmware.bin",
+  "notes": "Commit e8bdeeb1dfac"
 }

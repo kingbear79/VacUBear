@@ -1223,6 +1223,14 @@ bool otaCheckForUpdate(const char *reason)
   String requestUrl = config.otaManifestUrl;
   requestUrl += requestUrl.indexOf('?') >= 0 ? "&nocache=" : "?nocache=";
   requestUrl += String(millis());
+  ParsedHttpUrl requestTarget;
+  if (!parseHttpUrl(requestUrl, requestTarget))
+  {
+    otaStatus.lastError = "OTA-Manifest-URL ungueltig";
+    otaStatus.checkInProgress = false;
+    otaSetPhase("failed", otaStatus.lastError);
+    return false;
+  }
   bool mqttWasConnected = mqttClient.connected();
   if (mqttWasConnected)
   {
@@ -1231,16 +1239,23 @@ bool otaCheckForUpdate(const char *reason)
   }
 
   BearSSL::WiFiClientSecure secureClient;
+  WiFiClient plainClient;
+  String transportNote = requestTarget.https ? "HTTPS" : "HTTP";
   String tlsNote;
-  configureSecureClientForUrl(secureClient, requestUrl, tlsNote);
-  LOGI("OTA check (%s): %s heap=%u tls=%s", reason, requestUrl.c_str(), ESP.getFreeHeap(), tlsNote.c_str());
+  if (requestTarget.https)
+  {
+    configureSecureClientForUrl(secureClient, requestUrl, tlsNote);
+    transportNote += " / " + tlsNote;
+  }
+  LOGI("OTA check (%s): %s heap=%u transport=%s", reason, requestUrl.c_str(), ESP.getFreeHeap(), transportNote.c_str());
 
   HTTPClient http;
   http.setTimeout(OTA_HTTP_TIMEOUT_MS);
   http.setReuse(false);
   http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
 
-  if (!http.begin(secureClient, requestUrl))
+  bool beginOk = requestTarget.https ? http.begin(secureClient, requestUrl) : http.begin(plainClient, requestUrl);
+  if (!beginOk)
   {
     otaStatus.lastError = "Manifest-Request konnte nicht gestartet werden";
     otaStatus.checkInProgress = false;
@@ -1249,15 +1264,17 @@ bool otaCheckForUpdate(const char *reason)
     {
       publishTelemetry(true);
     }
-    LOGW("OTA check failed: begin() failed tls=%s", tlsNote.c_str());
+    LOGW("OTA check failed: begin() failed transport=%s", transportNote.c_str());
     return false;
   }
 
   int httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK)
   {
-    otaStatus.lastError = formatHttpClientError(httpCode, &secureClient);
-    if (httpCode == HTTPC_ERROR_CONNECTION_FAILED && tlsNote == "TLS-MFLN nicht verfuegbar")
+    otaStatus.lastError = formatHttpClientError(httpCode, requestTarget.https ? &secureClient : nullptr);
+    if (requestTarget.https &&
+        httpCode == HTTPC_ERROR_CONNECTION_FAILED &&
+        tlsNote == "TLS-MFLN nicht verfuegbar")
     {
       otaStatus.lastError += " / Zielserver unterstuetzt keine kleinen TLS-Fragmente";
     }
@@ -1269,7 +1286,7 @@ bool otaCheckForUpdate(const char *reason)
     {
       publishTelemetry(true);
     }
-    LOGW("OTA check failed: http=%d err=%s heap=%u tls=%s", httpCode, otaStatus.lastError.c_str(), ESP.getFreeHeap(), tlsNote.c_str());
+    LOGW("OTA check failed: http=%d err=%s heap=%u transport=%s", httpCode, otaStatus.lastError.c_str(), ESP.getFreeHeap(), transportNote.c_str());
     return false;
   }
 
@@ -1378,6 +1395,12 @@ bool otaApplyUpdate()
   otaStatus.lastError = "";
   otaResetProgress("downloading", "manifest", "Firmware wird geladen");
   LOGI("Starting OTA update from %s", otaStatus.firmwareUrl.c_str());
+  ParsedHttpUrl firmwareTarget;
+  if (!parseHttpUrl(otaStatus.firmwareUrl, firmwareTarget))
+  {
+    otaFinalizeFailure("Firmware-URL ungueltig");
+    return false;
+  }
 
   setSafeOutputState();
   if (mqttClient.connected())
@@ -1388,9 +1411,15 @@ bool otaApplyUpdate()
   mqttClient.disconnect();
 
   BearSSL::WiFiClientSecure secureClient;
+  WiFiClient plainClient;
+  String transportNote = firmwareTarget.https ? "HTTPS" : "HTTP";
   String tlsNote;
-  configureSecureClientForUrl(secureClient, otaStatus.firmwareUrl, tlsNote);
-  LOGI("OTA apply heap=%u tls=%s", ESP.getFreeHeap(), tlsNote.c_str());
+  if (firmwareTarget.https)
+  {
+    configureSecureClientForUrl(secureClient, otaStatus.firmwareUrl, tlsNote);
+    transportNote += " / " + tlsNote;
+  }
+  LOGI("OTA apply heap=%u transport=%s", ESP.getFreeHeap(), transportNote.c_str());
 
   ESPhttpUpdate.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
   ESPhttpUpdate.setClientTimeout(OTA_HTTP_TIMEOUT_MS);
@@ -1410,7 +1439,9 @@ bool otaApplyUpdate()
     otaSetProgress(otaStatus.progressTotal > 0 ? otaStatus.progressTotal : otaStatus.progressBytes,
                    otaStatus.progressTotal);
   });
-  t_httpUpdate_return result = ESPhttpUpdate.update(secureClient, otaStatus.firmwareUrl);
+  t_httpUpdate_return result = firmwareTarget.https
+                                   ? ESPhttpUpdate.update(secureClient, otaStatus.firmwareUrl)
+                                   : ESPhttpUpdate.update(plainClient, otaStatus.firmwareUrl);
 
   if (result == HTTP_UPDATE_OK)
   {
@@ -1428,7 +1459,9 @@ bool otaApplyUpdate()
   else
   {
     String errorText = ESPhttpUpdate.getLastErrorString();
-    if (errorText.indexOf("SSL structures and buffers") >= 0 && tlsNote == "TLS-MFLN nicht verfuegbar")
+    if (firmwareTarget.https &&
+        errorText.indexOf("SSL structures and buffers") >= 0 &&
+        tlsNote == "TLS-MFLN nicht verfuegbar")
     {
       errorText += " / Zielserver unterstuetzt keine kleinen TLS-Fragmente";
     }
@@ -2990,11 +3023,12 @@ bool isIpAddress(const String &host)
 
 bool isLegacyOtaManifestUrl(const String &url)
 {
-  // Erkennt fruehere OTA-URL-Variante, um auf neues Schema zu migrieren.
+  // Erkennt fruehere OTA-URL-Varianten, um auf neues Schema zu migrieren.
   String normalized = url;
   normalized.trim();
   normalized.toLowerCase();
-  return normalized.endsWith("/releases/latest/download/manifest.json");
+  return normalized.endsWith("/releases/latest/download/manifest.json") ||
+         normalized.indexOf("raw.githubusercontent.com/kingbear79/vacubear/") >= 0;
 }
 
 String defaultApSsid()
