@@ -329,6 +329,7 @@ void otaSetPhase(const String &phase, const String &statusText = "");
 void otaSetProgress(size_t current, size_t total);
 void otaScheduleRestart(const String &statusText);
 void otaFinalizeFailure(const String &errorText);
+String formatHttpClientError(int httpCode, BearSSL::WiFiClientSecure *secureClient = nullptr);
 void setupWiFi(void);
 void setupWebServer(void);
 void setupMqtt(void);
@@ -1039,6 +1040,32 @@ void otaFinalizeFailure(const String &errorText)
   }
 }
 
+String formatHttpClientError(int httpCode, BearSSL::WiFiClientSecure *secureClient)
+{
+  String message = "HTTP-Fehler " + String(httpCode);
+  String detail = HTTPClient::errorToString(httpCode);
+  if (detail.length() > 0)
+  {
+    message += " (" + detail + ")";
+  }
+
+  if (secureClient != nullptr)
+  {
+    char sslError[96] = {0};
+    int sslCode = secureClient->getLastSSLError(sslError, sizeof(sslError));
+    if (sslCode != 0)
+    {
+      message += " / SSL " + String(sslCode);
+      if (sslError[0] != '\0')
+      {
+        message += " (" + String(sslError) + ")";
+      }
+    }
+  }
+
+  return message;
+}
+
 void updateOtaDerivedState(const String &latestVersion, const String &firmwareUrl, const String &releaseNotes)
 {
   // Leitet "updateAvailable" ausschließlich aus Version + URL ab.
@@ -1089,7 +1116,13 @@ bool otaCheckForUpdate(const char *reason)
   String requestUrl = config.otaManifestUrl;
   requestUrl += requestUrl.indexOf('?') >= 0 ? "&nocache=" : "?nocache=";
   requestUrl += String(millis());
-  LOGI("OTA check (%s): %s", reason, requestUrl.c_str());
+  bool mqttWasConnected = mqttClient.connected();
+  if (mqttWasConnected)
+  {
+    mqttClient.disconnect();
+    delay(50);
+  }
+  LOGI("OTA check (%s): %s heap=%u", reason, requestUrl.c_str(), ESP.getFreeHeap());
 
   BearSSL::WiFiClientSecure secureClient;
   secureClient.setInsecure();
@@ -1105,6 +1138,10 @@ bool otaCheckForUpdate(const char *reason)
     otaStatus.lastError = "Manifest-Request konnte nicht gestartet werden";
     otaStatus.checkInProgress = false;
     otaSetPhase("failed", otaStatus.lastError);
+    if (mqttWasConnected)
+    {
+      publishTelemetry(true);
+    }
     LOGW("OTA check failed: begin() failed");
     return false;
   }
@@ -1112,12 +1149,16 @@ bool otaCheckForUpdate(const char *reason)
   int httpCode = http.GET();
   if (httpCode != HTTP_CODE_OK)
   {
-    otaStatus.lastError = "HTTP-Fehler " + String(httpCode);
+    otaStatus.lastError = formatHttpClientError(httpCode, &secureClient);
     updateOtaDerivedState("", "", "");
     otaStatus.checkInProgress = false;
     otaSetPhase("failed", otaStatus.lastError);
     http.end();
-    LOGW("OTA check failed: http=%d", httpCode);
+    if (mqttWasConnected)
+    {
+      publishTelemetry(true);
+    }
+    LOGW("OTA check failed: http=%d err=%s heap=%u", httpCode, otaStatus.lastError.c_str(), ESP.getFreeHeap());
     return false;
   }
 
@@ -1139,6 +1180,10 @@ bool otaCheckForUpdate(const char *reason)
     updateOtaDerivedState("", "", "");
     otaStatus.checkInProgress = false;
     otaSetPhase("failed", otaStatus.lastError);
+    if (mqttWasConnected)
+    {
+      publishTelemetry(true);
+    }
     LOGW("OTA check failed: invalid JSON");
     return false;
   }
@@ -1160,6 +1205,10 @@ bool otaCheckForUpdate(const char *reason)
     updateOtaDerivedState("", "", "");
     otaStatus.checkInProgress = false;
     otaSetPhase("failed", otaStatus.lastError);
+    if (mqttWasConnected)
+    {
+      publishTelemetry(true);
+    }
     LOGW("OTA check failed: manifest missing fields");
     return false;
   }
@@ -1178,6 +1227,10 @@ bool otaCheckForUpdate(const char *reason)
   if (mqttClient.connected())
   {
     publishTelemetry(true);
+  }
+  else if (mqttWasConnected)
+  {
+    // mqttEnsureConnected() baut die Verbindung in loop() wieder auf.
   }
 
   return true;
