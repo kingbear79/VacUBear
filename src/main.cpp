@@ -1131,7 +1131,7 @@ bool otaCheckForUpdate(const char *reason)
   }
   LOGI("OTA manifest preview: %s", payloadPreview.c_str());
 
-  StaticJsonDocument<1536> doc;
+  JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload);
   if (err)
   {
@@ -1486,41 +1486,41 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
       return;
     }
 
-    StaticJsonDocument<384> doc;
+    JsonDocument doc;
     DeserializationError err = deserializeJson(doc, payloadStr);
     if (!err)
     {
       if (doc["color"].is<JsonObject>())
       {
         JsonObject color = doc["color"].as<JsonObject>();
-        if (color.containsKey("r"))
+        if (!color["r"].isNull())
         {
           config.lightR = clampU8(color["r"].as<int>());
           changed = true;
         }
-        if (color.containsKey("g"))
+        if (!color["g"].isNull())
         {
           config.lightG = clampU8(color["g"].as<int>());
           changed = true;
         }
-        if (color.containsKey("b"))
+        if (!color["b"].isNull())
         {
           config.lightB = clampU8(color["b"].as<int>());
           changed = true;
         }
-        if (color.containsKey("w"))
+        if (!color["w"].isNull())
         {
           config.lightW = clampU8(color["w"].as<int>());
           changed = true;
         }
       }
 
-      if (doc.containsKey("white_value"))
+      if (!doc["white_value"].isNull())
       {
         config.lightW = clampU8(doc["white_value"].as<int>());
         changed = true;
       }
-      if (doc.containsKey("white"))
+      if (!doc["white"].isNull())
       {
         config.lightW = clampU8(doc["white"].as<int>());
         changed = true;
@@ -1684,7 +1684,7 @@ void publishDiscovery()
   // Veroeffentlicht HA Discovery fuer Steuer-Entities.
   // Bei LED_COUNT=0 wird die Light-Discovery absichtlich geloescht.
   LOGI("Publishing Home Assistant discovery");
-  StaticJsonDocument<512> switchCfg;
+  JsonDocument switchCfg;
   switchCfg["name"] = "Vakuumieren";
   switchCfg["object_id"] = "show";
   switchCfg["unique_id"] = deviceId + "-show";
@@ -1710,7 +1710,7 @@ void publishDiscovery()
   String lightDiscoveryTopic = "homeassistant/light/" + deviceId + "/light/config";
   if (HAS_LED_OUTPUT)
   {
-    StaticJsonDocument<768> lightCfg;
+    JsonDocument lightCfg;
     lightCfg["name"] = "Lichtfarbe";
     lightCfg["object_id"] = "light";
     lightCfg["unique_id"] = deviceId + "-light";
@@ -1756,7 +1756,7 @@ void publishDiscovery()
 
 void publishUpdateDiscovery()
 {
-  StaticJsonDocument<768> cfg;
+  JsonDocument cfg;
   cfg["name"] = "Firmware";
   cfg["object_id"] = "firmware";
   cfg["unique_id"] = deviceId + "-firmware-update";
@@ -1795,7 +1795,7 @@ void publishSensorDiscovery()
   };
 
   {
-    StaticJsonDocument<384> cfg;
+    JsonDocument cfg;
     cfg["name"] = "Show aktiv";
     cfg["object_id"] = "show_aktiv";
     cfg["unique_id"] = deviceId + "-show-aktiv";
@@ -1811,7 +1811,7 @@ void publishSensorDiscovery()
   }
 
   {
-    StaticJsonDocument<384> cfg;
+    JsonDocument cfg;
     cfg["name"] = "Show Phase";
     cfg["object_id"] = "show_phase";
     cfg["unique_id"] = deviceId + "-show-phase";
@@ -1826,7 +1826,7 @@ void publishSensorDiscovery()
   }
 
   {
-    StaticJsonDocument<384> cfg;
+    JsonDocument cfg;
     cfg["name"] = "WLAN RSSI";
     cfg["object_id"] = "wifi_rssi";
     cfg["unique_id"] = deviceId + "-wifi-rssi";
@@ -1842,7 +1842,7 @@ void publishSensorDiscovery()
   }
 
   {
-    StaticJsonDocument<384> cfg;
+    JsonDocument cfg;
     cfg["name"] = "Uptime";
     cfg["object_id"] = "uptime";
     cfg["unique_id"] = deviceId + "-uptime";
@@ -1859,7 +1859,7 @@ void publishSensorDiscovery()
   }
 
   {
-    StaticJsonDocument<384> cfg;
+    JsonDocument cfg;
     cfg["name"] = "Pumpen PWM";
     cfg["object_id"] = "pumpen_pwm";
     cfg["unique_id"] = deviceId + "-pumpen-pwm";
@@ -1875,7 +1875,7 @@ void publishSensorDiscovery()
   }
 
   {
-    StaticJsonDocument<384> cfg;
+    JsonDocument cfg;
     cfg["name"] = "Show Länge";
     cfg["object_id"] = "show_laenge";
     cfg["unique_id"] = deviceId + "-show-laenge";
@@ -1891,7 +1891,7 @@ void publishSensorDiscovery()
   }
 
   {
-    StaticJsonDocument<384> cfg;
+    JsonDocument cfg;
     cfg["name"] = "Nachlaufzeit";
     cfg["object_id"] = "nachlaufzeit";
     cfg["unique_id"] = deviceId + "-nachlaufzeit";
@@ -1907,7 +1907,7 @@ void publishSensorDiscovery()
   }
 
   {
-    StaticJsonDocument<384> cfg;
+    JsonDocument cfg;
     cfg["name"] = "Vakuumier-Zeit";
     cfg["object_id"] = "show_laenge_setzen";
     cfg["unique_id"] = deviceId + "-show-laenge-setzen";
@@ -1926,7 +1926,7 @@ void publishSensorDiscovery()
   }
 
   {
-    StaticJsonDocument<384> cfg;
+    JsonDocument cfg;
     cfg["name"] = "Nachlaufzeit";
     cfg["object_id"] = "nachlaufzeit_setzen";
     cfg["unique_id"] = deviceId + "-nachlaufzeit-setzen";
@@ -1944,7 +1944,7 @@ void publishSensorDiscovery()
   }
 
   {
-    StaticJsonDocument<384> cfg;
+    JsonDocument cfg;
     cfg["name"] = "Firmware Version";
     cfg["object_id"] = "firmware_version";
     cfg["unique_id"] = deviceId + "-firmware-version";
@@ -1959,7 +1959,7 @@ void publishSensorDiscovery()
   }
 
   {
-    StaticJsonDocument<384> cfg;
+    JsonDocument cfg;
     cfg["name"] = "Firmware Verfuegbar";
     cfg["object_id"] = "firmware_verfuegbar";
     cfg["unique_id"] = deviceId + "-firmware-verfuegbar";
@@ -1974,7 +1974,7 @@ void publishSensorDiscovery()
   }
 
   {
-    StaticJsonDocument<384> cfg;
+    JsonDocument cfg;
     cfg["name"] = "Update verfuegbar";
     cfg["object_id"] = "update_verfuegbar";
     cfg["unique_id"] = deviceId + "-update-verfuegbar";
@@ -2033,7 +2033,7 @@ void publishTelemetry(bool force)
   }
   lastTelemetryAt = now;
 
-  StaticJsonDocument<1536> doc;
+  JsonDocument doc;
   doc["UptimeSec"] = now / 1000;
 
   JsonObject wifi = doc["WiFi"].to<JsonObject>();
@@ -2318,7 +2318,7 @@ void handleSave()
 void handleStatus()
 {
   LOGD("HTTP GET /status");
-  StaticJsonDocument<1536> status;
+  JsonDocument status;
   status["wifi_connected"] = WiFi.status() == WL_CONNECTED;
   status["sta_ip"] = WiFi.localIP().toString();
   status["ap_enabled"] = captivePortalEnabled;
@@ -2368,7 +2368,7 @@ void handleStatus()
 void handleOtaStatus()
 {
   LOGD("HTTP GET /ota/status");
-  StaticJsonDocument<1536> status;
+  JsonDocument status;
   status["configured"] = config.otaManifestUrl.length() > 0;
   status["manifest_url"] = config.otaManifestUrl;
   status["wifi_connected"] = WiFi.status() == WL_CONNECTED;
@@ -2450,7 +2450,7 @@ void handleOtaUpdate()
 void handleOtaUpload()
 {
   LOGI("HTTP POST /ota/upload");
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
 
   if (otaStatus.rebootPending && otaStatus.source == "browser")
   {
@@ -2652,7 +2652,7 @@ void loadConfig()
 
   if (trimmed[0] == '{')
   {
-    StaticJsonDocument<1024> doc;
+    JsonDocument doc;
     DeserializationError err = deserializeJson(doc, raw);
     if (!err)
     {
@@ -2767,7 +2767,7 @@ void loadLegacyConfig(const String &raw)
 bool saveConfig()
 {
   // Persistiert die aktuelle AppConfig in /config.json.
-  StaticJsonDocument<1024> doc;
+  JsonDocument doc;
 
   JsonObject wifi = doc["wifi"].to<JsonObject>();
   wifi["ssid"] = config.wifiSsid;
