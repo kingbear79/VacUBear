@@ -6,7 +6,7 @@ Dieses Projekt ist auf ESP8266/ESP-12F portiert.
 
 - PlatformIO Environment: `esp12f`
 - Board: `esp12e` (kompatibel fuer ESP-12F)
-- Standard-OTA-Manifest: `http://ota.kinkbear.de/ha-update-boot-cleanup/manifest.json`
+- Standard-OTA-Manifest: `http://ota.kinkbear.de/master/manifest.json`
 
 ## FT232RL Programmieradapter
 
@@ -61,7 +61,7 @@ OTA_DEPLOY_HOST=ota.kinkbear.de
 OTA_DEPLOY_PORT=22
 OTA_DEPLOY_USER=deploy
 OTA_DEPLOY_BASE=/var/www/ota.kinkbear.de
-OTA_DEPLOY_BRANCH=ha-update-boot-cleanup
+OTA_DEPLOY_BRANCH=master
 OTA_DEPLOY_SSH_KEY=/Users/christianschweden/.ssh/id_ed25519_ota
 ```
 
