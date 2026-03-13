@@ -92,6 +92,9 @@ static const uint32_t LED_FADE_OUT_MS = 1200UL;
 static const uint32_t LED_AFTER_BELUEFTEN_MS = 5000UL;
 static const uint16_t LIGHT_LEVEL_MAX = 1023;
 static const uint32_t LIGHT_UPDATE_MS = 20UL;
+static const uint32_t BOOT_PULSE_PERIOD_MS = 1600UL;
+static const uint16_t BOOT_PULSE_LEVEL_MIN = 32;
+static const uint16_t BOOT_PULSE_LEVEL_MAX = 768;
 static const uint32_t TELEMETRY_INTERVAL_MS = TELEMETRY_INTERVAL_MS_CFG;
 
 static const char *CONFIG_FILE = "/config.json";
@@ -266,6 +269,7 @@ String topicCfgShowLengthSet;
 String topicCfgShowLengthState;
 String topicCfgNachlaufSet;
 String topicCfgNachlaufState;
+String topicOtaInstall;
 String topicAvailability;
 String topicTeleState;
 PumpSoftControl pumpControl;
@@ -274,6 +278,9 @@ OtaStatus otaStatus;
 bool otaCheckRequested = false;
 bool otaUpdateRequested = false;
 bool otaBootCheckPending = true;
+bool wifiStartupPending = false;
+unsigned long wifiStartupAt = 0;
+bool bootIndicatorActive = false;
 #if LED_COUNT > 0
 NeoPixelBus<NeoGrbwFeature, NeoEsp8266BitBang800KbpsMethod> lightBus(LED_COUNT, PIN_LED);
 #endif
@@ -292,6 +299,7 @@ void setupLightControl(void);
 void updateLightControl(void);
 void setLightTargetLevel(uint16_t level);
 void applyLightOutput(bool force = false);
+void applyBootIndicator(void);
 void otaLoop(void);
 bool otaCheckForUpdate(const char *reason);
 bool otaApplyUpdate(void);
@@ -301,6 +309,7 @@ void updateOtaDerivedState(const String &latestVersion, const String &firmwareUr
 void setupWiFi(void);
 void setupWebServer(void);
 void setupMqtt(void);
+void handleWiFiStartup(void);
 void mqttLoop(void);
 void mqttEnsureConnected(void);
 void mqttCallback(char *topic, byte *payload, unsigned int length);
@@ -310,6 +319,7 @@ void publishShowState(bool retained = true);
 void publishLightState(bool retained = true);
 void publishConfigState(bool retained = true);
 void publishDiscovery(void);
+void publishUpdateDiscovery(void);
 void publishSensorDiscovery(void);
 void publishTelemetry(bool force = false);
 const char *getShowPhase(void);
@@ -317,7 +327,6 @@ const char *getShowPhase(void);
 void loadConfig(void);
 bool saveConfig(void);
 void loadLegacyConfig(const String &raw);
-bool connectToConfiguredWifi(uint32_t timeoutMs);
 void startAccessPoint(void);
 void setupCaptivePortal(void);
 void handleRoot(void);
@@ -368,12 +377,6 @@ void setup()
   setupWiFi();
   setupWebServer();
   setupMqtt();
-
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    otaCheckForUpdate("boot");
-    otaBootCheckPending = false;
-  }
 
   lastShowRunningState = showStatus.isRunning;
   LOGI("Setup complete");
@@ -434,7 +437,11 @@ void loop()
     dnsServer.processNextRequest();
   }
 
-  if (WiFi.status() != WL_CONNECTED && config.wifiSsid.length() > 0)
+  handleWiFiStartup();
+
+  if (!wifiStartupPending &&
+      WiFi.status() != WL_CONNECTED &&
+      config.wifiSsid.length() > 0)
   {
     if (millis() - lastWifiRetryAt > WIFI_RETRY_INTERVAL_MS)
     {
@@ -685,11 +692,73 @@ void applyLightOutput(bool force)
 #endif
 }
 
+void applyBootIndicator()
+{
+#if LED_COUNT > 0
+  if (!HAS_LED_OUTPUT || !lightControl.outputInitialized)
+  {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lightControl.lastUpdateAt < LIGHT_UPDATE_MS)
+  {
+    return;
+  }
+  lightControl.lastUpdateAt = now;
+
+  uint32_t phase = now % BOOT_PULSE_PERIOD_MS;
+  uint32_t halfPeriod = BOOT_PULSE_PERIOD_MS / 2UL;
+  uint16_t level = BOOT_PULSE_LEVEL_MIN;
+  uint16_t levelRange = BOOT_PULSE_LEVEL_MAX - BOOT_PULSE_LEVEL_MIN;
+
+  if (halfPeriod > 0)
+  {
+    if (phase < halfPeriod)
+    {
+      level = BOOT_PULSE_LEVEL_MIN + (uint16_t)((levelRange * phase) / halfPeriod);
+    }
+    else
+    {
+      uint32_t downPhase = BOOT_PULSE_PERIOD_MS - phase;
+      level = BOOT_PULSE_LEVEL_MIN + (uint16_t)((levelRange * downPhase) / halfPeriod);
+    }
+  }
+
+  uint8_t scaledR = (uint8_t)(((uint32_t)255U * level + (LIGHT_LEVEL_MAX / 2)) / LIGHT_LEVEL_MAX);
+  if (scaledR == lightControl.lastR &&
+      lightControl.lastG == 0 &&
+      lightControl.lastB == 0 &&
+      lightControl.lastW == 0)
+  {
+    return;
+  }
+
+  RgbwColor outColor(scaledR, 0, 0, 0);
+  for (uint16_t i = 0; i < LED_COUNT; i++)
+  {
+    lightBus.SetPixelColor(i, outColor);
+  }
+  lightBus.Show();
+
+  lightControl.lastR = scaledR;
+  lightControl.lastG = 0;
+  lightControl.lastB = 0;
+  lightControl.lastW = 0;
+#endif
+}
+
 void updateLightControl()
 {
   // Licht ist aktiv:
   // - waehrend showStatus.isRunning
   // - plus Nachlauf LED_AFTER_BELUEFTEN_MS nach Belueftungsbeginn
+  if (bootIndicatorActive)
+  {
+    applyBootIndicator();
+    return;
+  }
+
   unsigned long now = millis();
   bool lightWindowActive = showStatus.isRunning;
   if (!lightWindowActive && lightControl.onUntilAt > 0)
@@ -749,6 +818,7 @@ void setSafeOutputState()
 {
   // Wird z. B. vor OTA aufgerufen, um alle Aktoren in sicheren Zustand
   // zu bringen (Pumpen AUS, Ventil definiert, Licht AUS).
+  bootIndicatorActive = false;
   showStatus.shouldStart = false;
   showStatus.isRunning = false;
   setPumpTarget(false);
@@ -1131,6 +1201,33 @@ void setupMqtt()
   LOGI("MQTT setup: broker=%s:%u", config.mqttHost.c_str(), config.mqttPort);
 }
 
+void handleWiFiStartup()
+{
+  if (!wifiStartupPending)
+  {
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    wifiStartupPending = false;
+    bootIndicatorActive = false;
+    LOGI("STA connected. IP=%s", WiFi.localIP().toString().c_str());
+    return;
+  }
+
+  if ((millis() - wifiStartupAt) < WIFI_CONNECT_TIMEOUT_MS)
+  {
+    return;
+  }
+
+  wifiStartupPending = false;
+  bootIndicatorActive = false;
+  LOGW("Initial WiFi connect timed out, enabling AP fallback");
+  startAccessPoint();
+  setupCaptivePortal();
+}
+
 void mqttLoop()
 {
   // MQTT nur bedienen, wenn STA-Link aktiv ist.
@@ -1203,6 +1300,7 @@ void mqttEnsureConnected()
   }
   mqttClient.subscribe(topicCfgShowLengthSet.c_str());
   mqttClient.subscribe(topicCfgNachlaufSet.c_str());
+  mqttClient.subscribe(topicOtaInstall.c_str());
   publishAvailability("online", true);
   publishDiscovery();
   publishShowState(true);
@@ -1375,6 +1473,45 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
     scheduleConfigSave();
     publishConfigState(true);
     publishTelemetry(true);
+    return;
+  }
+
+  if (topicStr == topicOtaInstall)
+  {
+    if (payloadStr != "install")
+    {
+      LOGW("Invalid OTA install payload: %s", payloadStr.c_str());
+      return;
+    }
+
+    if (otaStatus.checkInProgress || otaStatus.updateInProgress)
+    {
+      otaStatus.lastError = "OTA bereits aktiv";
+      publishTelemetry(true);
+      return;
+    }
+    if (WiFi.status() != WL_CONNECTED)
+    {
+      otaStatus.lastError = "WLAN nicht verbunden";
+      publishTelemetry(true);
+      return;
+    }
+    if (showStatus.isRunning)
+    {
+      otaStatus.lastError = "Show laeuft noch";
+      publishTelemetry(true);
+      return;
+    }
+    if (!otaStatus.updateAvailable || otaStatus.firmwareUrl.length() == 0)
+    {
+      otaStatus.lastError = "Kein Update verfuegbar";
+      publishTelemetry(true);
+      return;
+    }
+
+    otaUpdateRequested = true;
+    otaStatus.lastError = "";
+    publishTelemetry(true);
   }
 }
 
@@ -1489,7 +1626,35 @@ void publishDiscovery()
     LOGI("Light discovery removed (LED_COUNT=0)");
   }
 
+  publishUpdateDiscovery();
   publishSensorDiscovery();
+}
+
+void publishUpdateDiscovery()
+{
+  StaticJsonDocument<768> cfg;
+  cfg["name"] = "Firmware";
+  cfg["object_id"] = "firmware";
+  cfg["unique_id"] = deviceId + "-firmware-update";
+  cfg["device_class"] = "firmware";
+  cfg["command_topic"] = topicOtaInstall;
+  cfg["payload_install"] = "install";
+  cfg["state_topic"] = topicTeleState;
+  cfg["value_template"] = "{{ {'installed_version': value_json.OTA.CurrentVersion, 'latest_version': value_json.OTA.LatestVersion, 'title': 'VacUBear Firmware', 'release_summary': value_json.OTA.ReleaseNotes, 'in_progress': value_json.OTA.UpdateInProgress } | to_json }}";
+  cfg["availability_topic"] = topicAvailability;
+  cfg["payload_available"] = "online";
+  cfg["payload_not_available"] = "offline";
+
+  JsonObject dev = cfg["device"].to<JsonObject>();
+  JsonArray ids = dev["identifiers"].to<JsonArray>();
+  ids.add(deviceId);
+  dev["name"] = "VacUBear";
+  dev["manufacturer"] = "KingBEAR";
+  dev["model"] = "Frame-25";
+
+  String payload;
+  serializeJson(cfg, payload);
+  mqttClient.publish((String("homeassistant/update/") + deviceId + "/firmware/config").c_str(), payload.c_str(), true);
 }
 
 void publishSensorDiscovery()
@@ -1628,7 +1793,7 @@ void publishSensorDiscovery()
     cfg["min"] = SHOW_LENGTH_MIN_S;
     cfg["max"] = SHOW_LENGTH_MAX_S;
     cfg["step"] = 1;
-    cfg["mode"] = "slider";
+    cfg["mode"] = "box";
     cfg["availability_topic"] = topicAvailability;
     addDevice(cfg.as<JsonObject>());
     String payload;
@@ -1788,6 +1953,7 @@ void publishTelemetry(bool force)
   JsonObject ota = doc["OTA"].to<JsonObject>();
   ota["CurrentVersion"] = otaStatus.currentVersion;
   ota["LatestVersion"] = otaStatus.latestVersion;
+  ota["ReleaseNotes"] = otaStatus.releaseNotes;
   ota["UpdateAvailable"] = otaStatus.updateAvailable;
   ota["CheckInProgress"] = otaStatus.checkInProgress;
   ota["UpdateInProgress"] = otaStatus.updateInProgress;
@@ -1824,6 +1990,7 @@ void updateMqttTopics()
   topicCfgShowLengthState = topicBase + "/config/show_length_s/state";
   topicCfgNachlaufSet = topicBase + "/config/nachlauf_s/set";
   topicCfgNachlaufState = topicBase + "/config/nachlauf_s/state";
+  topicOtaInstall = topicBase + "/ota/update/install";
   topicAvailability = topicBase + "/availability";
   topicTeleState = "tele/" + deviceId + "/STATE";
   LOGI("MQTT topics initialized: base=%s", topicBase.c_str());
@@ -1832,8 +1999,9 @@ void updateMqttTopics()
 void setupWiFi()
 {
   // Strategie:
-  // 1) STA-Verbindung versuchen
-  // 2) bei Fehlschlag AP + Captive Portal starten
+  // 1) STA-Verbindung asynchron starten
+  // 2) waehrenddessen loop() aktiv lassen (z. B. Boot-LED)
+  // 3) bei Timeout AP + Captive Portal starten
   LOGI("Initializing WiFi");
   apSsid = defaultApSsid();
 
@@ -1841,40 +2009,21 @@ void setupWiFi()
   WiFi.setAutoReconnect(true);
   WiFi.hostname(deviceId.c_str());
 
-  bool connected = connectToConfiguredWifi(WIFI_CONNECT_TIMEOUT_MS);
-  if (!connected)
-  {
-    startAccessPoint();
-    setupCaptivePortal();
-  }
-  else
-  {
-    LOGI("STA connected. IP=%s", WiFi.localIP().toString().c_str());
-  }
-}
-
-bool connectToConfiguredWifi(uint32_t timeoutMs)
-{
-  // Blockierender Erstverbindungsversuch nur in setup().
-  // Spaetere Reconnects laufen nicht-blockierend in loop().
   if (config.wifiSsid.length() == 0)
   {
     LOGW("No WiFi SSID configured yet");
-    return false;
+    startAccessPoint();
+    setupCaptivePortal();
+    return;
   }
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(config.wifiSsid.c_str(), config.wifiPassword.c_str());
-
-  LOGI("Connecting to WiFi SSID '%s'...", config.wifiSsid.c_str());
-
-  unsigned long startAt = millis();
-  while (WiFi.status() != WL_CONNECTED && (millis() - startAt) < timeoutMs)
-  {
-    delay(250);
-  }
-
-  return WiFi.status() == WL_CONNECTED;
+  wifiStartupPending = true;
+  wifiStartupAt = millis();
+  bootIndicatorActive = HAS_LED_OUTPUT;
+  lastWifiRetryAt = wifiStartupAt;
+  LOGI("Connecting to WiFi SSID '%s' asynchronously...", config.wifiSsid.c_str());
 }
 
 void startAccessPoint()
