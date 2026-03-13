@@ -1,5 +1,5 @@
 {
   "version": "0.0.6-dev",
   "firmware_url": "http://ota.kinkbear.de/ha-update-boot-cleanup/firmware.bin",
-  "notes": "Commit e8bdeeb1dfac"
+  "notes": "Commit 30a79f21c55c"
 }
