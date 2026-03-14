@@ -628,6 +628,21 @@ bool parseJsonBody(JsonDocument &doc, String &errorText)
   return true;
 }
 
+bool requestBodyLooksLikeJson()
+{
+  String raw = server.arg("plain");
+  for (size_t i = 0; i < raw.length(); i++)
+  {
+    char c = raw[i];
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+    {
+      continue;
+    }
+    return c == '{' || c == '[';
+  }
+  return false;
+}
+
 void sendJsonDocument(int statusCode, JsonDocument &doc)
 {
   String out;
@@ -3481,7 +3496,7 @@ void handleLightConfig()
   bool previewRequested = false;
   JsonDocument requestDoc;
   String errorText;
-  bool hasJsonBody = server.arg("plain").length() > 0;
+  bool hasJsonBody = requestBodyLooksLikeJson();
 
   if (hasJsonBody)
   {
