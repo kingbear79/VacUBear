@@ -382,6 +382,7 @@ void startAccessPoint(void);
 void setupCaptivePortal(void);
 void handleRoot(void);
 void handleSave(void);
+void handleAppJs(void);
 void handleApiConfigGet(void);
 void handleApiConfigPost(void);
 void handleApiShowGet(void);
@@ -398,6 +399,7 @@ void handleOtaUploadData(void);
 bool handleCaptivePortalRedirect(void);
 String htmlEscape(const String &input);
 String buildHtmlPage(const String &message = "");
+void sendHtmlPage(const String &message = "", int statusCode = 200);
 bool isIpAddress(const String &host);
 bool isLegacyOtaManifestUrl(const String &url);
 String defaultApSsid(void);
@@ -2748,6 +2750,7 @@ void setupWebServer()
   // - "/api/*"     REST-Endpunkte
   // - "/ota/*"     OTA-Status, Check, Update (legacy + UI)
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/app.js", HTTP_GET, handleAppJs);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/api/status", HTTP_GET, handleStatus);
@@ -2777,7 +2780,337 @@ void handleRoot()
   {
     return;
   }
-  server.send(200, "text/html", buildHtmlPage());
+  sendHtmlPage();
+}
+
+void handleAppJs()
+{
+  LOGD("HTTP GET /app.js");
+  static const char APP_JS[] PROGMEM = R"rawliteral(
+function parseJsonText(text) {
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function requestJson(path, method, body, contentType, onSuccess, onError) {
+  var xhr = new XMLHttpRequest();
+  xhr.open(method || 'GET', path, true);
+  if (contentType) {
+    xhr.setRequestHeader('Content-Type', contentType);
+  }
+  xhr.onreadystatechange = function() {
+    var json;
+    if (xhr.readyState !== 4) return;
+    json = parseJsonText(xhr.responseText);
+    if (xhr.status >= 200 && xhr.status < 300) {
+      if (onSuccess) onSuccess(json, xhr);
+      return;
+    }
+    if (onError) onError(new Error(json.error || ('HTTP ' + xhr.status)), json, xhr);
+  };
+  xhr.onerror = function() {
+    if (onError) onError(new Error('Verbindung fehlgeschlagen'), {}, xhr);
+  };
+  xhr.send(body || null);
+}
+
+function apiJson(path, method, onSuccess, onError) {
+  requestJson(path, method || 'GET', null, null, onSuccess, onError);
+}
+
+function formatBytes(value) {
+  var bytes = Number(value || 0);
+  if (!bytes) return '0 B';
+  if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return bytes + ' B';
+}
+
+function clampByte(value) {
+  var numeric = Number(value || 0);
+  return Math.max(0, Math.min(255, Math.round(numeric)));
+}
+
+function byteToHex(value) {
+  var hex = clampByte(value).toString(16).toUpperCase();
+  return hex.length < 2 ? ('0' + hex) : hex;
+}
+
+function hexToRgb(hex) {
+  var normalized = String(hex || '').replace('#', '');
+  if (normalized.length !== 6) {
+    return {r: 255, g: 255, b: 255};
+  }
+  return {
+    r: parseInt(normalized.substr(0, 2), 16),
+    g: parseInt(normalized.substr(2, 2), 16),
+    b: parseInt(normalized.substr(4, 2), 16)
+  };
+}
+
+function rgbToCss(r, g, b, w) {
+  var white = clampByte(w);
+  var red = clampByte(r + white);
+  var green = clampByte(g + white);
+  var blue = clampByte(b + white);
+  return 'rgb(' + red + ', ' + green + ', ' + blue + ')';
+}
+
+function syncLightPickerFromHidden() {
+  var colorInput = document.getElementById('light_color');
+  var hiddenR = document.getElementById('light_r');
+  var hiddenG = document.getElementById('light_g');
+  var hiddenB = document.getElementById('light_b');
+  var hex;
+  if (!colorInput || !hiddenR || !hiddenG || !hiddenB) return;
+  hex = '#' + byteToHex(hiddenR.value) + byteToHex(hiddenG.value) + byteToHex(hiddenB.value);
+  colorInput.value = hex;
+}
+
+function syncHiddenFromLightPicker() {
+  var colorInput = document.getElementById('light_color');
+  var hiddenR = document.getElementById('light_r');
+  var hiddenG = document.getElementById('light_g');
+  var hiddenB = document.getElementById('light_b');
+  var rgb;
+  if (!colorInput || !hiddenR || !hiddenG || !hiddenB) return;
+  rgb = hexToRgb(colorInput.value);
+  hiddenR.value = rgb.r;
+  hiddenG.value = rgb.g;
+  hiddenB.value = rgb.b;
+}
+
+function syncWhiteControls(sourceId) {
+  var slider = document.getElementById('light_w_slider');
+  var input = document.getElementById('light_w');
+  var source = sourceId === 'slider' ? slider : input;
+  var value;
+  if (!slider || !input || !source) return;
+  value = clampByte(source.value);
+  slider.value = value;
+  input.value = value;
+}
+
+function updateLightPreviewCard() {
+  var preview = document.getElementById('light-preview');
+  var text = document.getElementById('light-preview-text');
+  var enabled = document.getElementById('light_enabled');
+  var hiddenR = document.getElementById('light_r');
+  var hiddenG = document.getElementById('light_g');
+  var hiddenB = document.getElementById('light_b');
+  var white = document.getElementById('light_w');
+  var r;
+  var g;
+  var b;
+  var w;
+  if (!preview || !text || !hiddenR || !hiddenG || !hiddenB || !white) return;
+  r = clampByte(hiddenR.value);
+  g = clampByte(hiddenG.value);
+  b = clampByte(hiddenB.value);
+  w = clampByte(white.value);
+  preview.style.background = rgbToCss(r, g, b, w);
+  text.innerHTML = 'RGBW: ' + r + ', ' + g + ', ' + b + ', ' + w +
+    ' | Show-Beleuchtung: ' + (enabled && enabled.checked ? 'AN' : 'AUS');
+}
+
+function buildLightPayloadString(preview) {
+  var enabled = document.getElementById('light_enabled');
+  var hiddenR = document.getElementById('light_r');
+  var hiddenG = document.getElementById('light_g');
+  var hiddenB = document.getElementById('light_b');
+  var white = document.getElementById('light_w');
+  syncHiddenFromLightPicker();
+  syncWhiteControls('input');
+  updateLightPreviewCard();
+  return 'enabled=' + encodeURIComponent(enabled && enabled.checked ? '1' : '0') +
+    '&r=' + encodeURIComponent(hiddenR ? hiddenR.value : '0') +
+    '&g=' + encodeURIComponent(hiddenG ? hiddenG.value : '0') +
+    '&b=' + encodeURIComponent(hiddenB ? hiddenB.value : '0') +
+    '&w=' + encodeURIComponent(white ? white.value : '0') +
+    '&preview=' + encodeURIComponent(preview ? '1' : '0');
+}
+
+function saveLightConfig(preview) {
+  if (!document.getElementById('light_color')) return;
+  requestJson(
+    '/api/light',
+    'POST',
+    buildLightPayloadString(preview),
+    'application/x-www-form-urlencoded;charset=UTF-8',
+    function() {
+      updateLightPreviewCard();
+    },
+    function(error) {
+      alert('Beleuchtung konnte nicht gespeichert werden: ' + error.message);
+    }
+  );
+}
+
+function previewLightConfig() {
+  saveLightConfig(true);
+}
+
+function setOtaProgress(percent, text) {
+  var bar = document.getElementById('ota-progress-bar');
+  var label = document.getElementById('ota-progress-text');
+  var safePercent = Math.max(0, Math.min(100, Number(percent || 0)));
+  if (bar) {
+    bar.style.width = safePercent + '%';
+  }
+  if (label) {
+    label.innerHTML = text || '';
+  }
+}
+
+function renderOta(status) {
+  var el = document.getElementById('ota-box');
+  var text = '';
+  var progressText = status.status_text || status.phase || 'Bereit';
+  if (!el) return;
+  text += 'Konfiguriert: ' + (status.configured ? 'ja' : 'nein') + '<br>';
+  text += 'Manifest URL: ' + (status.manifest_url || '-') + '<br>';
+  text += 'WLAN verbunden: ' + (status.wifi_connected ? 'ja' : 'nein') + '<br>';
+  text += 'Aktuell: ' + (status.current_version || '-') + '<br>';
+  text += 'Neueste Version: ' + (status.latest_version || '-') + '<br>';
+  text += 'Update verfuegbar: ' + (status.update_available ? 'ja' : 'nein') + '<br>';
+  text += 'Quelle: ' + (status.source || '-') + '<br>';
+  text += 'Status: ' + (status.status_text || status.phase || '-') + '<br>';
+  if (status.last_error) {
+    text += 'Letzter Fehler: ' + status.last_error + '<br>';
+  }
+  if (status.release_notes) {
+    text += 'Hinweis: ' + status.release_notes + '<br>';
+  }
+  el.innerHTML = text;
+  if (status.progress_total > 0) {
+    progressText += ' (' + (status.progress_percent || 0) + '% / ' +
+      formatBytes(status.progress_bytes) + ' von ' + formatBytes(status.progress_total) + ')';
+  } else if (status.progress_bytes > 0) {
+    progressText += ' (' + formatBytes(status.progress_bytes) + ')';
+  }
+  if (status.reboot_pending) {
+    progressText += ' - Neustart ausstehend';
+  }
+  setOtaProgress(status.progress_percent || 0, progressText);
+}
+
+function refreshOta() {
+  apiJson(
+    '/ota/status',
+    'GET',
+    function(status) {
+      renderOta(status);
+    },
+    function(error) {
+      var el = document.getElementById('ota-box');
+      if (el) el.innerHTML = 'OTA-Status konnte nicht geladen werden: ' + error.message;
+    }
+  );
+}
+
+function otaCheck() {
+  apiJson(
+    '/ota/check',
+    'POST',
+    function() {
+      setTimeout(refreshOta, 300);
+      setTimeout(refreshOta, 1500);
+    },
+    function(error) {
+      alert('OTA-Check fehlgeschlagen: ' + error.message);
+    }
+  );
+}
+
+function otaUpdate() {
+  if (!confirm('Firmware-Update jetzt starten?')) return;
+  apiJson(
+    '/ota/update',
+    'POST',
+    function() {
+      setTimeout(refreshOta, 200);
+    },
+    function(error) {
+      alert('OTA-Update fehlgeschlagen: ' + error.message);
+    }
+  );
+}
+
+function otaUploadFile() {
+  var input = document.getElementById('ota-file');
+  var file;
+  var form;
+  var xhr;
+  if (!input || !input.files || !input.files.length) {
+    alert('Bitte zuerst eine Firmware-Datei auswaehlen.');
+    return;
+  }
+  file = input.files[0];
+  if (!confirm('Firmware-Datei jetzt hochladen und installieren?')) return;
+  form = new FormData();
+  form.append('firmware', file, file.name);
+  setOtaProgress(0, 'Upload wird gestartet...');
+  xhr = new XMLHttpRequest();
+  xhr.open('POST', '/ota/upload', true);
+  if (xhr.upload) {
+    xhr.upload.onprogress = function(event) {
+      var percent;
+      if (!event.lengthComputable) return;
+      percent = Math.round((event.loaded / event.total) * 100);
+      setOtaProgress(percent, 'Upload laeuft (' + percent + '% / ' +
+        formatBytes(event.loaded) + ' von ' + formatBytes(event.total) + ')');
+    };
+  }
+  xhr.onreadystatechange = function() {
+    var json;
+    if (xhr.readyState !== 4) return;
+    json = parseJsonText(xhr.responseText);
+    if (xhr.status >= 200 && xhr.status < 300) {
+      input.value = '';
+      setTimeout(refreshOta, 200);
+      return;
+    }
+    alert('Firmware-Upload fehlgeschlagen: ' + (json.error || ('HTTP ' + xhr.status)));
+    setTimeout(refreshOta, 200);
+  };
+  xhr.onerror = function() {
+    alert('Firmware-Upload fehlgeschlagen: Upload-Verbindung fehlgeschlagen');
+    setTimeout(refreshOta, 200);
+  };
+  xhr.send(form);
+}
+
+function initLightControls() {
+  var colorInput = document.getElementById('light_color');
+  var enabled = document.getElementById('light_enabled');
+  var whiteSlider = document.getElementById('light_w_slider');
+  var whiteInput = document.getElementById('light_w');
+  if (!colorInput || !enabled || !whiteSlider || !whiteInput) return;
+  syncLightPickerFromHidden();
+  syncWhiteControls('input');
+  updateLightPreviewCard();
+  colorInput.onchange = function() { saveLightConfig(true); };
+  enabled.onchange = function() { saveLightConfig(false); };
+  whiteSlider.oninput = function() {
+    syncWhiteControls('slider');
+    updateLightPreviewCard();
+  };
+  whiteSlider.onchange = function() { saveLightConfig(true); };
+  whiteInput.oninput = function() {
+    syncWhiteControls('input');
+    updateLightPreviewCard();
+  };
+  whiteInput.onchange = function() { saveLightConfig(true); };
+}
+
+refreshOta();
+initLightControls();
+setInterval(refreshOta, 1000);
+)rawliteral";
+  server.send_P(200, "application/javascript", APP_JS);
 }
 
 void handleSave()
@@ -2851,12 +3184,12 @@ void handleSave()
   if (!saveConfig())
   {
     LOGW("Config save failed");
-    server.send(500, "text/html", buildHtmlPage("Fehler beim Speichern."));
+    sendHtmlPage("Fehler beim Speichern.", 500);
     return;
   }
 
   LOGI("Config saved, restarting device");
-  server.send(200, "text/html", buildHtmlPage("Gespeichert. Das Geraet startet neu..."));
+  sendHtmlPage("Gespeichert. Das Geraet startet neu...");
   delay(500);
   ESP.restart();
 }
@@ -3832,6 +4165,11 @@ String htmlEscape(const String &input)
   return out;
 }
 
+void sendHtmlPage(const String &message, int statusCode)
+{
+  server.send(statusCode, "text/html", buildHtmlPage(message));
+}
+
 String buildHtmlPage(const String &message)
 {
   // Einfache, eingebettete Setup-Seite ohne externe Assets.
@@ -3951,332 +4289,7 @@ String buildHtmlPage(const String &message)
   html += "</div>";
   html += "<div class='small'>Aktuelle Firmware: " + String(FW_VERSION) + "</div>";
   html += "<div class='small'>Bei gueltigem WLAN im lokalen Netz erreichbar. Bei Fehler startet AP + Captive Portal.</div>";
-  html += R"rawliteral(
-<script>
-function parseJsonText(text) {
-  try {
-    return text ? JSON.parse(text) : {};
-  } catch (e) {
-    return {};
-  }
-}
-
-function requestJson(path, method, body, contentType, onSuccess, onError) {
-  var xhr = new XMLHttpRequest();
-  xhr.open(method || 'GET', path, true);
-  if (contentType) {
-    xhr.setRequestHeader('Content-Type', contentType);
-  }
-  xhr.onreadystatechange = function() {
-    var json;
-    if (xhr.readyState !== 4) return;
-    json = parseJsonText(xhr.responseText);
-    if (xhr.status >= 200 && xhr.status < 300) {
-      if (onSuccess) onSuccess(json, xhr);
-      return;
-    }
-    if (onError) onError(new Error(json.error || ('HTTP ' + xhr.status)), json, xhr);
-  };
-  xhr.onerror = function() {
-    if (onError) onError(new Error('Verbindung fehlgeschlagen'), {}, xhr);
-  };
-  xhr.send(body || null);
-}
-
-function apiJson(path, method, onSuccess, onError) {
-  requestJson(path, method || 'GET', null, null, onSuccess, onError);
-}
-
-function formatBytes(value) {
-  var bytes = Number(value || 0);
-  if (!bytes) return '0 B';
-  if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
-  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
-  return bytes + ' B';
-}
-
-function clampByte(value) {
-  var numeric = Number(value || 0);
-  return Math.max(0, Math.min(255, Math.round(numeric)));
-}
-
-function byteToHex(value) {
-  var hex = clampByte(value).toString(16).toUpperCase();
-  return hex.length < 2 ? ('0' + hex) : hex;
-}
-
-function hexToRgb(hex) {
-  var normalized = String(hex || '').replace('#', '');
-  if (normalized.length !== 6) {
-    return {r: 255, g: 255, b: 255};
-  }
-  return {
-    r: parseInt(normalized.substr(0, 2), 16),
-    g: parseInt(normalized.substr(2, 2), 16),
-    b: parseInt(normalized.substr(4, 2), 16)
-  };
-}
-
-function rgbToCss(r, g, b, w) {
-  var white = clampByte(w);
-  var red = clampByte(r + white);
-  var green = clampByte(g + white);
-  var blue = clampByte(b + white);
-  return 'rgb(' + red + ', ' + green + ', ' + blue + ')';
-}
-
-function syncLightPickerFromHidden() {
-  var colorInput = document.getElementById('light_color');
-  var hiddenR = document.getElementById('light_r');
-  var hiddenG = document.getElementById('light_g');
-  var hiddenB = document.getElementById('light_b');
-  var hex;
-  if (!colorInput || !hiddenR || !hiddenG || !hiddenB) return;
-  hex = '#' + byteToHex(hiddenR.value) + byteToHex(hiddenG.value) + byteToHex(hiddenB.value);
-  colorInput.value = hex;
-}
-
-function syncHiddenFromLightPicker() {
-  var colorInput = document.getElementById('light_color');
-  var hiddenR = document.getElementById('light_r');
-  var hiddenG = document.getElementById('light_g');
-  var hiddenB = document.getElementById('light_b');
-  var rgb;
-  if (!colorInput || !hiddenR || !hiddenG || !hiddenB) return;
-  rgb = hexToRgb(colorInput.value);
-  hiddenR.value = rgb.r;
-  hiddenG.value = rgb.g;
-  hiddenB.value = rgb.b;
-}
-
-function syncWhiteControls(sourceId) {
-  var slider = document.getElementById('light_w_slider');
-  var input = document.getElementById('light_w');
-  var source = sourceId === 'slider' ? slider : input;
-  var value;
-  if (!slider || !input || !source) return;
-  value = clampByte(source.value);
-  slider.value = value;
-  input.value = value;
-}
-
-function updateLightPreviewCard() {
-  var preview = document.getElementById('light-preview');
-  var text = document.getElementById('light-preview-text');
-  var enabled = document.getElementById('light_enabled');
-  var hiddenR = document.getElementById('light_r');
-  var hiddenG = document.getElementById('light_g');
-  var hiddenB = document.getElementById('light_b');
-  var white = document.getElementById('light_w');
-  var r;
-  var g;
-  var b;
-  var w;
-  if (!preview || !text || !hiddenR || !hiddenG || !hiddenB || !white) return;
-  r = clampByte(hiddenR.value);
-  g = clampByte(hiddenG.value);
-  b = clampByte(hiddenB.value);
-  w = clampByte(white.value);
-  preview.style.background = rgbToCss(r, g, b, w);
-  text.innerHTML = 'RGBW: ' + r + ', ' + g + ', ' + b + ', ' + w +
-    ' | Show-Beleuchtung: ' + (enabled && enabled.checked ? 'AN' : 'AUS');
-}
-
-function buildLightPayloadString(preview) {
-  var enabled = document.getElementById('light_enabled');
-  var hiddenR = document.getElementById('light_r');
-  var hiddenG = document.getElementById('light_g');
-  var hiddenB = document.getElementById('light_b');
-  var white = document.getElementById('light_w');
-  syncHiddenFromLightPicker();
-  syncWhiteControls('input');
-  updateLightPreviewCard();
-  return 'enabled=' + encodeURIComponent(enabled && enabled.checked ? '1' : '0') +
-    '&r=' + encodeURIComponent(hiddenR ? hiddenR.value : '0') +
-    '&g=' + encodeURIComponent(hiddenG ? hiddenG.value : '0') +
-    '&b=' + encodeURIComponent(hiddenB ? hiddenB.value : '0') +
-    '&w=' + encodeURIComponent(white ? white.value : '0') +
-    '&preview=' + encodeURIComponent(preview ? '1' : '0');
-}
-
-function saveLightConfig(preview) {
-  if (!document.getElementById('light_color')) return;
-  requestJson(
-    '/api/light',
-    'POST',
-    buildLightPayloadString(preview),
-    'application/x-www-form-urlencoded;charset=UTF-8',
-    function() {
-      updateLightPreviewCard();
-    },
-    function(error) {
-      alert('Beleuchtung konnte nicht gespeichert werden: ' + error.message);
-    }
-  );
-}
-
-function previewLightConfig() {
-  saveLightConfig(true);
-}
-
-function setOtaProgress(percent, text) {
-  var bar = document.getElementById('ota-progress-bar');
-  var label = document.getElementById('ota-progress-text');
-  var safePercent = Math.max(0, Math.min(100, Number(percent || 0)));
-  if (bar) {
-    bar.style.width = safePercent + '%';
-  }
-  if (label) {
-    label.innerHTML = text || '';
-  }
-}
-
-function renderOta(status) {
-  var el = document.getElementById('ota-box');
-  var text = '';
-  var progressText = status.status_text || status.phase || 'Bereit';
-  if (!el) return;
-  text += 'Konfiguriert: ' + (status.configured ? 'ja' : 'nein') + '<br>';
-  text += 'Manifest URL: ' + (status.manifest_url || '-') + '<br>';
-  text += 'WLAN verbunden: ' + (status.wifi_connected ? 'ja' : 'nein') + '<br>';
-  text += 'Aktuell: ' + (status.current_version || '-') + '<br>';
-  text += 'Neueste Version: ' + (status.latest_version || '-') + '<br>';
-  text += 'Update verfuegbar: ' + (status.update_available ? 'ja' : 'nein') + '<br>';
-  text += 'Quelle: ' + (status.source || '-') + '<br>';
-  text += 'Status: ' + (status.status_text || status.phase || '-') + '<br>';
-  if (status.last_error) {
-    text += 'Letzter Fehler: ' + status.last_error + '<br>';
-  }
-  if (status.release_notes) {
-    text += 'Hinweis: ' + status.release_notes + '<br>';
-  }
-  el.innerHTML = text;
-  if (status.progress_total > 0) {
-    progressText += ' (' + (status.progress_percent || 0) + '% / ' +
-      formatBytes(status.progress_bytes) + ' von ' + formatBytes(status.progress_total) + ')';
-  } else if (status.progress_bytes > 0) {
-    progressText += ' (' + formatBytes(status.progress_bytes) + ')';
-  }
-  if (status.reboot_pending) {
-    progressText += ' - Neustart ausstehend';
-  }
-  setOtaProgress(status.progress_percent || 0, progressText);
-}
-
-function refreshOta() {
-  apiJson(
-    '/ota/status',
-    'GET',
-    function(status) {
-      renderOta(status);
-    },
-    function(error) {
-      var el = document.getElementById('ota-box');
-      if (el) el.innerHTML = 'OTA-Status konnte nicht geladen werden: ' + error.message;
-    }
-  );
-}
-
-function otaCheck() {
-  apiJson(
-    '/ota/check',
-    'POST',
-    function() {
-      setTimeout(refreshOta, 300);
-      setTimeout(refreshOta, 1500);
-    },
-    function(error) {
-      alert('OTA-Check fehlgeschlagen: ' + error.message);
-    }
-  );
-}
-
-function otaUpdate() {
-  if (!confirm('Firmware-Update jetzt starten?')) return;
-  apiJson(
-    '/ota/update',
-    'POST',
-    function() {
-      setTimeout(refreshOta, 200);
-    },
-    function(error) {
-      alert('OTA-Update fehlgeschlagen: ' + error.message);
-    }
-  );
-}
-
-function otaUploadFile() {
-  var input = document.getElementById('ota-file');
-  var file;
-  var form;
-  var xhr;
-  if (!input || !input.files || !input.files.length) {
-    alert('Bitte zuerst eine Firmware-Datei auswaehlen.');
-    return;
-  }
-  file = input.files[0];
-  if (!confirm('Firmware-Datei jetzt hochladen und installieren?')) return;
-  form = new FormData();
-  form.append('firmware', file, file.name);
-  setOtaProgress(0, 'Upload wird gestartet...');
-  xhr = new XMLHttpRequest();
-  xhr.open('POST', '/ota/upload', true);
-  if (xhr.upload) {
-    xhr.upload.onprogress = function(event) {
-      var percent;
-      if (!event.lengthComputable) return;
-      percent = Math.round((event.loaded / event.total) * 100);
-      setOtaProgress(percent, 'Upload laeuft (' + percent + '% / ' +
-        formatBytes(event.loaded) + ' von ' + formatBytes(event.total) + ')');
-    };
-  }
-  xhr.onreadystatechange = function() {
-    var json;
-    if (xhr.readyState !== 4) return;
-    json = parseJsonText(xhr.responseText);
-    if (xhr.status >= 200 && xhr.status < 300) {
-      input.value = '';
-      setTimeout(refreshOta, 200);
-      return;
-    }
-    alert('Firmware-Upload fehlgeschlagen: ' + (json.error || ('HTTP ' + xhr.status)));
-    setTimeout(refreshOta, 200);
-  };
-  xhr.onerror = function() {
-    alert('Firmware-Upload fehlgeschlagen: Upload-Verbindung fehlgeschlagen');
-    setTimeout(refreshOta, 200);
-  };
-  xhr.send(form);
-}
-
-function initLightControls() {
-  var colorInput = document.getElementById('light_color');
-  var enabled = document.getElementById('light_enabled');
-  var whiteSlider = document.getElementById('light_w_slider');
-  var whiteInput = document.getElementById('light_w');
-  if (!colorInput || !enabled || !whiteSlider || !whiteInput) return;
-  syncLightPickerFromHidden();
-  syncWhiteControls('input');
-  updateLightPreviewCard();
-  colorInput.onchange = function() { saveLightConfig(true); };
-  enabled.onchange = function() { saveLightConfig(false); };
-  whiteSlider.oninput = function() {
-    syncWhiteControls('slider');
-    updateLightPreviewCard();
-  };
-  whiteSlider.onchange = function() { saveLightConfig(true); };
-  whiteInput.oninput = function() {
-    syncWhiteControls('input');
-    updateLightPreviewCard();
-  };
-  whiteInput.onchange = function() { saveLightConfig(true); };
-}
-
-refreshOta();
-initLightControls();
-setInterval(refreshOta, 1000);
-</script>
-)rawliteral";
+  html += "<script src='/app.js'></script>";
   html += "</div></div></body></html>";
 
   return html;
