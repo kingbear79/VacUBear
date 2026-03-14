@@ -1414,7 +1414,7 @@ static size_t extractVersionNumbers(const String &version, uint32_t *outParts, s
 static int versionQualifierRank(const String &version)
 {
   // Reihenfolge fuer Prae-Release-Tags:
-  // dev < alpha < beta < rc < stable
+  // dev < alpha < beta < rc < stable/custom-release-name
   String lower = version;
   lower.toLowerCase();
 
@@ -1441,8 +1441,8 @@ static int versionQualifierRank(const String &version)
     return 0;
   }
 
-  // Unknown prerelease tag stays below stable.
-  return 0;
+  // Unbekannte Suffixe gelten als benannte Stable-Releases.
+  return 4;
 }
 
 int compareVersionStrings(const String &lhs, const String &rhs)

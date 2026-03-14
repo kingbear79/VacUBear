@@ -129,8 +129,8 @@ Beispiel:
   "light_enabled": true,
   "light": {"r": 255, "g": 180, "b": 60, "w": 20},
   "ota": {
-    "current_version": "0.0.8-dev",
-    "latest_version": "0.0.8-dev",
+    "current_version": "0.1.0-passionate_gimp",
+    "latest_version": "0.1.0-passionate_gimp",
     "update_available": false
   }
 }
