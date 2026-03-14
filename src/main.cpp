@@ -3953,19 +3953,42 @@ String buildHtmlPage(const String &message)
   html += "<div class='small'>Bei gueltigem WLAN im lokalen Netz erreichbar. Bei Fehler startet AP + Captive Portal.</div>";
   html += R"rawliteral(
 <script>
-async function apiJson(path, method) {
-  const res = await fetch(path, {method: method || 'GET'});
-  const text = await res.text();
-  let json = {};
-  try { json = text ? JSON.parse(text) : {}; } catch (_) {}
-  if (!res.ok) {
-    throw new Error(json.error || ('HTTP ' + res.status));
+function parseJsonText(text) {
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch (e) {
+    return {};
   }
-  return json;
+}
+
+function requestJson(path, method, body, contentType, onSuccess, onError) {
+  var xhr = new XMLHttpRequest();
+  xhr.open(method || 'GET', path, true);
+  if (contentType) {
+    xhr.setRequestHeader('Content-Type', contentType);
+  }
+  xhr.onreadystatechange = function() {
+    var json;
+    if (xhr.readyState !== 4) return;
+    json = parseJsonText(xhr.responseText);
+    if (xhr.status >= 200 && xhr.status < 300) {
+      if (onSuccess) onSuccess(json, xhr);
+      return;
+    }
+    if (onError) onError(new Error(json.error || ('HTTP ' + xhr.status)), json, xhr);
+  };
+  xhr.onerror = function() {
+    if (onError) onError(new Error('Verbindung fehlgeschlagen'), {}, xhr);
+  };
+  xhr.send(body || null);
+}
+
+function apiJson(path, method, onSuccess, onError) {
+  requestJson(path, method || 'GET', null, null, onSuccess, onError);
 }
 
 function formatBytes(value) {
-  const bytes = Number(value || 0);
+  var bytes = Number(value || 0);
   if (!bytes) return '0 B';
   if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
   if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
@@ -3973,137 +3996,146 @@ function formatBytes(value) {
 }
 
 function clampByte(value) {
-  const numeric = Number(value || 0);
+  var numeric = Number(value || 0);
   return Math.max(0, Math.min(255, Math.round(numeric)));
 }
 
+function byteToHex(value) {
+  var hex = clampByte(value).toString(16).toUpperCase();
+  return hex.length < 2 ? ('0' + hex) : hex;
+}
+
 function hexToRgb(hex) {
-  const normalized = String(hex || '').replace('#', '');
+  var normalized = String(hex || '').replace('#', '');
   if (normalized.length !== 6) {
     return {r: 255, g: 255, b: 255};
   }
   return {
-    r: parseInt(normalized.slice(0, 2), 16),
-    g: parseInt(normalized.slice(2, 4), 16),
-    b: parseInt(normalized.slice(4, 6), 16)
+    r: parseInt(normalized.substr(0, 2), 16),
+    g: parseInt(normalized.substr(2, 2), 16),
+    b: parseInt(normalized.substr(4, 2), 16)
   };
 }
 
 function rgbToCss(r, g, b, w) {
-  const white = clampByte(w);
-  const red = clampByte(r + white);
-  const green = clampByte(g + white);
-  const blue = clampByte(b + white);
+  var white = clampByte(w);
+  var red = clampByte(r + white);
+  var green = clampByte(g + white);
+  var blue = clampByte(b + white);
   return 'rgb(' + red + ', ' + green + ', ' + blue + ')';
 }
 
 function syncLightPickerFromHidden() {
-  const colorInput = document.getElementById('light_color');
-  const hiddenR = document.getElementById('light_r');
-  const hiddenG = document.getElementById('light_g');
-  const hiddenB = document.getElementById('light_b');
+  var colorInput = document.getElementById('light_color');
+  var hiddenR = document.getElementById('light_r');
+  var hiddenG = document.getElementById('light_g');
+  var hiddenB = document.getElementById('light_b');
+  var hex;
   if (!colorInput || !hiddenR || !hiddenG || !hiddenB) return;
-  const hex = '#' +
-    clampByte(hiddenR.value).toString(16).padStart(2, '0') +
-    clampByte(hiddenG.value).toString(16).padStart(2, '0') +
-    clampByte(hiddenB.value).toString(16).padStart(2, '0');
+  hex = '#' + byteToHex(hiddenR.value) + byteToHex(hiddenG.value) + byteToHex(hiddenB.value);
   colorInput.value = hex;
 }
 
 function syncHiddenFromLightPicker() {
-  const colorInput = document.getElementById('light_color');
-  const hiddenR = document.getElementById('light_r');
-  const hiddenG = document.getElementById('light_g');
-  const hiddenB = document.getElementById('light_b');
+  var colorInput = document.getElementById('light_color');
+  var hiddenR = document.getElementById('light_r');
+  var hiddenG = document.getElementById('light_g');
+  var hiddenB = document.getElementById('light_b');
+  var rgb;
   if (!colorInput || !hiddenR || !hiddenG || !hiddenB) return;
-  const rgb = hexToRgb(colorInput.value);
+  rgb = hexToRgb(colorInput.value);
   hiddenR.value = rgb.r;
   hiddenG.value = rgb.g;
   hiddenB.value = rgb.b;
 }
 
 function syncWhiteControls(sourceId) {
-  const slider = document.getElementById('light_w_slider');
-  const input = document.getElementById('light_w');
-  if (!slider || !input) return;
-  const source = sourceId === 'slider' ? slider : input;
-  const value = clampByte(source.value);
+  var slider = document.getElementById('light_w_slider');
+  var input = document.getElementById('light_w');
+  var source = sourceId === 'slider' ? slider : input;
+  var value;
+  if (!slider || !input || !source) return;
+  value = clampByte(source.value);
   slider.value = value;
   input.value = value;
 }
 
 function updateLightPreviewCard() {
-  const preview = document.getElementById('light-preview');
-  const text = document.getElementById('light-preview-text');
-  const enabled = document.getElementById('light_enabled');
-  const hiddenR = document.getElementById('light_r');
-  const hiddenG = document.getElementById('light_g');
-  const hiddenB = document.getElementById('light_b');
-  const white = document.getElementById('light_w');
+  var preview = document.getElementById('light-preview');
+  var text = document.getElementById('light-preview-text');
+  var enabled = document.getElementById('light_enabled');
+  var hiddenR = document.getElementById('light_r');
+  var hiddenG = document.getElementById('light_g');
+  var hiddenB = document.getElementById('light_b');
+  var white = document.getElementById('light_w');
+  var r;
+  var g;
+  var b;
+  var w;
   if (!preview || !text || !hiddenR || !hiddenG || !hiddenB || !white) return;
-  const r = clampByte(hiddenR.value);
-  const g = clampByte(hiddenG.value);
-  const b = clampByte(hiddenB.value);
-  const w = clampByte(white.value);
+  r = clampByte(hiddenR.value);
+  g = clampByte(hiddenG.value);
+  b = clampByte(hiddenB.value);
+  w = clampByte(white.value);
   preview.style.background = rgbToCss(r, g, b, w);
-  text.textContent = 'RGBW: ' + r + ', ' + g + ', ' + b + ', ' + w +
+  text.innerHTML = 'RGBW: ' + r + ', ' + g + ', ' + b + ', ' + w +
     ' | Show-Beleuchtung: ' + (enabled && enabled.checked ? 'AN' : 'AUS');
 }
 
-function getLightPayload(preview) {
+function buildLightPayloadString(preview) {
+  var enabled = document.getElementById('light_enabled');
+  var hiddenR = document.getElementById('light_r');
+  var hiddenG = document.getElementById('light_g');
+  var hiddenB = document.getElementById('light_b');
+  var white = document.getElementById('light_w');
   syncHiddenFromLightPicker();
   syncWhiteControls('input');
   updateLightPreviewCard();
-  return new URLSearchParams({
-    enabled: document.getElementById('light_enabled') && document.getElementById('light_enabled').checked ? '1' : '0',
-    r: document.getElementById('light_r') ? document.getElementById('light_r').value : '0',
-    g: document.getElementById('light_g') ? document.getElementById('light_g').value : '0',
-    b: document.getElementById('light_b') ? document.getElementById('light_b').value : '0',
-    w: document.getElementById('light_w') ? document.getElementById('light_w').value : '0',
-    preview: preview ? '1' : '0'
-  });
+  return 'enabled=' + encodeURIComponent(enabled && enabled.checked ? '1' : '0') +
+    '&r=' + encodeURIComponent(hiddenR ? hiddenR.value : '0') +
+    '&g=' + encodeURIComponent(hiddenG ? hiddenG.value : '0') +
+    '&b=' + encodeURIComponent(hiddenB ? hiddenB.value : '0') +
+    '&w=' + encodeURIComponent(white ? white.value : '0') +
+    '&preview=' + encodeURIComponent(preview ? '1' : '0');
 }
 
-async function saveLightConfig(preview) {
+function saveLightConfig(preview) {
   if (!document.getElementById('light_color')) return;
-  try {
-    const response = await fetch('/api/light', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8'},
-      body: getLightPayload(preview).toString()
-    });
-    const text = await response.text();
-    let json = {};
-    try { json = text ? JSON.parse(text) : {}; } catch (_) {}
-    if (!response.ok) {
-      throw new Error(json.error || ('HTTP ' + response.status));
+  requestJson(
+    '/api/light',
+    'POST',
+    buildLightPayloadString(preview),
+    'application/x-www-form-urlencoded;charset=UTF-8',
+    function() {
+      updateLightPreviewCard();
+    },
+    function(error) {
+      alert('Beleuchtung konnte nicht gespeichert werden: ' + error.message);
     }
-    updateLightPreviewCard();
-  } catch (e) {
-    alert('Beleuchtung konnte nicht gespeichert werden: ' + e.message);
-  }
+  );
 }
 
 function previewLightConfig() {
-  return saveLightConfig(true);
+  saveLightConfig(true);
 }
 
 function setOtaProgress(percent, text) {
-  const bar = document.getElementById('ota-progress-bar');
-  const label = document.getElementById('ota-progress-text');
+  var bar = document.getElementById('ota-progress-bar');
+  var label = document.getElementById('ota-progress-text');
+  var safePercent = Math.max(0, Math.min(100, Number(percent || 0)));
   if (bar) {
-    const safePercent = Math.max(0, Math.min(100, Number(percent || 0)));
     bar.style.width = safePercent + '%';
   }
   if (label) {
-    label.textContent = text || '';
+    label.innerHTML = text || '';
   }
 }
 
 function renderOta(status) {
-  const el = document.getElementById('ota-box');
+  var el = document.getElementById('ota-box');
+  var text = '';
+  var progressText = status.status_text || status.phase || 'Bereit';
   if (!el) return;
-  let text = '';
   text += 'Konfiguriert: ' + (status.configured ? 'ja' : 'nein') + '<br>';
   text += 'Manifest URL: ' + (status.manifest_url || '-') + '<br>';
   text += 'WLAN verbunden: ' + (status.wifi_connected ? 'ja' : 'nein') + '<br>';
@@ -4119,8 +4151,6 @@ function renderOta(status) {
     text += 'Hinweis: ' + status.release_notes + '<br>';
   }
   el.innerHTML = text;
-
-  let progressText = status.status_text || status.phase || 'Bereit';
   if (status.progress_total > 0) {
     progressText += ' (' + (status.progress_percent || 0) + '% / ' +
       formatBytes(status.progress_bytes) + ' von ' + formatBytes(status.progress_total) + ')';
@@ -4133,102 +4163,113 @@ function renderOta(status) {
   setOtaProgress(status.progress_percent || 0, progressText);
 }
 
-async function refreshOta() {
-  try {
-    const status = await apiJson('/ota/status');
-    renderOta(status);
-  } catch (e) {
-    const el = document.getElementById('ota-box');
-    if (el) el.textContent = 'OTA-Status konnte nicht geladen werden: ' + e.message;
-  }
+function refreshOta() {
+  apiJson(
+    '/ota/status',
+    'GET',
+    function(status) {
+      renderOta(status);
+    },
+    function(error) {
+      var el = document.getElementById('ota-box');
+      if (el) el.innerHTML = 'OTA-Status konnte nicht geladen werden: ' + error.message;
+    }
+  );
 }
 
-async function otaCheck() {
-  try {
-    await apiJson('/ota/check', 'POST');
-    setTimeout(refreshOta, 300);
-    setTimeout(refreshOta, 1500);
-  } catch (e) {
-    alert('OTA-Check fehlgeschlagen: ' + e.message);
-  }
+function otaCheck() {
+  apiJson(
+    '/ota/check',
+    'POST',
+    function() {
+      setTimeout(refreshOta, 300);
+      setTimeout(refreshOta, 1500);
+    },
+    function(error) {
+      alert('OTA-Check fehlgeschlagen: ' + error.message);
+    }
+  );
 }
 
-async function otaUpdate() {
+function otaUpdate() {
   if (!confirm('Firmware-Update jetzt starten?')) return;
-  try {
-    await apiJson('/ota/update', 'POST');
-    setTimeout(refreshOta, 200);
-  } catch (e) {
-    alert('OTA-Update fehlgeschlagen: ' + e.message);
-  }
+  apiJson(
+    '/ota/update',
+    'POST',
+    function() {
+      setTimeout(refreshOta, 200);
+    },
+    function(error) {
+      alert('OTA-Update fehlgeschlagen: ' + error.message);
+    }
+  );
 }
 
-async function otaUploadFile() {
-  const input = document.getElementById('ota-file');
+function otaUploadFile() {
+  var input = document.getElementById('ota-file');
+  var file;
+  var form;
+  var xhr;
   if (!input || !input.files || !input.files.length) {
     alert('Bitte zuerst eine Firmware-Datei auswaehlen.');
     return;
   }
-
-  const file = input.files[0];
+  file = input.files[0];
   if (!confirm('Firmware-Datei jetzt hochladen und installieren?')) return;
-
-  const form = new FormData();
+  form = new FormData();
   form.append('firmware', file, file.name);
-
   setOtaProgress(0, 'Upload wird gestartet...');
-
-  try {
-    await new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', '/ota/upload');
-      xhr.upload.onprogress = (event) => {
-        if (!event.lengthComputable) return;
-        const percent = Math.round((event.loaded / event.total) * 100);
-        setOtaProgress(percent, 'Upload laeuft (' + percent + '% / ' +
-          formatBytes(event.loaded) + ' von ' + formatBytes(event.total) + ')');
-      };
-      xhr.onload = () => {
-        let json = {};
-        try { json = xhr.responseText ? JSON.parse(xhr.responseText) : {}; } catch (_) {}
-        if (xhr.status >= 200 && xhr.status < 300) {
-          resolve(json);
-          return;
-        }
-        reject(new Error(json.error || ('HTTP ' + xhr.status)));
-      };
-      xhr.onerror = () => reject(new Error('Upload-Verbindung fehlgeschlagen'));
-      xhr.send(form);
-    });
-    input.value = '';
-    setTimeout(refreshOta, 200);
-  } catch (e) {
-    alert('Firmware-Upload fehlgeschlagen: ' + e.message);
-    setTimeout(refreshOta, 200);
+  xhr = new XMLHttpRequest();
+  xhr.open('POST', '/ota/upload', true);
+  if (xhr.upload) {
+    xhr.upload.onprogress = function(event) {
+      var percent;
+      if (!event.lengthComputable) return;
+      percent = Math.round((event.loaded / event.total) * 100);
+      setOtaProgress(percent, 'Upload laeuft (' + percent + '% / ' +
+        formatBytes(event.loaded) + ' von ' + formatBytes(event.total) + ')');
+    };
   }
+  xhr.onreadystatechange = function() {
+    var json;
+    if (xhr.readyState !== 4) return;
+    json = parseJsonText(xhr.responseText);
+    if (xhr.status >= 200 && xhr.status < 300) {
+      input.value = '';
+      setTimeout(refreshOta, 200);
+      return;
+    }
+    alert('Firmware-Upload fehlgeschlagen: ' + (json.error || ('HTTP ' + xhr.status)));
+    setTimeout(refreshOta, 200);
+  };
+  xhr.onerror = function() {
+    alert('Firmware-Upload fehlgeschlagen: Upload-Verbindung fehlgeschlagen');
+    setTimeout(refreshOta, 200);
+  };
+  xhr.send(form);
 }
 
 function initLightControls() {
-  const colorInput = document.getElementById('light_color');
-  const enabled = document.getElementById('light_enabled');
-  const whiteSlider = document.getElementById('light_w_slider');
-  const whiteInput = document.getElementById('light_w');
+  var colorInput = document.getElementById('light_color');
+  var enabled = document.getElementById('light_enabled');
+  var whiteSlider = document.getElementById('light_w_slider');
+  var whiteInput = document.getElementById('light_w');
   if (!colorInput || !enabled || !whiteSlider || !whiteInput) return;
   syncLightPickerFromHidden();
   syncWhiteControls('input');
   updateLightPreviewCard();
-  colorInput.addEventListener('change', () => saveLightConfig(true));
-  enabled.addEventListener('change', () => saveLightConfig(false));
-  whiteSlider.addEventListener('input', () => {
+  colorInput.onchange = function() { saveLightConfig(true); };
+  enabled.onchange = function() { saveLightConfig(false); };
+  whiteSlider.oninput = function() {
     syncWhiteControls('slider');
     updateLightPreviewCard();
-  });
-  whiteSlider.addEventListener('change', () => saveLightConfig(true));
-  whiteInput.addEventListener('input', () => {
+  };
+  whiteSlider.onchange = function() { saveLightConfig(true); };
+  whiteInput.oninput = function() {
     syncWhiteControls('input');
     updateLightPreviewCard();
-  });
-  whiteInput.addEventListener('change', () => saveLightConfig(true));
+  };
+  whiteInput.onchange = function() { saveLightConfig(true); };
 }
 
 refreshOta();
