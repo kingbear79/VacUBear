@@ -357,6 +357,7 @@ bool bootIndicatorActive = false;
 bool apModeIndicatorActive = false;
 unsigned long buttonPressedAt = 0;
 bool buttonApModeTriggered = false;
+bool buttonLightToggleArmed = false;
 #if LED_COUNT > 0
 NeoPixelBus<NeoGrbwFeature, NeoEsp8266BitBang800KbpsMethod> lightBus(LED_COUNT, PIN_LED);
 #endif
@@ -808,13 +809,22 @@ void loop()
 void handleButtonInput()
 {
   button.read();
-  unsigned long now = millis();
 
   if (button.wasPressed())
   {
     buttonPressedAt = button.lastChange();
     buttonApModeTriggered = false;
+    buttonLightToggleArmed = false;
     LOGI("Button pressed");
+  }
+
+  if (button.isPressed() &&
+      !buttonApModeTriggered &&
+      !buttonLightToggleArmed &&
+      button.pressedFor(BUTTON_LIGHT_TOGGLE_MS))
+  {
+    buttonLightToggleArmed = true;
+    LOGI("Button long press armed for light toggle");
   }
 
   if (button.isPressed() &&
@@ -831,7 +841,7 @@ void handleButtonInput()
     return;
   }
 
-  unsigned long pressedMs = (buttonPressedAt > 0) ? (now - buttonPressedAt) : 0;
+  unsigned long pressedMs = (buttonPressedAt > 0) ? (button.lastChange() - buttonPressedAt) : 0;
   LOGI("Button released after %lu ms", pressedMs);
 
   if (buttonApModeTriggered)
@@ -839,8 +849,9 @@ void handleButtonInput()
     return;
   }
 
-  if (pressedMs >= BUTTON_LIGHT_TOGGLE_MS)
+  if (buttonLightToggleArmed)
   {
+    buttonLightToggleArmed = false;
     if (HAS_LED_OUTPUT && showStatus.isRunning)
     {
       config.lightEnabled = !config.lightEnabled;
