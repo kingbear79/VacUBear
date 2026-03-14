@@ -92,6 +92,7 @@ static const uint32_t PUMP_PWM_UPDATE_MS = 20UL;
 static const uint32_t LED_FADE_IN_MS = 1200UL;
 static const uint32_t LED_FADE_OUT_MS = 1200UL;
 static const uint32_t LED_AFTER_BELUEFTEN_MS = 5000UL;
+static const uint32_t LIGHT_PREVIEW_MS = 5000UL;
 static const uint16_t LIGHT_LEVEL_MAX = 1023;
 static const uint32_t LIGHT_UPDATE_MS = 20UL;
 static const uint32_t BOOT_PULSE_PERIOD_MS = 1600UL;
@@ -120,6 +121,7 @@ struct AppConfig
   String otaManifestUrl;
   uint32_t showLengthMs;
   uint32_t showNachlaufMs;
+  bool lightEnabled;
   uint8_t lightR;
   uint8_t lightG;
   uint8_t lightB;
@@ -136,6 +138,7 @@ struct AppConfig
         otaManifestUrl(OTA_MANIFEST_URL),
         showLengthMs(SHOW_LENGTH),
         showNachlaufMs(SHOW_NACHLAUF),
+        lightEnabled(true),
         lightR(255),
         lightG(255),
         lightB(255),
@@ -190,6 +193,7 @@ struct LightSoftControl
   uint16_t currentLevel;
   uint16_t targetLevel;
   unsigned long onUntilAt;
+  unsigned long previewUntilAt;
   unsigned long lastUpdateAt;
   uint8_t lastR;
   uint8_t lastG;
@@ -201,6 +205,7 @@ struct LightSoftControl
       : currentLevel(0),
         targetLevel(0),
         onUntilAt(0),
+        previewUntilAt(0),
         lastUpdateAt(0),
         lastR(0),
         lastG(0),
@@ -336,6 +341,8 @@ void updateLightControl(void);
 void setLightTargetLevel(uint16_t level);
 void applyLightOutput(bool force = false);
 void applyBootIndicator(void);
+void requestLightPreview(uint32_t durationMs = LIGHT_PREVIEW_MS);
+bool isLightPreviewActive(unsigned long now);
 void otaLoop(void);
 bool otaCheckForUpdate(const char *reason);
 bool otaApplyUpdate(void);
@@ -375,6 +382,14 @@ void startAccessPoint(void);
 void setupCaptivePortal(void);
 void handleRoot(void);
 void handleSave(void);
+void handleAppJs(void);
+void handleApiConfigGet(void);
+void handleApiConfigPost(void);
+void handleApiWifiScan(void);
+void handleApiShowGet(void);
+void handleApiShowPost(void);
+void handleApiLightGet(void);
+void handleLightConfig(void);
 void handleNotFound(void);
 void handleStatus(void);
 void handleOtaStatus(void);
@@ -385,16 +400,264 @@ void handleOtaUploadData(void);
 bool handleCaptivePortalRedirect(void);
 String htmlEscape(const String &input);
 String buildHtmlPage(const String &message = "");
+void sendHtmlPage(const String &message = "", int statusCode = 200);
 bool isIpAddress(const String &host);
 bool isLegacyOtaManifestUrl(const String &url);
 String defaultApSsid(void);
 String defaultDeviceId(void);
+String rgbToHex(uint8_t r, uint8_t g, uint8_t b);
+void sanitizeConfig(void);
+void applyConfigToRuntime(bool wifiChanged, bool mqttChanged, bool publishStates = true);
+void buildLightStatusJson(JsonDocument &doc);
+void buildStatusJson(JsonDocument &doc);
+void buildOtaStatusJson(JsonDocument &doc);
+void buildConfigJson(JsonObject root);
+bool parseJsonBody(JsonDocument &doc, String &errorText);
+void sendJsonDocument(int statusCode, JsonDocument &doc);
+void sendJsonError(int statusCode, const String &errorText);
 uint32_t clampU32(uint32_t value, uint32_t minValue, uint32_t maxValue);
 uint32_t clampMinU32(uint32_t value, uint32_t minValue);
 uint32_t secToMs(uint32_t seconds);
 uint32_t msToSec(uint32_t milliseconds);
 uint8_t clampU8(int value);
 void scheduleConfigSave(void);
+
+void sanitizeConfig()
+{
+  config.wifiSsid.trim();
+  config.wifiPassword.trim();
+  config.mqttHost.trim();
+  config.mqttUser.trim();
+  config.mqttPassword.trim();
+  config.mqttTopic.trim();
+  config.otaManifestUrl.trim();
+  if (config.otaManifestUrl.length() == 0 || isLegacyOtaManifestUrl(config.otaManifestUrl))
+  {
+    config.otaManifestUrl = String(OTA_MANIFEST_URL);
+  }
+
+  if (config.mqttPort == 0)
+  {
+    config.mqttPort = 1883;
+  }
+  if (config.mqttTopic.length() == 0 || config.mqttTopic == "vacubear" || config.mqttTopic.startsWith("vacubear/"))
+  {
+    config.mqttTopic = deviceId;
+  }
+
+  config.showLengthMs = clampU32(config.showLengthMs, SHOW_LENGTH_MIN_MS, SHOW_LENGTH_MAX_MS);
+  config.showNachlaufMs = clampMinU32(config.showNachlaufMs, SHOW_NACHLAUF_MIN_MS);
+}
+
+void applyConfigToRuntime(bool wifiChanged, bool mqttChanged, bool publishStates)
+{
+  showStatus.showDuration = config.showLengthMs;
+  showStatus.showNachlauf = config.showNachlaufMs;
+
+  if (wifiChanged)
+  {
+    if (config.wifiSsid.length() == 0)
+    {
+      startAccessPoint();
+      if (!captivePortalEnabled)
+      {
+        setupCaptivePortal();
+      }
+    }
+    else
+    {
+      WiFi.mode(captivePortalEnabled ? WIFI_AP_STA : WIFI_STA);
+      WiFi.begin(config.wifiSsid.c_str(), config.wifiPassword.c_str());
+      wifiStartupPending = true;
+      wifiStartupAt = millis();
+      lastWifiRetryAt = wifiStartupAt;
+      bootIndicatorActive = HAS_LED_OUTPUT;
+    }
+  }
+
+  if (mqttChanged)
+  {
+    updateMqttTopics();
+    if (mqttClient.connected())
+    {
+      mqttClient.disconnect();
+    }
+    lastMqttReconnectAt = 0;
+  }
+
+  if (publishStates)
+  {
+    publishConfigState(true);
+    if (HAS_LED_OUTPUT)
+    {
+      publishLightState(true);
+    }
+    publishTelemetry(true);
+  }
+}
+
+void buildLightStatusJson(JsonDocument &doc)
+{
+  unsigned long now = millis();
+  doc["enabled"] = config.lightEnabled;
+  doc["preview_remaining_ms"] = isLightPreviewActive(now) ? (uint32_t)(lightControl.previewUntilAt - now) : 0;
+  doc["show_running"] = showStatus.isRunning;
+  JsonObject color = doc["color"].to<JsonObject>();
+  color["r"] = config.lightR;
+  color["g"] = config.lightG;
+  color["b"] = config.lightB;
+  color["w"] = config.lightW;
+}
+
+void buildStatusJson(JsonDocument &status)
+{
+  status["wifi_connected"] = WiFi.status() == WL_CONNECTED;
+  status["sta_ip"] = WiFi.localIP().toString();
+  status["ap_enabled"] = captivePortalEnabled;
+  status["ap_ip"] = WiFi.softAPIP().toString();
+  status["show_running"] = showStatus.isRunning;
+  status["show_length"] = config.showLengthMs;
+  status["show_nachlauf"] = config.showNachlaufMs;
+  status["pump_pwm"] = pumpControl.currentPwm;
+  status["pump_target_pwm"] = pumpControl.targetPwm;
+  if (HAS_LED_OUTPUT)
+  {
+    unsigned long now = millis();
+    status["light_enabled"] = config.lightEnabled;
+    status["led_count"] = LED_COUNT;
+    status["light_level"] = lightControl.currentLevel;
+    status["light_target_level"] = lightControl.targetLevel;
+    status["light_on_until_at"] = lightControl.onUntilAt;
+    status["light_preview_remaining_ms"] = isLightPreviewActive(now) ? (uint32_t)(lightControl.previewUntilAt - now) : 0;
+
+    JsonObject color = status["light"].to<JsonObject>();
+    color["r"] = config.lightR;
+    color["g"] = config.lightG;
+    color["b"] = config.lightB;
+    color["w"] = config.lightW;
+  }
+
+  JsonObject ota = status["ota"].to<JsonObject>();
+  ota["current_version"] = otaStatus.currentVersion;
+  ota["latest_version"] = otaStatus.latestVersion;
+  ota["update_available"] = otaStatus.updateAvailable;
+  ota["check_in_progress"] = otaStatus.checkInProgress;
+  ota["update_in_progress"] = otaStatus.updateInProgress;
+  ota["phase"] = otaStatus.phase;
+  ota["source"] = otaStatus.source;
+  ota["status_text"] = otaStatus.statusText;
+  ota["reboot_pending"] = otaStatus.rebootPending;
+  ota["progress_bytes"] = otaStatus.progressBytes;
+  ota["progress_total"] = otaStatus.progressTotal;
+  ota["progress_percent"] = otaStatus.progressPercent;
+  ota["last_error"] = otaStatus.lastError;
+  ota["last_check_ms"] = otaStatus.lastCheckAt;
+  ota["reboot_at_ms"] = otaStatus.rebootAt;
+}
+
+void buildOtaStatusJson(JsonDocument &status)
+{
+  status["configured"] = config.otaManifestUrl.length() > 0;
+  status["manifest_url"] = config.otaManifestUrl;
+  status["wifi_connected"] = WiFi.status() == WL_CONNECTED;
+  status["current_version"] = otaStatus.currentVersion;
+  status["latest_version"] = otaStatus.latestVersion;
+  status["firmware_url"] = otaStatus.firmwareUrl;
+  status["release_notes"] = otaStatus.releaseNotes;
+  status["update_available"] = otaStatus.updateAvailable;
+  status["check_in_progress"] = otaStatus.checkInProgress;
+  status["update_in_progress"] = otaStatus.updateInProgress;
+  status["phase"] = otaStatus.phase;
+  status["source"] = otaStatus.source;
+  status["status_text"] = otaStatus.statusText;
+  status["reboot_pending"] = otaStatus.rebootPending;
+  status["progress_bytes"] = otaStatus.progressBytes;
+  status["progress_total"] = otaStatus.progressTotal;
+  status["progress_percent"] = otaStatus.progressPercent;
+  status["last_error"] = otaStatus.lastError;
+  status["last_check_ms"] = otaStatus.lastCheckAt;
+  status["reboot_at_ms"] = otaStatus.rebootAt;
+  status["interval_ms"] = OTA_CHECK_INTERVAL_MS;
+}
+
+void buildConfigJson(JsonObject root)
+{
+  root["device_id"] = deviceId;
+  JsonObject wifi = root["wifi"].to<JsonObject>();
+  wifi["ssid"] = config.wifiSsid;
+  wifi["password_set"] = config.wifiPassword.length() > 0;
+
+  JsonObject mqtt = root["mqtt"].to<JsonObject>();
+  mqtt["host"] = config.mqttHost;
+  mqtt["port"] = config.mqttPort;
+  mqtt["user"] = config.mqttUser;
+  mqtt["password_set"] = config.mqttPassword.length() > 0;
+  mqtt["topic"] = config.mqttTopic;
+
+  JsonObject ota = root["ota"].to<JsonObject>();
+  ota["manifest_url"] = config.otaManifestUrl;
+
+  JsonObject show = root["show"].to<JsonObject>();
+  show["length_ms"] = config.showLengthMs;
+  show["nachlauf_ms"] = config.showNachlaufMs;
+  show["length_s"] = msToSec(config.showLengthMs);
+  show["nachlauf_s"] = msToSec(config.showNachlaufMs);
+
+  JsonObject light = root["light"].to<JsonObject>();
+  light["enabled"] = config.lightEnabled;
+  light["r"] = config.lightR;
+  light["g"] = config.lightG;
+  light["b"] = config.lightB;
+  light["w"] = config.lightW;
+}
+
+bool parseJsonBody(JsonDocument &doc, String &errorText)
+{
+  String raw = server.arg("plain");
+  if (raw.length() == 0)
+  {
+    errorText = "Leerer JSON-Body";
+    return false;
+  }
+
+  DeserializationError err = deserializeJson(doc, raw);
+  if (err)
+  {
+    errorText = String("JSON ungueltig: ") + err.c_str();
+    return false;
+  }
+  return true;
+}
+
+bool requestBodyLooksLikeJson()
+{
+  String raw = server.arg("plain");
+  for (size_t i = 0; i < raw.length(); i++)
+  {
+    char c = raw[i];
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+    {
+      continue;
+    }
+    return c == '{' || c == '[';
+  }
+  return false;
+}
+
+void sendJsonDocument(int statusCode, JsonDocument &doc)
+{
+  String out;
+  serializeJson(doc, out);
+  server.send(statusCode, "application/json", out);
+}
+
+void sendJsonError(int statusCode, const String &errorText)
+{
+  JsonDocument doc;
+  doc["ok"] = false;
+  doc["error"] = errorText;
+  sendJsonDocument(statusCode, doc);
+}
 
 void setup()
 {
@@ -670,6 +933,7 @@ void setupLightControl()
   lightControl.currentLevel = 0;
   lightControl.targetLevel = 0;
   lightControl.onUntilAt = 0;
+  lightControl.previewUntilAt = 0;
   lightControl.lastUpdateAt = 0;
   lightControl.outputInitialized = false;
 
@@ -682,6 +946,30 @@ void setupLightControl()
 #else
   LOGI("Light output disabled: LED_COUNT=0");
 #endif
+}
+
+void requestLightPreview(uint32_t durationMs)
+{
+  if (!HAS_LED_OUTPUT || durationMs == 0)
+  {
+    return;
+  }
+  lightControl.previewUntilAt = millis() + durationMs;
+  LOGD("Light preview requested: until=%lu", lightControl.previewUntilAt);
+}
+
+bool isLightPreviewActive(unsigned long now)
+{
+  if (lightControl.previewUntilAt == 0)
+  {
+    return false;
+  }
+  if ((int32_t)(lightControl.previewUntilAt - now) > 0)
+  {
+    return true;
+  }
+  lightControl.previewUntilAt = 0;
+  return false;
 }
 
 void setLightTargetLevel(uint16_t level)
@@ -806,13 +1094,14 @@ void updateLightControl()
   }
 
   unsigned long now = millis();
-  bool lightWindowActive = showStatus.isRunning;
-  if (!lightWindowActive && lightControl.onUntilAt > 0)
+  bool lightWindowActive = config.lightEnabled && showStatus.isRunning;
+  if (!lightWindowActive && config.lightEnabled && lightControl.onUntilAt > 0)
   {
     lightWindowActive = (int32_t)(lightControl.onUntilAt - now) > 0;
   }
+  bool previewActive = isLightPreviewActive(now);
 
-  setLightTargetLevel(lightWindowActive ? LIGHT_LEVEL_MAX : 0);
+  setLightTargetLevel((lightWindowActive || previewActive) ? LIGHT_LEVEL_MAX : 0);
 
   if (now - lightControl.lastUpdateAt < LIGHT_UPDATE_MS)
   {
@@ -871,6 +1160,7 @@ void setSafeOutputState()
   pumpControl.currentPwm = 0;
   applyPumpPwm(0);
   lightControl.onUntilAt = 0;
+  lightControl.previewUntilAt = 0;
   lightControl.currentLevel = 0;
   lightControl.targetLevel = 0;
   applyLightOutput(true);
@@ -1680,11 +1970,26 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
   if (HAS_LED_OUTPUT && topicStr == topicLightSet)
   {
     bool changed = false;
+    bool colorChanged = false;
 
     if (payloadStr == "ON" || payloadStr == "OFF")
     {
+      bool newEnabled = payloadStr == "ON";
+      if (config.lightEnabled != newEnabled)
+      {
+        config.lightEnabled = newEnabled;
+        changed = true;
+      }
       publishLightState(true);
       publishTelemetry(true);
+      if (changed)
+      {
+        if (!config.lightEnabled && !showStatus.isRunning)
+        {
+          lightControl.previewUntilAt = 0;
+        }
+        scheduleConfigSave();
+      }
       return;
     }
 
@@ -1692,6 +1997,21 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
     DeserializationError err = deserializeJson(doc, payloadStr);
     if (!err)
     {
+      if (!doc["state"].isNull())
+      {
+        String state = doc["state"].as<String>();
+        state.trim();
+        state.toUpperCase();
+        if (state == "ON" || state == "OFF")
+        {
+          bool newEnabled = state == "ON";
+          if (config.lightEnabled != newEnabled)
+          {
+            config.lightEnabled = newEnabled;
+            changed = true;
+          }
+        }
+      }
       if (doc["color"].is<JsonObject>())
       {
         JsonObject color = doc["color"].as<JsonObject>();
@@ -1699,21 +2019,25 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
         {
           config.lightR = clampU8(color["r"].as<int>());
           changed = true;
+          colorChanged = true;
         }
         if (!color["g"].isNull())
         {
           config.lightG = clampU8(color["g"].as<int>());
           changed = true;
+          colorChanged = true;
         }
         if (!color["b"].isNull())
         {
           config.lightB = clampU8(color["b"].as<int>());
           changed = true;
+          colorChanged = true;
         }
         if (!color["w"].isNull())
         {
           config.lightW = clampU8(color["w"].as<int>());
           changed = true;
+          colorChanged = true;
         }
       }
 
@@ -1721,17 +2045,27 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
       {
         config.lightW = clampU8(doc["white_value"].as<int>());
         changed = true;
+        colorChanged = true;
       }
       if (!doc["white"].isNull())
       {
         config.lightW = clampU8(doc["white"].as<int>());
         changed = true;
+        colorChanged = true;
       }
     }
 
     if (changed)
     {
-      LOGI("Lichtfarbe updated via JSON command");
+      LOGI("Beleuchtung updated via JSON command");
+      if (colorChanged && !showStatus.isRunning)
+      {
+        requestLightPreview();
+      }
+      else if (!config.lightEnabled && !showStatus.isRunning)
+      {
+        lightControl.previewUntilAt = 0;
+      }
       scheduleConfigSave();
     }
     publishLightState(true);
@@ -1752,7 +2086,11 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
       config.lightG = clampU8(g);
       config.lightB = clampU8(b);
       config.lightW = clampU8(w);
-      LOGI("Lichtfarbe updated via RGBW topic: %u,%u,%u,%u", config.lightR, config.lightG, config.lightB, config.lightW);
+      LOGI("Beleuchtung updated via RGBW topic: %u,%u,%u,%u", config.lightR, config.lightG, config.lightB, config.lightW);
+      if (!showStatus.isRunning)
+      {
+        requestLightPreview();
+      }
       scheduleConfigSave();
       publishLightState(true);
       publishTelemetry(true);
@@ -1856,16 +2194,16 @@ void publishShowState(bool retained)
 
 void publishLightState(bool retained)
 {
-  // Licht-Entity ist Konfig-Interface:
-  // State bleibt ON, Farbe kommt aus persistenter Konfiguration.
+  // Light-Entity bildet die aktivierte Show-Beleuchtung ab.
+  // Farbe wird persistent konfiguriert, ON/OFF schaltet die Show-Beleuchtung frei.
   if (!HAS_LED_OUTPUT)
   {
     return;
   }
-  mqttClient.publish(topicLightState.c_str(), "ON", retained);
+  mqttClient.publish(topicLightState.c_str(), config.lightEnabled ? "ON" : "OFF", retained);
   String rgbw = String(config.lightR) + "," + String(config.lightG) + "," + String(config.lightB) + "," + String(config.lightW);
   mqttClient.publish(topicLightRgbwState.c_str(), rgbw.c_str(), retained);
-  LOGD("MQTT TX light_state=ON rgbw=%s", rgbw.c_str());
+  LOGD("MQTT TX light_state=%s rgbw=%s", config.lightEnabled ? "ON" : "OFF", rgbw.c_str());
 }
 
 void publishConfigState(bool retained)
@@ -1913,7 +2251,7 @@ void publishDiscovery()
   if (HAS_LED_OUTPUT)
   {
     JsonDocument lightCfg;
-    lightCfg["name"] = "Lichtfarbe";
+    lightCfg["name"] = "Beleuchtung";
     lightCfg["object_id"] = "light";
     lightCfg["unique_id"] = deviceId + "-light";
     lightCfg["command_topic"] = topicLightSet;
@@ -2006,6 +2344,8 @@ void publishSensorDiscovery()
     cfg["payload_on"] = "ON";
     cfg["payload_off"] = "OFF";
     cfg["availability_topic"] = topicAvailability;
+    cfg["enabled_by_default"] = false;
+    cfg["entity_category"] = "diagnostic";
     addDevice(cfg.as<JsonObject>());
     String payload;
     serializeJson(cfg, payload);
@@ -2021,10 +2361,28 @@ void publishSensorDiscovery()
     cfg["value_template"] = "{{ value_json.Show.Phase }}";
     cfg["icon"] = "mdi:state-machine";
     cfg["availability_topic"] = topicAvailability;
+    cfg["enabled_by_default"] = false;
+    cfg["entity_category"] = "diagnostic";
     addDevice(cfg.as<JsonObject>());
     String payload;
     serializeJson(cfg, payload);
     mqttClient.publish((String("homeassistant/sensor/") + deviceId + "/show_phase/config").c_str(), payload.c_str(), true);
+  }
+
+  {
+    JsonDocument cfg;
+    cfg["name"] = "IP-Adresse";
+    cfg["object_id"] = "ip_adresse";
+    cfg["unique_id"] = deviceId + "-ip-adresse";
+    cfg["state_topic"] = topicTeleState;
+    cfg["value_template"] = "{{ value_json.WiFi.IP }}";
+    cfg["icon"] = "mdi:ip-network";
+    cfg["availability_topic"] = topicAvailability;
+    cfg["entity_category"] = "diagnostic";
+    addDevice(cfg.as<JsonObject>());
+    String payload;
+    serializeJson(cfg, payload);
+    mqttClient.publish((String("homeassistant/sensor/") + deviceId + "/ip_adresse/config").c_str(), payload.c_str(), true);
   }
 
   {
@@ -2070,6 +2428,8 @@ void publishSensorDiscovery()
     cfg["unit_of_measurement"] = "raw";
     cfg["icon"] = "mdi:fan";
     cfg["availability_topic"] = topicAvailability;
+    cfg["enabled_by_default"] = false;
+    cfg["entity_category"] = "diagnostic";
     addDevice(cfg.as<JsonObject>());
     String payload;
     serializeJson(cfg, payload);
@@ -2086,6 +2446,7 @@ void publishSensorDiscovery()
     cfg["unit_of_measurement"] = "s";
     cfg["icon"] = "mdi:timer-sand";
     cfg["availability_topic"] = topicAvailability;
+    cfg["enabled_by_default"] = false;
     addDevice(cfg.as<JsonObject>());
     String payload;
     serializeJson(cfg, payload);
@@ -2102,6 +2463,7 @@ void publishSensorDiscovery()
     cfg["unit_of_measurement"] = "s";
     cfg["icon"] = "mdi:timer-outline";
     cfg["availability_topic"] = topicAvailability;
+    cfg["enabled_by_default"] = false;
     addDevice(cfg.as<JsonObject>());
     String payload;
     serializeJson(cfg, payload);
@@ -2154,6 +2516,8 @@ void publishSensorDiscovery()
     cfg["value_template"] = "{{ value_json.OTA.CurrentVersion }}";
     cfg["icon"] = "mdi:chip";
     cfg["availability_topic"] = topicAvailability;
+    cfg["enabled_by_default"] = false;
+    cfg["entity_category"] = "diagnostic";
     addDevice(cfg.as<JsonObject>());
     String payload;
     serializeJson(cfg, payload);
@@ -2169,6 +2533,8 @@ void publishSensorDiscovery()
     cfg["value_template"] = "{{ value_json.OTA.LatestVersion }}";
     cfg["icon"] = "mdi:update";
     cfg["availability_topic"] = topicAvailability;
+    cfg["enabled_by_default"] = false;
+    cfg["entity_category"] = "diagnostic";
     addDevice(cfg.as<JsonObject>());
     String payload;
     serializeJson(cfg, payload);
@@ -2262,18 +2628,24 @@ void publishTelemetry(bool force)
 
   if (HAS_LED_OUTPUT)
   {
+    uint32_t previewRemainingMs = isLightPreviewActive(now)
+                                      ? (uint32_t)(lightControl.previewUntilAt - now)
+                                      : 0;
     JsonObject licht = doc["Lichtfarbe"].to<JsonObject>();
+    licht["Enabled"] = config.lightEnabled;
     licht["R"] = config.lightR;
     licht["G"] = config.lightG;
     licht["B"] = config.lightB;
     licht["W"] = config.lightW;
+    licht["PreviewRemainingMs"] = previewRemainingMs;
 
     JsonObject led = doc["LED"].to<JsonObject>();
-    led["Enabled"] = true;
+    led["Enabled"] = config.lightEnabled;
     led["Count"] = LED_COUNT;
     led["Level"] = lightControl.currentLevel;
     led["TargetLevel"] = lightControl.targetLevel;
     led["OnUntilAt"] = lightControl.onUntilAt;
+    led["PreviewUntilAt"] = lightControl.previewUntilAt;
   }
 
   JsonObject ota = doc["OTA"].to<JsonObject>();
@@ -2390,11 +2762,24 @@ void setupWebServer()
   // Web-API:
   // - "/"          Konfigseite
   // - "/save"      Konfig speichern + reboot
-  // - "/status"    Laufzeitstatus JSON
-  // - "/ota/*"     OTA-Status, Check, Update
+  // - "/status"    Laufzeitstatus JSON (legacy)
+  // - "/api/*"     REST-Endpunkte
+  // - "/ota/*"     OTA-Status, Check, Update (legacy + UI)
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/app.js", HTTP_GET, handleAppJs);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/status", HTTP_GET, handleStatus);
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/wifi/scan", HTTP_GET, handleApiWifiScan);
+  server.on("/api/config", HTTP_GET, handleApiConfigGet);
+  server.on("/api/config", HTTP_POST, handleApiConfigPost);
+  server.on("/api/show", HTTP_GET, handleApiShowGet);
+  server.on("/api/show", HTTP_POST, handleApiShowPost);
+  server.on("/api/light", HTTP_GET, handleApiLightGet);
+  server.on("/api/light", HTTP_POST, handleLightConfig);
+  server.on("/api/ota/status", HTTP_GET, handleOtaStatus);
+  server.on("/api/ota/check", HTTP_POST, handleOtaCheck);
+  server.on("/api/ota/update", HTTP_POST, handleOtaUpdate);
   server.on("/ota/status", HTTP_GET, handleOtaStatus);
   server.on("/ota/check", HTTP_POST, handleOtaCheck);
   server.on("/ota/update", HTTP_POST, handleOtaUpdate);
@@ -2412,7 +2797,494 @@ void handleRoot()
   {
     return;
   }
-  server.send(200, "text/html", buildHtmlPage());
+  sendHtmlPage();
+}
+
+void handleAppJs()
+{
+  LOGD("HTTP GET /app.js");
+  static const char APP_JS[] PROGMEM = R"rawliteral(
+function parseJsonText(text) {
+  try {
+    return text ? JSON.parse(text) : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+var otaPollTimer = null;
+var otaPollFailureCount = 0;
+var otaLocalBusyState = '';
+
+function otaSetLocalBusyState(state) {
+  otaLocalBusyState = state || '';
+}
+
+function otaClearLocalBusyState() {
+  otaLocalBusyState = '';
+}
+
+function scheduleOtaRefresh(delayMs) {
+  if (otaPollTimer) {
+    clearTimeout(otaPollTimer);
+  }
+  otaPollTimer = setTimeout(refreshOta, Math.max(0, Number(delayMs || 0)));
+}
+
+function requestJson(path, method, body, contentType, onSuccess, onError, timeoutMs) {
+  var xhr = new XMLHttpRequest();
+  xhr.open(method || 'GET', path, true);
+  xhr.timeout = Number(timeoutMs || 8000);
+  if (contentType) {
+    xhr.setRequestHeader('Content-Type', contentType);
+  }
+  xhr.onreadystatechange = function() {
+    var json;
+    if (xhr.readyState !== 4) return;
+    json = parseJsonText(xhr.responseText);
+    if (xhr.status >= 200 && xhr.status < 300) {
+      if (onSuccess) onSuccess(json, xhr);
+      return;
+    }
+    if (onError) onError(new Error(json.error || ('HTTP ' + xhr.status)), json, xhr);
+  };
+  xhr.onerror = function() {
+    if (onError) onError(new Error('Verbindung fehlgeschlagen'), {}, xhr);
+  };
+  xhr.ontimeout = function() {
+    if (onError) onError(new Error('Zeitueberschreitung beim Warten auf Antwort'), {}, xhr);
+  };
+  xhr.send(body || null);
+}
+
+function apiJson(path, method, onSuccess, onError, timeoutMs) {
+  requestJson(path, method || 'GET', null, null, onSuccess, onError, timeoutMs);
+}
+
+function describeWifiNetwork(network) {
+  var parts = [];
+  var rssi = Number(network && network.rssi);
+  if (network && network.secure) {
+    parts.push('gesichert');
+  } else {
+    parts.push('offen');
+  }
+  if (!isNaN(rssi) && rssi !== 0) {
+    parts.push(rssi + ' dBm');
+  }
+  return parts.join(' | ');
+}
+
+function renderWifiNetworks(networks) {
+  var select = document.getElementById('wifi-network-list');
+  var status = document.getElementById('wifi-scan-status');
+  var ssidInput = document.getElementById('ssid');
+  var currentSsid = ssidInput ? ssidInput.value : '';
+  var i;
+  var option;
+  if (!select) return;
+  select.options.length = 0;
+  if (!networks || !networks.length) {
+    option = document.createElement('option');
+    option.value = '';
+    option.text = 'Keine Netzwerke gefunden';
+    select.appendChild(option);
+    if (status) status.innerHTML = 'Es wurden keine sichtbaren WLAN-Netzwerke gefunden.';
+    return;
+  }
+  for (i = 0; i < networks.length; i++) {
+    option = document.createElement('option');
+    option.value = networks[i].ssid || '';
+    option.text = (networks[i].ssid || '(ohne SSID)') + ' - ' + describeWifiNetwork(networks[i]);
+    if (currentSsid && option.value === currentSsid) {
+      option.selected = true;
+    }
+    select.appendChild(option);
+  }
+  if (status) {
+    status.innerHTML = String(networks.length) + ' WLAN-Netzwerke gefunden.';
+  }
+}
+
+function applySelectedWifiSsid() {
+  var select = document.getElementById('wifi-network-list');
+  var ssidInput = document.getElementById('ssid');
+  if (!select || !ssidInput || !select.value) return;
+  ssidInput.value = select.value;
+}
+
+function refreshWifiScan() {
+  var status = document.getElementById('wifi-scan-status');
+  if (status) {
+    status.innerHTML = 'Suche nach verfuegbaren WLAN-Netzwerken...';
+  }
+  apiJson(
+    '/api/wifi/scan',
+    'GET',
+    function(response) {
+      renderWifiNetworks(response.networks || []);
+    },
+    function(error) {
+      if (status) {
+        status.innerHTML = 'WLAN-Scan fehlgeschlagen: ' + error.message;
+      }
+    },
+    15000
+  );
+}
+
+function initWifiControls() {
+  var select = document.getElementById('wifi-network-list');
+  var status = document.getElementById('wifi-scan-status');
+  if (!select) return;
+  select.onchange = applySelectedWifiSsid;
+  if (select.options && select.options.length) {
+    if (status) {
+      status.innerHTML = String(select.options.length) + ' WLAN-Netzwerke vorgeladen.';
+    }
+  } else if (status) {
+    status.innerHTML = 'Noch keine WLAN-Netzwerke geladen.';
+  }
+}
+
+function formatBytes(value) {
+  var bytes = Number(value || 0);
+  if (!bytes) return '0 B';
+  if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return bytes + ' B';
+}
+
+function clampByte(value) {
+  var numeric = Number(value || 0);
+  return Math.max(0, Math.min(255, Math.round(numeric)));
+}
+
+function byteToHex(value) {
+  var hex = clampByte(value).toString(16).toUpperCase();
+  return hex.length < 2 ? ('0' + hex) : hex;
+}
+
+function hexToRgb(hex) {
+  var normalized = String(hex || '').replace('#', '');
+  if (normalized.length !== 6) {
+    return {r: 255, g: 255, b: 255};
+  }
+  return {
+    r: parseInt(normalized.substr(0, 2), 16),
+    g: parseInt(normalized.substr(2, 2), 16),
+    b: parseInt(normalized.substr(4, 2), 16)
+  };
+}
+
+function rgbToCss(r, g, b, w) {
+  var white = clampByte(w);
+  var red = clampByte(r + white);
+  var green = clampByte(g + white);
+  var blue = clampByte(b + white);
+  return 'rgb(' + red + ', ' + green + ', ' + blue + ')';
+}
+
+function syncLightPickerFromHidden() {
+  var colorInput = document.getElementById('light_color');
+  var hiddenR = document.getElementById('light_r');
+  var hiddenG = document.getElementById('light_g');
+  var hiddenB = document.getElementById('light_b');
+  var hex;
+  if (!colorInput || !hiddenR || !hiddenG || !hiddenB) return;
+  hex = '#' + byteToHex(hiddenR.value) + byteToHex(hiddenG.value) + byteToHex(hiddenB.value);
+  colorInput.value = hex;
+}
+
+function syncHiddenFromLightPicker() {
+  var colorInput = document.getElementById('light_color');
+  var hiddenR = document.getElementById('light_r');
+  var hiddenG = document.getElementById('light_g');
+  var hiddenB = document.getElementById('light_b');
+  var rgb;
+  if (!colorInput || !hiddenR || !hiddenG || !hiddenB) return;
+  rgb = hexToRgb(colorInput.value);
+  hiddenR.value = rgb.r;
+  hiddenG.value = rgb.g;
+  hiddenB.value = rgb.b;
+}
+
+function syncWhiteControls(sourceId) {
+  var slider = document.getElementById('light_w_slider');
+  var input = document.getElementById('light_w');
+  var source = sourceId === 'slider' ? slider : input;
+  var value;
+  if (!slider || !input || !source) return;
+  value = clampByte(source.value);
+  slider.value = value;
+  input.value = value;
+}
+
+function updateLightPreviewCard() {
+  var preview = document.getElementById('light-preview');
+  var text = document.getElementById('light-preview-text');
+  var enabled = document.getElementById('light_enabled');
+  var hiddenR = document.getElementById('light_r');
+  var hiddenG = document.getElementById('light_g');
+  var hiddenB = document.getElementById('light_b');
+  var white = document.getElementById('light_w');
+  var r;
+  var g;
+  var b;
+  var w;
+  if (!preview || !text || !hiddenR || !hiddenG || !hiddenB || !white) return;
+  r = clampByte(hiddenR.value);
+  g = clampByte(hiddenG.value);
+  b = clampByte(hiddenB.value);
+  w = clampByte(white.value);
+  preview.style.background = rgbToCss(r, g, b, w);
+  text.innerHTML = 'RGBW: ' + r + ', ' + g + ', ' + b + ', ' + w +
+    ' | Show-Beleuchtung: ' + (enabled && enabled.checked ? 'AN' : 'AUS');
+}
+
+function buildLightPayloadString(preview) {
+  var enabled = document.getElementById('light_enabled');
+  var hiddenR = document.getElementById('light_r');
+  var hiddenG = document.getElementById('light_g');
+  var hiddenB = document.getElementById('light_b');
+  var white = document.getElementById('light_w');
+  syncHiddenFromLightPicker();
+  syncWhiteControls('input');
+  updateLightPreviewCard();
+  return 'enabled=' + encodeURIComponent(enabled && enabled.checked ? '1' : '0') +
+    '&r=' + encodeURIComponent(hiddenR ? hiddenR.value : '0') +
+    '&g=' + encodeURIComponent(hiddenG ? hiddenG.value : '0') +
+    '&b=' + encodeURIComponent(hiddenB ? hiddenB.value : '0') +
+    '&w=' + encodeURIComponent(white ? white.value : '0') +
+    '&preview=' + encodeURIComponent(preview ? '1' : '0');
+}
+
+function saveLightConfig(preview) {
+  if (!document.getElementById('light_color')) return;
+  requestJson(
+    '/api/light',
+    'POST',
+    buildLightPayloadString(preview),
+    'application/x-www-form-urlencoded;charset=UTF-8',
+    function() {
+      updateLightPreviewCard();
+    },
+    function(error) {
+      alert('Beleuchtung konnte nicht gespeichert werden: ' + error.message);
+    }
+  );
+}
+
+function previewLightConfig() {
+  saveLightConfig(true);
+}
+
+function setOtaProgress(percent, text) {
+  var bar = document.getElementById('ota-progress-bar');
+  var label = document.getElementById('ota-progress-text');
+  var safePercent = Math.max(0, Math.min(100, Number(percent || 0)));
+  if (bar) {
+    bar.style.width = safePercent + '%';
+  }
+  if (label) {
+    label.innerHTML = text || '';
+  }
+}
+
+function renderOta(status) {
+  var el = document.getElementById('ota-box');
+  var text = '';
+  var progressText = status.status_text || status.phase || 'Bereit';
+  var busy = !!(status.check_in_progress || status.update_in_progress || status.reboot_pending ||
+    status.phase === 'queued' || status.phase === 'checking' || status.phase === 'downloading' || status.phase === 'flashing');
+  if (!el) return;
+  otaPollFailureCount = 0;
+  if (!busy) {
+    otaClearLocalBusyState();
+  }
+  text += 'Konfiguriert: ' + (status.configured ? 'ja' : 'nein') + '<br>';
+  text += 'Manifest URL: ' + (status.manifest_url || '-') + '<br>';
+  text += 'WLAN verbunden: ' + (status.wifi_connected ? 'ja' : 'nein') + '<br>';
+  text += 'Aktuell: ' + (status.current_version || '-') + '<br>';
+  text += 'Neueste Version: ' + (status.latest_version || '-') + '<br>';
+  text += 'Update verfuegbar: ' + (status.update_available ? 'ja' : 'nein') + '<br>';
+  text += 'Quelle: ' + (status.source || '-') + '<br>';
+  text += 'Status: ' + (status.status_text || status.phase || '-') + '<br>';
+  if (status.last_error) {
+    text += 'Letzter Fehler: ' + status.last_error + '<br>';
+  }
+  if (status.release_notes) {
+    text += 'Hinweis: ' + status.release_notes + '<br>';
+  }
+  el.innerHTML = text;
+  if (status.progress_total > 0) {
+    progressText += ' (' + (status.progress_percent || 0) + '% / ' +
+      formatBytes(status.progress_bytes) + ' von ' + formatBytes(status.progress_total) + ')';
+  } else if (status.progress_bytes > 0) {
+    progressText += ' (' + formatBytes(status.progress_bytes) + ')';
+  }
+  if (status.reboot_pending) {
+    progressText += ' - Neustart ausstehend';
+  }
+  setOtaProgress(status.progress_percent || 0, progressText);
+  scheduleOtaRefresh(busy ? 2000 : 5000);
+}
+
+function renderOtaOfflineHint(error) {
+  var el = document.getElementById('ota-box');
+  var message = '';
+  if (!el) return;
+  if (otaLocalBusyState === 'update') {
+    message = 'Online-Update wurde gestartet.<br>' +
+      'Waehend Download, Flash und Neustart antwortet das Geraet zeitweise nicht auf Statusabfragen.<br>' +
+      'Bitte das Geraet in dieser Phase nicht manuell neu starten oder ausschalten.<br>' +
+      'Letzter Verbindungsfehler: ' + (error && error.message ? error.message : 'unbekannt');
+    el.innerHTML = message;
+    setOtaProgress(100, 'Update laeuft oder Neustart wird vorbereitet. Verbindung wird erneut geprueft...');
+    return;
+  }
+  if (otaLocalBusyState === 'check') {
+    message = 'OTA-Pruefung wurde gestartet.<br>' +
+      'Waehend der Pruefung kann die Statusabfrage kurzzeitig aussetzen.<br>' +
+      'Letzter Verbindungsfehler: ' + (error && error.message ? error.message : 'unbekannt');
+    el.innerHTML = message;
+    setOtaProgress(0, 'Pruefe erneut auf Rueckmeldung...');
+    return;
+  }
+  el.innerHTML = 'OTA-Status konnte nicht geladen werden: ' + (error && error.message ? error.message : 'unbekannt');
+}
+
+function refreshOta() {
+  apiJson(
+    '/ota/status',
+    'GET',
+    function(status) {
+      renderOta(status);
+    },
+    function(error) {
+      otaPollFailureCount += 1;
+      renderOtaOfflineHint(error);
+      if (otaLocalBusyState === 'update') {
+        scheduleOtaRefresh(Math.min(15000, 4000 + (otaPollFailureCount * 1000)));
+        return;
+      }
+      if (otaLocalBusyState === 'check') {
+        scheduleOtaRefresh(Math.min(10000, 2500 + (otaPollFailureCount * 1000)));
+        return;
+      }
+      scheduleOtaRefresh(8000);
+    },
+    2500
+  );
+}
+
+function otaCheck() {
+  apiJson(
+    '/ota/check',
+    'POST',
+    function() {
+      otaSetLocalBusyState('check');
+      setOtaProgress(0, 'OTA-Pruefung wurde gestartet...');
+      scheduleOtaRefresh(400);
+    },
+    function(error) {
+      alert('OTA-Check fehlgeschlagen: ' + error.message);
+      scheduleOtaRefresh(2000);
+    },
+    5000
+  );
+}
+
+function otaUpdate() {
+  if (!confirm('Firmware-Update jetzt starten?')) return;
+  apiJson(
+    '/ota/update',
+    'POST',
+    function() {
+      otaSetLocalBusyState('update');
+      setOtaProgress(100, 'Online-Update wurde gestartet. Das Geraet kann waehrend Download, Flash und Neustart kurzzeitig nicht antworten.');
+      scheduleOtaRefresh(1500);
+    },
+    function(error) {
+      alert('OTA-Update fehlgeschlagen: ' + error.message);
+      scheduleOtaRefresh(2000);
+    },
+    5000
+  );
+}
+
+function otaUploadFile() {
+  var input = document.getElementById('ota-file');
+  var file;
+  var form;
+  var xhr;
+  if (!input || !input.files || !input.files.length) {
+    alert('Bitte zuerst eine Firmware-Datei auswaehlen.');
+    return;
+  }
+  file = input.files[0];
+  if (!confirm('Firmware-Datei jetzt hochladen und installieren?')) return;
+  form = new FormData();
+  form.append('firmware', file, file.name);
+  setOtaProgress(0, 'Upload wird gestartet...');
+  xhr = new XMLHttpRequest();
+  xhr.open('POST', '/ota/upload', true);
+  if (xhr.upload) {
+    xhr.upload.onprogress = function(event) {
+      var percent;
+      if (!event.lengthComputable) return;
+      percent = Math.round((event.loaded / event.total) * 100);
+      setOtaProgress(percent, 'Upload laeuft (' + percent + '% / ' +
+        formatBytes(event.loaded) + ' von ' + formatBytes(event.total) + ')');
+    };
+  }
+  xhr.onreadystatechange = function() {
+    var json;
+    if (xhr.readyState !== 4) return;
+    json = parseJsonText(xhr.responseText);
+    if (xhr.status >= 200 && xhr.status < 300) {
+      input.value = '';
+      setTimeout(refreshOta, 200);
+      return;
+    }
+    alert('Firmware-Upload fehlgeschlagen: ' + (json.error || ('HTTP ' + xhr.status)));
+    setTimeout(refreshOta, 200);
+  };
+  xhr.onerror = function() {
+    alert('Firmware-Upload fehlgeschlagen: Upload-Verbindung fehlgeschlagen');
+    setTimeout(refreshOta, 200);
+  };
+  xhr.send(form);
+}
+
+function initLightControls() {
+  var colorInput = document.getElementById('light_color');
+  var enabled = document.getElementById('light_enabled');
+  var whiteSlider = document.getElementById('light_w_slider');
+  var whiteInput = document.getElementById('light_w');
+  if (!colorInput || !enabled || !whiteSlider || !whiteInput) return;
+  syncLightPickerFromHidden();
+  syncWhiteControls('input');
+  updateLightPreviewCard();
+  colorInput.onchange = function() { saveLightConfig(true); };
+  enabled.onchange = function() { saveLightConfig(false); };
+  whiteSlider.oninput = function() {
+    syncWhiteControls('slider');
+    updateLightPreviewCard();
+  };
+  whiteSlider.onchange = function() { saveLightConfig(true); };
+  whiteInput.oninput = function() {
+    syncWhiteControls('input');
+    updateLightPreviewCard();
+  };
+  whiteInput.onchange = function() { saveLightConfig(true); };
+}
+
+refreshOta();
+initWifiControls();
+initLightControls();
+)rawliteral";
+  server.send_P(200, "application/javascript", APP_JS);
 }
 
 void handleSave()
@@ -2461,6 +3333,7 @@ void handleSave()
   }
   if (HAS_LED_OUTPUT)
   {
+    config.lightEnabled = server.hasArg("light_enabled") && server.arg("light_enabled") != "0";
     if (server.hasArg("light_r"))
     {
       config.lightR = clampU8(server.arg("light_r").toInt());
@@ -2479,123 +3352,491 @@ void handleSave()
     }
   }
 
-  config.wifiSsid.trim();
-  config.wifiPassword.trim();
-  config.mqttHost.trim();
-  config.mqttUser.trim();
-  config.mqttPassword.trim();
-  config.mqttTopic.trim();
-  config.otaManifestUrl.trim();
-  if (config.otaManifestUrl.length() == 0 || isLegacyOtaManifestUrl(config.otaManifestUrl))
-  {
-    config.otaManifestUrl = String(OTA_MANIFEST_URL);
-  }
-
-  if (config.mqttPort == 0)
-  {
-    config.mqttPort = 1883;
-  }
-  if (config.mqttTopic.length() == 0 || config.mqttTopic == "vacubear" || config.mqttTopic.startsWith("vacubear/"))
-  {
-    config.mqttTopic = deviceId;
-  }
-
-  showStatus.showDuration = config.showLengthMs;
-  showStatus.showNachlauf = config.showNachlaufMs;
-  publishConfigState(true);
+  sanitizeConfig();
+  applyConfigToRuntime(true, true, true);
 
   if (!saveConfig())
   {
     LOGW("Config save failed");
-    server.send(500, "text/html", buildHtmlPage("Fehler beim Speichern."));
+    sendHtmlPage("Fehler beim Speichern.", 500);
     return;
   }
 
   LOGI("Config saved, restarting device");
-  server.send(200, "text/html", buildHtmlPage("Gespeichert. Das Geraet startet neu..."));
+  sendHtmlPage("Gespeichert. Das Geraet startet neu...");
   delay(500);
   ESP.restart();
+}
+
+void handleApiWifiScan()
+{
+  LOGD("HTTP GET /api/wifi/scan");
+  int networkCount = WiFi.scanNetworks();
+  if (networkCount < 0)
+  {
+    sendJsonError(500, "WLAN-Scan fehlgeschlagen");
+    return;
+  }
+
+  JsonDocument doc;
+  JsonArray networks = doc["networks"].to<JsonArray>();
+  for (int i = 0; i < networkCount; i++)
+  {
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0)
+    {
+      continue;
+    }
+    JsonObject network = networks.add<JsonObject>();
+    network["ssid"] = ssid;
+    network["rssi"] = WiFi.RSSI(i);
+    network["secure"] = WiFi.encryptionType(i) != ENC_TYPE_NONE;
+  }
+  WiFi.scanDelete();
+  doc["ok"] = true;
+  sendJsonDocument(200, doc);
+}
+
+void handleApiConfigGet()
+{
+  LOGD("HTTP GET /api/config");
+  JsonDocument doc;
+  buildConfigJson(doc.to<JsonObject>());
+  sendJsonDocument(200, doc);
+}
+
+void handleApiConfigPost()
+{
+  LOGI("HTTP POST /api/config");
+  JsonDocument doc;
+  String errorText;
+  if (!parseJsonBody(doc, errorText))
+  {
+    sendJsonError(400, errorText);
+    return;
+  }
+
+  bool wifiChanged = false;
+  bool mqttChanged = false;
+  bool lightChanged = false;
+  bool lightColorChanged = false;
+
+  if (doc["wifi"].is<JsonObject>())
+  {
+    JsonObject wifi = doc["wifi"].as<JsonObject>();
+    if (!wifi["ssid"].isNull())
+    {
+      String value = wifi["ssid"].as<String>();
+      if (config.wifiSsid != value)
+      {
+        config.wifiSsid = value;
+        wifiChanged = true;
+      }
+    }
+    if (!wifi["password"].isNull())
+    {
+      String value = wifi["password"].as<String>();
+      if (config.wifiPassword != value)
+      {
+        config.wifiPassword = value;
+        wifiChanged = true;
+      }
+    }
+  }
+
+  if (doc["mqtt"].is<JsonObject>())
+  {
+    JsonObject mqtt = doc["mqtt"].as<JsonObject>();
+    if (!mqtt["host"].isNull())
+    {
+      String value = mqtt["host"].as<String>();
+      if (config.mqttHost != value)
+      {
+        config.mqttHost = value;
+        mqttChanged = true;
+      }
+    }
+    if (!mqtt["port"].isNull())
+    {
+      uint16_t value = (uint16_t)clampU32((uint32_t)mqtt["port"].as<unsigned long>(), 1, 65535);
+      if (config.mqttPort != value)
+      {
+        config.mqttPort = value;
+        mqttChanged = true;
+      }
+    }
+    if (!mqtt["user"].isNull())
+    {
+      String value = mqtt["user"].as<String>();
+      if (config.mqttUser != value)
+      {
+        config.mqttUser = value;
+        mqttChanged = true;
+      }
+    }
+    if (!mqtt["password"].isNull())
+    {
+      String value = mqtt["password"].as<String>();
+      if (config.mqttPassword != value)
+      {
+        config.mqttPassword = value;
+        mqttChanged = true;
+      }
+    }
+    if (!mqtt["topic"].isNull())
+    {
+      String value = mqtt["topic"].as<String>();
+      if (config.mqttTopic != value)
+      {
+        config.mqttTopic = value;
+        mqttChanged = true;
+      }
+    }
+  }
+
+  if (doc["ota"].is<JsonObject>())
+  {
+    JsonObject ota = doc["ota"].as<JsonObject>();
+    if (!ota["manifest_url"].isNull())
+    {
+      config.otaManifestUrl = ota["manifest_url"].as<String>();
+    }
+  }
+
+  if (doc["show"].is<JsonObject>())
+  {
+    JsonObject show = doc["show"].as<JsonObject>();
+    if (!show["length_ms"].isNull())
+    {
+      config.showLengthMs = clampU32(show["length_ms"].as<unsigned long>(), SHOW_LENGTH_MIN_MS, SHOW_LENGTH_MAX_MS);
+    }
+    else if (!show["length_s"].isNull())
+    {
+      config.showLengthMs = clampU32(secToMs(show["length_s"].as<unsigned long>()), SHOW_LENGTH_MIN_MS, SHOW_LENGTH_MAX_MS);
+    }
+
+    if (!show["nachlauf_ms"].isNull())
+    {
+      config.showNachlaufMs = clampMinU32(show["nachlauf_ms"].as<unsigned long>(), SHOW_NACHLAUF_MIN_MS);
+    }
+    else if (!show["nachlauf_s"].isNull())
+    {
+      config.showNachlaufMs = clampMinU32(secToMs(show["nachlauf_s"].as<unsigned long>()), SHOW_NACHLAUF_MIN_MS);
+    }
+  }
+
+  if (HAS_LED_OUTPUT && doc["light"].is<JsonObject>())
+  {
+    JsonObject light = doc["light"].as<JsonObject>();
+    if (!light["enabled"].isNull())
+    {
+      bool value = light["enabled"].as<bool>();
+      if (config.lightEnabled != value)
+      {
+        config.lightEnabled = value;
+        lightChanged = true;
+      }
+    }
+    if (!light["r"].isNull())
+    {
+      uint8_t value = clampU8(light["r"].as<int>());
+      if (config.lightR != value)
+      {
+        config.lightR = value;
+        lightChanged = true;
+        lightColorChanged = true;
+      }
+    }
+    if (!light["g"].isNull())
+    {
+      uint8_t value = clampU8(light["g"].as<int>());
+      if (config.lightG != value)
+      {
+        config.lightG = value;
+        lightChanged = true;
+        lightColorChanged = true;
+      }
+    }
+    if (!light["b"].isNull())
+    {
+      uint8_t value = clampU8(light["b"].as<int>());
+      if (config.lightB != value)
+      {
+        config.lightB = value;
+        lightChanged = true;
+        lightColorChanged = true;
+      }
+    }
+    if (!light["w"].isNull())
+    {
+      uint8_t value = clampU8(light["w"].as<int>());
+      if (config.lightW != value)
+      {
+        config.lightW = value;
+        lightChanged = true;
+        lightColorChanged = true;
+      }
+    }
+  }
+
+  sanitizeConfig();
+  if (!saveConfig())
+  {
+    sendJsonError(500, "Konfiguration konnte nicht gespeichert werden");
+    return;
+  }
+
+  if (lightColorChanged && !showStatus.isRunning)
+  {
+    requestLightPreview();
+  }
+  else if (!config.lightEnabled && !showStatus.isRunning)
+  {
+    lightControl.previewUntilAt = 0;
+  }
+
+  applyConfigToRuntime(wifiChanged, mqttChanged, true);
+
+  JsonDocument response;
+  response["ok"] = true;
+  response["wifi_changed"] = wifiChanged;
+  response["mqtt_changed"] = mqttChanged;
+  response["light_changed"] = lightChanged;
+  buildConfigJson(response["config"].to<JsonObject>());
+  sendJsonDocument(200, response);
+}
+
+void handleApiShowGet()
+{
+  LOGD("HTTP GET /api/show");
+  JsonDocument doc;
+  doc["running"] = showStatus.isRunning;
+  doc["phase"] = getShowPhase();
+  doc["length_ms"] = config.showLengthMs;
+  doc["nachlauf_ms"] = config.showNachlaufMs;
+  doc["end_at_ms"] = showStatus.endAt;
+  doc["open_valve_at_ms"] = showStatus.openValveAt;
+  sendJsonDocument(200, doc);
+}
+
+void handleApiShowPost()
+{
+  LOGI("HTTP POST /api/show");
+  JsonDocument doc;
+  String errorText;
+  if (!parseJsonBody(doc, errorText))
+  {
+    sendJsonError(400, errorText);
+    return;
+  }
+
+  String state = doc["state"] | "";
+  state.trim();
+  state.toUpperCase();
+  if (state == "ON")
+  {
+    startShow();
+  }
+  else if (state == "OFF")
+  {
+    stopShow();
+  }
+  else
+  {
+    sendJsonError(400, "state muss ON oder OFF sein");
+    return;
+  }
+
+  publishShowState(true);
+  publishTelemetry(true);
+  JsonDocument response;
+  response["ok"] = true;
+  response["queued_state"] = state;
+  response["running"] = showStatus.isRunning;
+  response["phase"] = getShowPhase();
+  sendJsonDocument(202, response);
+}
+
+void handleApiLightGet()
+{
+  LOGD("HTTP GET /api/light");
+  if (!HAS_LED_OUTPUT)
+  {
+    sendJsonError(404, "Keine LED-Hardware konfiguriert");
+    return;
+  }
+  JsonDocument doc;
+  buildLightStatusJson(doc);
+  sendJsonDocument(200, doc);
+}
+
+void handleLightConfig()
+{
+  LOGI("HTTP /api/light requested");
+  if (!HAS_LED_OUTPUT)
+  {
+    sendJsonError(404, "Keine LED-Hardware konfiguriert");
+    return;
+  }
+
+  bool changed = false;
+  bool colorChanged = false;
+  bool previewRequested = false;
+  JsonDocument requestDoc;
+  String errorText;
+  bool hasJsonBody = requestBodyLooksLikeJson();
+
+  if (hasJsonBody)
+  {
+    if (!parseJsonBody(requestDoc, errorText))
+    {
+      sendJsonError(400, errorText);
+      return;
+    }
+    if (!requestDoc["enabled"].isNull())
+    {
+      bool newEnabled = requestDoc["enabled"].as<bool>();
+      if (config.lightEnabled != newEnabled)
+      {
+        config.lightEnabled = newEnabled;
+        changed = true;
+      }
+    }
+    if (!requestDoc["preview"].isNull())
+    {
+      previewRequested = requestDoc["preview"].as<bool>();
+    }
+    if (!requestDoc["r"].isNull())
+    {
+      uint8_t value = clampU8(requestDoc["r"].as<int>());
+      if (config.lightR != value)
+      {
+        config.lightR = value;
+        changed = true;
+        colorChanged = true;
+      }
+    }
+    if (!requestDoc["g"].isNull())
+    {
+      uint8_t value = clampU8(requestDoc["g"].as<int>());
+      if (config.lightG != value)
+      {
+        config.lightG = value;
+        changed = true;
+        colorChanged = true;
+      }
+    }
+    if (!requestDoc["b"].isNull())
+    {
+      uint8_t value = clampU8(requestDoc["b"].as<int>());
+      if (config.lightB != value)
+      {
+        config.lightB = value;
+        changed = true;
+        colorChanged = true;
+      }
+    }
+    if (!requestDoc["w"].isNull())
+    {
+      uint8_t value = clampU8(requestDoc["w"].as<int>());
+      if (config.lightW != value)
+      {
+        config.lightW = value;
+        changed = true;
+        colorChanged = true;
+      }
+    }
+  }
+  else
+  {
+    previewRequested = server.hasArg("preview") && server.arg("preview") != "0";
+    if (server.hasArg("enabled"))
+    {
+      bool newEnabled = server.arg("enabled") != "0";
+      if (config.lightEnabled != newEnabled)
+      {
+        config.lightEnabled = newEnabled;
+        changed = true;
+      }
+    }
+    if (server.hasArg("r"))
+    {
+      uint8_t value = clampU8(server.arg("r").toInt());
+      if (config.lightR != value)
+      {
+        config.lightR = value;
+        changed = true;
+        colorChanged = true;
+      }
+    }
+    if (server.hasArg("g"))
+    {
+      uint8_t value = clampU8(server.arg("g").toInt());
+      if (config.lightG != value)
+      {
+        config.lightG = value;
+        changed = true;
+        colorChanged = true;
+      }
+    }
+    if (server.hasArg("b"))
+    {
+      uint8_t value = clampU8(server.arg("b").toInt());
+      if (config.lightB != value)
+      {
+        config.lightB = value;
+        changed = true;
+        colorChanged = true;
+      }
+    }
+    if (server.hasArg("w"))
+    {
+      uint8_t value = clampU8(server.arg("w").toInt());
+      if (config.lightW != value)
+      {
+        config.lightW = value;
+        changed = true;
+        colorChanged = true;
+      }
+    }
+  }
+
+  if (previewRequested || colorChanged)
+  {
+    requestLightPreview();
+  }
+  else if (!config.lightEnabled && !showStatus.isRunning)
+  {
+    lightControl.previewUntilAt = 0;
+  }
+
+  if (changed)
+  {
+    scheduleConfigSave();
+    publishLightState(true);
+    publishTelemetry(true);
+  }
+
+  JsonDocument status;
+  buildLightStatusJson(status);
+  status["preview_requested"] = previewRequested || colorChanged;
+  sendJsonDocument(200, status);
 }
 
 void handleStatus()
 {
   LOGD("HTTP GET /status");
   JsonDocument status;
-  status["wifi_connected"] = WiFi.status() == WL_CONNECTED;
-  status["sta_ip"] = WiFi.localIP().toString();
-  status["ap_enabled"] = captivePortalEnabled;
-  status["ap_ip"] = WiFi.softAPIP().toString();
-  status["show_running"] = showStatus.isRunning;
-  status["show_length"] = config.showLengthMs;
-  status["show_nachlauf"] = config.showNachlaufMs;
-  status["pump_pwm"] = pumpControl.currentPwm;
-  status["pump_target_pwm"] = pumpControl.targetPwm;
-  if (HAS_LED_OUTPUT)
-  {
-    status["light_enabled"] = true;
-    status["led_count"] = LED_COUNT;
-    status["light_level"] = lightControl.currentLevel;
-    status["light_target_level"] = lightControl.targetLevel;
-    status["light_on_until_at"] = lightControl.onUntilAt;
-
-    JsonObject color = status["light"].to<JsonObject>();
-    color["r"] = config.lightR;
-    color["g"] = config.lightG;
-    color["b"] = config.lightB;
-    color["w"] = config.lightW;
-  }
-
-  JsonObject ota = status["ota"].to<JsonObject>();
-  ota["current_version"] = otaStatus.currentVersion;
-  ota["latest_version"] = otaStatus.latestVersion;
-  ota["update_available"] = otaStatus.updateAvailable;
-  ota["check_in_progress"] = otaStatus.checkInProgress;
-  ota["update_in_progress"] = otaStatus.updateInProgress;
-  ota["phase"] = otaStatus.phase;
-  ota["source"] = otaStatus.source;
-  ota["status_text"] = otaStatus.statusText;
-  ota["reboot_pending"] = otaStatus.rebootPending;
-  ota["progress_bytes"] = otaStatus.progressBytes;
-  ota["progress_total"] = otaStatus.progressTotal;
-  ota["progress_percent"] = otaStatus.progressPercent;
-  ota["last_error"] = otaStatus.lastError;
-  ota["last_check_ms"] = otaStatus.lastCheckAt;
-  ota["reboot_at_ms"] = otaStatus.rebootAt;
-
-  String out;
-  serializeJson(status, out);
-  server.send(200, "application/json", out);
+  buildStatusJson(status);
+  sendJsonDocument(200, status);
 }
 
 void handleOtaStatus()
 {
   LOGD("HTTP GET /ota/status");
   JsonDocument status;
-  status["configured"] = config.otaManifestUrl.length() > 0;
-  status["manifest_url"] = config.otaManifestUrl;
-  status["wifi_connected"] = WiFi.status() == WL_CONNECTED;
-  status["current_version"] = otaStatus.currentVersion;
-  status["latest_version"] = otaStatus.latestVersion;
-  status["firmware_url"] = otaStatus.firmwareUrl;
-  status["release_notes"] = otaStatus.releaseNotes;
-  status["update_available"] = otaStatus.updateAvailable;
-  status["check_in_progress"] = otaStatus.checkInProgress;
-  status["update_in_progress"] = otaStatus.updateInProgress;
-  status["phase"] = otaStatus.phase;
-  status["source"] = otaStatus.source;
-  status["status_text"] = otaStatus.statusText;
-  status["reboot_pending"] = otaStatus.rebootPending;
-  status["progress_bytes"] = otaStatus.progressBytes;
-  status["progress_total"] = otaStatus.progressTotal;
-  status["progress_percent"] = otaStatus.progressPercent;
-  status["last_error"] = otaStatus.lastError;
-  status["last_check_ms"] = otaStatus.lastCheckAt;
-  status["reboot_at_ms"] = otaStatus.rebootAt;
-  status["interval_ms"] = OTA_CHECK_INTERVAL_MS;
-
-  String out;
-  serializeJson(status, out);
-  server.send(200, "application/json", out);
+  buildOtaStatusJson(status);
+  sendJsonDocument(200, status);
 }
 
 void handleOtaCheck()
@@ -2617,6 +3858,8 @@ void handleOtaCheck()
     return;
   }
 
+  otaStatus.lastError = "";
+  otaResetProgress("queued", "manifest", "OTA-Pruefung wurde gestartet");
   otaCheckRequested = true;
   server.send(202, "application/json", "{\"ok\":true,\"queued\":true}");
 }
@@ -2645,6 +3888,8 @@ void handleOtaUpdate()
     return;
   }
 
+  otaStatus.lastError = "";
+  otaResetProgress("queued", "manifest", "Online-Update wurde gestartet");
   otaUpdateRequested = true;
   server.send(202, "application/json", "{\"ok\":true,\"queued\":true}");
 }
@@ -2868,6 +4113,7 @@ void loadConfig()
       config.otaManifestUrl = doc["ota"]["manifest_url"] | config.otaManifestUrl;
       config.showLengthMs = doc["show"]["length_ms"] | config.showLengthMs;
       config.showNachlaufMs = doc["show"]["nachlauf_ms"] | config.showNachlaufMs;
+      config.lightEnabled = doc["light"]["enabled"] | config.lightEnabled;
       config.lightR = doc["light"]["r"] | config.lightR;
       config.lightG = doc["light"]["g"] | config.lightG;
       config.lightB = doc["light"]["b"] | config.lightB;
@@ -2884,30 +4130,7 @@ void loadConfig()
     saveConfig();
   }
 
-  config.wifiSsid.trim();
-  config.wifiPassword.trim();
-  config.mqttHost.trim();
-  config.mqttUser.trim();
-  config.mqttPassword.trim();
-  config.mqttTopic.trim();
-  config.otaManifestUrl.trim();
-  if (config.otaManifestUrl.length() == 0 || isLegacyOtaManifestUrl(config.otaManifestUrl))
-  {
-    config.otaManifestUrl = String(OTA_MANIFEST_URL);
-  }
-
-  if (config.mqttPort == 0)
-  {
-    config.mqttPort = 1883;
-  }
-  if (config.mqttTopic.length() == 0 || config.mqttTopic == "vacubear" || config.mqttTopic.startsWith("vacubear/"))
-  {
-    config.mqttTopic = deviceId;
-  }
-
-  config.showLengthMs = clampU32(config.showLengthMs, SHOW_LENGTH_MIN_MS, SHOW_LENGTH_MAX_MS);
-  config.showNachlaufMs = clampMinU32(config.showNachlaufMs, SHOW_NACHLAUF_MIN_MS);
-
+  sanitizeConfig();
   showStatus.showDuration = config.showLengthMs;
   showStatus.showNachlauf = config.showNachlaufMs;
 }
@@ -2957,13 +4180,15 @@ void loadLegacyConfig(const String &raw)
   if (count > 8)
     config.showNachlaufMs = (uint32_t)lines[8].toInt();
   if (count > 9)
-    config.lightR = clampU8(lines[9].toInt());
+    config.lightEnabled = lines[9] != "0";
   if (count > 10)
-    config.lightG = clampU8(lines[10].toInt());
+    config.lightR = clampU8(lines[10].toInt());
   if (count > 11)
-    config.lightB = clampU8(lines[11].toInt());
+    config.lightG = clampU8(lines[11].toInt());
   if (count > 12)
-    config.lightW = clampU8(lines[12].toInt());
+    config.lightB = clampU8(lines[12].toInt());
+  if (count > 13)
+    config.lightW = clampU8(lines[13].toInt());
 }
 
 bool saveConfig()
@@ -2990,6 +4215,7 @@ bool saveConfig()
   show["nachlauf_ms"] = config.showNachlaufMs;
 
   JsonObject light = doc["light"].to<JsonObject>();
+  light["enabled"] = config.lightEnabled;
   light["r"] = config.lightR;
   light["g"] = config.lightG;
   light["b"] = config.lightB;
@@ -3068,6 +4294,13 @@ String defaultDeviceId()
   return String(buf);
 }
 
+String rgbToHex(uint8_t r, uint8_t g, uint8_t b)
+{
+  char buf[8];
+  snprintf(buf, sizeof(buf), "#%02X%02X%02X", r, g, b);
+  return String(buf);
+}
+
 uint32_t clampU32(uint32_t value, uint32_t minValue, uint32_t maxValue)
 {
   if (value < minValue)
@@ -3139,12 +4372,17 @@ String htmlEscape(const String &input)
   return out;
 }
 
+void sendHtmlPage(const String &message, int statusCode)
+{
+  server.send(statusCode, "text/html", buildHtmlPage(message));
+}
+
 String buildHtmlPage(const String &message)
 {
   // Einfache, eingebettete Setup-Seite ohne externe Assets.
   // Vorteil: laeuft auch im AP/Captive-Portal-Modus robust.
   int networkCount = WiFi.scanNetworks();
-  String options;
+  String networkOptions;
   if (networkCount > 0)
   {
     for (int i = 0; i < networkCount; i++)
@@ -3154,7 +4392,17 @@ String buildHtmlPage(const String &message)
       {
         continue;
       }
-      options += "<option value='" + htmlEscape(ssid) + "'>";
+      String optionText = htmlEscape(ssid) + " - ";
+      optionText += (WiFi.encryptionType(i) == ENC_TYPE_NONE) ? "offen" : "gesichert";
+      optionText += " | ";
+      optionText += String(WiFi.RSSI(i));
+      optionText += " dBm";
+      networkOptions += "<option value='" + htmlEscape(ssid) + "'";
+      if (ssid == config.wifiSsid)
+      {
+        networkOptions += " selected";
+      }
+      networkOptions += ">" + optionText + "</option>";
     }
   }
   WiFi.scanDelete();
@@ -3162,9 +4410,10 @@ String buildHtmlPage(const String &message)
   String stateText = (WiFi.status() == WL_CONNECTED)
                          ? (String("Verbunden mit ") + htmlEscape(config.wifiSsid) + " (" + WiFi.localIP().toString() + ")")
                          : "Kein STA-Link. Captive Portal im AP-Modus aktiv.";
+  String lightHex = rgbToHex(config.lightR, config.lightG, config.lightB);
 
   String html;
-  html.reserve(17000);
+  html.reserve(24000);
   html += "<!doctype html><html><head><meta charset='utf-8'>";
   html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<title>VacUBear Setup</title>";
@@ -3172,7 +4421,11 @@ String buildHtmlPage(const String &message)
   html += ".wrap{max-width:760px;margin:24px auto;padding:0 14px;}";
   html += ".card{background:#fff;border-radius:12px;padding:16px;box-shadow:0 6px 22px rgba(0,0,0,.08);}";
   html += "label{display:block;font-weight:600;margin-top:12px;}";
-  html += "input{width:100%;padding:10px;border-radius:8px;border:1px solid #c8d1db;margin-top:6px;box-sizing:border-box;}";
+  html += "input,select{width:100%;padding:10px;border-radius:8px;border:1px solid #c8d1db;margin-top:6px;box-sizing:border-box;}";
+  html += "input[type='checkbox']{width:auto;margin:0;}";
+  html += "input[type='range']{padding:0;border:0;}";
+  html += "input[type='color']{padding:4px;height:52px;}";
+  html += "select[size]{min-height:150px;}";
   html += "button{margin-top:16px;padding:11px 16px;background:#005bbb;color:#fff;border:0;border-radius:8px;font-weight:700;cursor:pointer;}";
   html += ".btn-secondary{background:#4b5563;margin-right:10px;}";
   html += ".btn-danger{background:#b91c1c;}";
@@ -3181,6 +4434,9 @@ String buildHtmlPage(const String &message)
   html += ".msg{background:#e8f8ed;border-left:4px solid #16853f;padding:10px;border-radius:8px;margin-bottom:14px;}";
   html += ".row{display:flex;gap:10px;flex-wrap:wrap;align-items:center;}";
   html += ".row button{margin-top:0;}";
+  html += ".row .grow{flex:1 1 220px;}";
+  html += ".toggle{display:flex;gap:10px;align-items:center;margin-top:12px;font-weight:600;}";
+  html += ".swatch{height:56px;border-radius:10px;border:1px solid #c8d1db;margin-top:10px;background:#000;box-shadow:inset 0 0 0 1px rgba(255,255,255,.2);}";
   html += ".upload-box{border:1px dashed #9fb4c7;border-radius:10px;padding:12px;margin-top:14px;background:#f8fbff;}";
   html += ".progress{height:12px;background:#d7dee6;border-radius:999px;overflow:hidden;margin:10px 0 6px;}";
   html += ".progress-bar{height:100%;width:0;background:linear-gradient(90deg,#005bbb,#0f766e);transition:width .25s ease;}";
@@ -3200,8 +4456,20 @@ String buildHtmlPage(const String &message)
   }
 
   html += "<form method='post' action='/save'>";
-  html += "<label>WiFi SSID</label><input name='ssid' list='ssid-list' value='" + htmlEscape(config.wifiSsid) + "' required>";
-  html += "<datalist id='ssid-list'>" + options + "</datalist>";
+  html += "<label for='ssid'>WiFi SSID</label><input id='ssid' name='ssid' value='" + htmlEscape(config.wifiSsid) + "' required>";
+  html += "<label for='wifi-network-list'>Verfuegbare WLAN-Netzwerke</label>";
+  html += "<select id='wifi-network-list' size='6'>";
+  if (networkOptions.length() > 0)
+  {
+    html += networkOptions;
+  }
+  else
+  {
+    html += "<option value=''>Keine Netzwerke gefunden</option>";
+  }
+  html += "</select>";
+  html += "<div class='row'><button type='button' class='btn-secondary' onclick='applySelectedWifiSsid()'>Auswahl uebernehmen</button><button type='button' class='btn-upload' onclick='refreshWifiScan()'>Netzwerke aktualisieren</button></div>";
+  html += "<div id='wifi-scan-status' class='small'></div>";
   html += "<label>WiFi Passwort</label><input name='wifi_password' type='password' value='" + htmlEscape(config.wifiPassword) + "'>";
   html += "<label>MQTT Host</label><input name='mqtt_host' value='" + htmlEscape(config.mqttHost) + "'>";
   html += "<label>MQTT Port</label><input name='mqtt_port' type='number' min='1' max='65535' value='" + String(config.mqttPort) + "'>";
@@ -3213,10 +4481,26 @@ String buildHtmlPage(const String &message)
   html += "<label>Nachlaufzeit (ms)</label><input name='show_nachlauf' type='number' min='" + String(SHOW_NACHLAUF_MIN_MS) + "' value='" + String(config.showNachlaufMs) + "'>";
   if (HAS_LED_OUTPUT)
   {
-    html += "<label>Lichtfarbe R (0-255)</label><input name='light_r' type='number' min='0' max='255' value='" + String(config.lightR) + "'>";
-    html += "<label>Lichtfarbe G (0-255)</label><input name='light_g' type='number' min='0' max='255' value='" + String(config.lightG) + "'>";
-    html += "<label>Lichtfarbe B (0-255)</label><input name='light_b' type='number' min='0' max='255' value='" + String(config.lightB) + "'>";
-    html += "<label>Lichtfarbe W (0-255)</label><input name='light_w' type='number' min='0' max='255' value='" + String(config.lightW) + "'>";
+    html += "<hr><h3>Beleuchtung</h3>";
+    html += "<div class='status'>Die Beleuchtung bleibt ausserhalb der Show aus. Farbwerte lassen sich hier ohne Neustart speichern und fuer 5 Sekunden pruefweise anzeigen.</div>";
+    html += "<label class='toggle'><input id='light_enabled' name='light_enabled' type='checkbox' value='1'";
+    if (config.lightEnabled)
+    {
+      html += " checked";
+    }
+    html += "> Beleuchtung waehrend der Show aktivieren</label>";
+    html += "<label for='light_color'>Lichtfarbe</label><input id='light_color' type='color' value='" + lightHex + "'>";
+    html += "<div class='row'>";
+    html += "<div class='grow'><label for='light_w_slider'>Weiss-Anteil</label><input id='light_w_slider' type='range' min='0' max='255' value='" + String(config.lightW) + "'></div>";
+    html += "<div style='width:110px'><label for='light_w'>Weiss (0-255)</label><input id='light_w' name='light_w' type='number' min='0' max='255' value='" + String(config.lightW) + "'></div>";
+    html += "</div>";
+    html += "<input id='light_r' name='light_r' type='hidden' value='" + String(config.lightR) + "'>";
+    html += "<input id='light_g' name='light_g' type='hidden' value='" + String(config.lightG) + "'>";
+    html += "<input id='light_b' name='light_b' type='hidden' value='" + String(config.lightB) + "'>";
+    html += "<div id='light-preview' class='swatch'></div>";
+    html += "<div id='light-preview-text' class='small'>RGBW: " + String(config.lightR) + ", " + String(config.lightG) + ", " + String(config.lightB) + ", " + String(config.lightW) + "</div>";
+    html += "<div class='row'><button type='button' class='btn-secondary' onclick='saveLightConfig(false)'>Beleuchtung speichern</button><button type='button' class='btn-upload' onclick='previewLightConfig()'>Vorschau 5s</button></div>";
+    html += "<div class='small'>Der native Browser-Color-Picker deckt RGB ab. Der Weiss-Kanal bleibt deshalb separat einstellbar.</div>";
   }
   html += "<button type='submit'>Speichern & Neustart</button></form>";
   html += "<hr><h3>OTA Firmware</h3>";
@@ -3235,151 +4519,7 @@ String buildHtmlPage(const String &message)
   html += "</div>";
   html += "<div class='small'>Aktuelle Firmware: " + String(FW_VERSION) + "</div>";
   html += "<div class='small'>Bei gueltigem WLAN im lokalen Netz erreichbar. Bei Fehler startet AP + Captive Portal.</div>";
-  html += R"rawliteral(
-<script>
-async function apiJson(path, method) {
-  const res = await fetch(path, {method: method || 'GET'});
-  const text = await res.text();
-  let json = {};
-  try { json = text ? JSON.parse(text) : {}; } catch (_) {}
-  if (!res.ok) {
-    throw new Error(json.error || ('HTTP ' + res.status));
-  }
-  return json;
-}
-
-function formatBytes(value) {
-  const bytes = Number(value || 0);
-  if (!bytes) return '0 B';
-  if (bytes >= 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
-  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + ' KB';
-  return bytes + ' B';
-}
-
-function setOtaProgress(percent, text) {
-  const bar = document.getElementById('ota-progress-bar');
-  const label = document.getElementById('ota-progress-text');
-  if (bar) {
-    const safePercent = Math.max(0, Math.min(100, Number(percent || 0)));
-    bar.style.width = safePercent + '%';
-  }
-  if (label) {
-    label.textContent = text || '';
-  }
-}
-
-function renderOta(status) {
-  const el = document.getElementById('ota-box');
-  if (!el) return;
-  let text = '';
-  text += 'Konfiguriert: ' + (status.configured ? 'ja' : 'nein') + '<br>';
-  text += 'Manifest URL: ' + (status.manifest_url || '-') + '<br>';
-  text += 'WLAN verbunden: ' + (status.wifi_connected ? 'ja' : 'nein') + '<br>';
-  text += 'Aktuell: ' + (status.current_version || '-') + '<br>';
-  text += 'Neueste Version: ' + (status.latest_version || '-') + '<br>';
-  text += 'Update verfuegbar: ' + (status.update_available ? 'ja' : 'nein') + '<br>';
-  text += 'Quelle: ' + (status.source || '-') + '<br>';
-  text += 'Status: ' + (status.status_text || status.phase || '-') + '<br>';
-  if (status.last_error) {
-    text += 'Letzter Fehler: ' + status.last_error + '<br>';
-  }
-  if (status.release_notes) {
-    text += 'Hinweis: ' + status.release_notes + '<br>';
-  }
-  el.innerHTML = text;
-
-  let progressText = status.status_text || status.phase || 'Bereit';
-  if (status.progress_total > 0) {
-    progressText += ' (' + (status.progress_percent || 0) + '% / ' +
-      formatBytes(status.progress_bytes) + ' von ' + formatBytes(status.progress_total) + ')';
-  } else if (status.progress_bytes > 0) {
-    progressText += ' (' + formatBytes(status.progress_bytes) + ')';
-  }
-  if (status.reboot_pending) {
-    progressText += ' - Neustart ausstehend';
-  }
-  setOtaProgress(status.progress_percent || 0, progressText);
-}
-
-async function refreshOta() {
-  try {
-    const status = await apiJson('/ota/status');
-    renderOta(status);
-  } catch (e) {
-    const el = document.getElementById('ota-box');
-    if (el) el.textContent = 'OTA-Status konnte nicht geladen werden: ' + e.message;
-  }
-}
-
-async function otaCheck() {
-  try {
-    await apiJson('/ota/check', 'POST');
-    setTimeout(refreshOta, 300);
-    setTimeout(refreshOta, 1500);
-  } catch (e) {
-    alert('OTA-Check fehlgeschlagen: ' + e.message);
-  }
-}
-
-async function otaUpdate() {
-  if (!confirm('Firmware-Update jetzt starten?')) return;
-  try {
-    await apiJson('/ota/update', 'POST');
-    setTimeout(refreshOta, 200);
-  } catch (e) {
-    alert('OTA-Update fehlgeschlagen: ' + e.message);
-  }
-}
-
-async function otaUploadFile() {
-  const input = document.getElementById('ota-file');
-  if (!input || !input.files || !input.files.length) {
-    alert('Bitte zuerst eine Firmware-Datei auswaehlen.');
-    return;
-  }
-
-  const file = input.files[0];
-  if (!confirm('Firmware-Datei jetzt hochladen und installieren?')) return;
-
-  const form = new FormData();
-  form.append('firmware', file, file.name);
-
-  setOtaProgress(0, 'Upload wird gestartet...');
-
-  try {
-    await new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open('POST', '/ota/upload');
-      xhr.upload.onprogress = (event) => {
-        if (!event.lengthComputable) return;
-        const percent = Math.round((event.loaded / event.total) * 100);
-        setOtaProgress(percent, 'Upload laeuft (' + percent + '% / ' +
-          formatBytes(event.loaded) + ' von ' + formatBytes(event.total) + ')');
-      };
-      xhr.onload = () => {
-        let json = {};
-        try { json = xhr.responseText ? JSON.parse(xhr.responseText) : {}; } catch (_) {}
-        if (xhr.status >= 200 && xhr.status < 300) {
-          resolve(json);
-          return;
-        }
-        reject(new Error(json.error || ('HTTP ' + xhr.status)));
-      };
-      xhr.onerror = () => reject(new Error('Upload-Verbindung fehlgeschlagen'));
-      xhr.send(form);
-    });
-    input.value = '';
-    setTimeout(refreshOta, 200);
-  } catch (e) {
-    alert('Firmware-Upload fehlgeschlagen: ' + e.message);
-    setTimeout(refreshOta, 200);
-  }
-}
-
-refreshOta();
-setInterval(refreshOta, 1000);
-</script>
-)rawliteral";
+  html += "<script src='/app.js'></script>";
   html += "</div></div></body></html>";
 
   return html;
