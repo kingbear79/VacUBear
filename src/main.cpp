@@ -304,6 +304,8 @@ String topicShowSet;
 String topicShowState;
 String topicLightSet;
 String topicLightState;
+String topicLightRgbSet;
+String topicLightRgbState;
 String topicLightRgbwSet;
 String topicLightRgbwState;
 String topicCfgShowLengthSet;
@@ -1912,6 +1914,7 @@ void mqttEnsureConnected()
   if (HAS_LED_OUTPUT)
   {
     mqttClient.subscribe(topicLightSet.c_str());
+    mqttClient.subscribe(topicLightRgbSet.c_str());
     mqttClient.subscribe(topicLightRgbwSet.c_str());
   }
   mqttClient.subscribe(topicCfgShowLengthSet.c_str());
@@ -1934,6 +1937,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
   // Erwartete Payloads:
   // - show/set: ON|OFF
   // - light/set: ON|OFF oder JSON
+  // - light/rgb/set: "r,g,b"
   // - light/rgbw/set: "r,g,b,w"
   // - config/*/set: Sekundenwerte
   String topicStr(topic);
@@ -1961,7 +1965,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
     return;
   }
 
-  if (!HAS_LED_OUTPUT && (topicStr == topicLightSet || topicStr == topicLightRgbwSet))
+  if (!HAS_LED_OUTPUT && (topicStr == topicLightSet || topicStr == topicLightRgbSet || topicStr == topicLightRgbwSet))
   {
     LOGD("Ignoring light MQTT command (LED_COUNT=0)");
     return;
@@ -2070,6 +2074,33 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
     }
     publishLightState(true);
     publishTelemetry(true);
+    return;
+  }
+
+  if (HAS_LED_OUTPUT && topicStr == topicLightRgbSet)
+  {
+    int r = -1;
+    int g = -1;
+    int b = -1;
+    int parsed = sscanf(payloadStr.c_str(), "%d,%d,%d", &r, &g, &b);
+    if (parsed == 3)
+    {
+      config.lightR = clampU8(r);
+      config.lightG = clampU8(g);
+      config.lightB = clampU8(b);
+      LOGI("Beleuchtung updated via RGB topic: %u,%u,%u", config.lightR, config.lightG, config.lightB);
+      if (!showStatus.isRunning)
+      {
+        requestLightPreview();
+      }
+      scheduleConfigSave();
+      publishLightState(true);
+      publishTelemetry(true);
+    }
+    else
+    {
+      LOGW("Invalid RGB payload on %s: %s", topicStr.c_str(), payloadStr.c_str());
+    }
     return;
   }
 
@@ -2201,9 +2232,11 @@ void publishLightState(bool retained)
     return;
   }
   mqttClient.publish(topicLightState.c_str(), config.lightEnabled ? "ON" : "OFF", retained);
+  String rgb = String(config.lightR) + "," + String(config.lightG) + "," + String(config.lightB);
+  mqttClient.publish(topicLightRgbState.c_str(), rgb.c_str(), retained);
   String rgbw = String(config.lightR) + "," + String(config.lightG) + "," + String(config.lightB) + "," + String(config.lightW);
   mqttClient.publish(topicLightRgbwState.c_str(), rgbw.c_str(), retained);
-  LOGD("MQTT TX light_state=%s rgbw=%s", config.lightEnabled ? "ON" : "OFF", rgbw.c_str());
+  LOGD("MQTT TX light_state=%s rgb=%s rgbw=%s", config.lightEnabled ? "ON" : "OFF", rgb.c_str(), rgbw.c_str());
 }
 
 void publishConfigState(bool retained)
@@ -2258,10 +2291,10 @@ void publishDiscovery()
     lightCfg["state_topic"] = topicLightState;
     lightCfg["payload_on"] = "ON";
     lightCfg["payload_off"] = "OFF";
-    lightCfg["rgbw_command_topic"] = topicLightRgbwSet;
-    lightCfg["rgbw_state_topic"] = topicLightRgbwState;
+    lightCfg["rgb_command_topic"] = topicLightRgbSet;
+    lightCfg["rgb_state_topic"] = topicLightRgbState;
     JsonArray colorModes = lightCfg["supported_color_modes"].to<JsonArray>();
-    colorModes.add("rgbw");
+    colorModes.add("rgb");
     lightCfg["availability_topic"] = topicAvailability;
     lightCfg["payload_available"] = "online";
     lightCfg["payload_not_available"] = "offline";
@@ -2690,6 +2723,8 @@ void updateMqttTopics()
   topicShowState = topicBase + "/show/state";
   topicLightSet = topicBase + "/light/set";
   topicLightState = topicBase + "/light/state";
+  topicLightRgbSet = topicBase + "/light/rgb/set";
+  topicLightRgbState = topicBase + "/light/rgb/state";
   topicLightRgbwSet = topicBase + "/light/rgbw/set";
   topicLightRgbwState = topicBase + "/light/rgbw/state";
   topicCfgShowLengthSet = topicBase + "/config/show_length_s/set";
