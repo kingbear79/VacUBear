@@ -1,5 +1,5 @@
 {
-  "version": "0.0.7-dev",
+  "version": "0.0.8-dev",
   "firmware_url": "http://ota.kinkbear.de/master/firmware.bin",
-  "notes": "Commit ade31d695e82"
+  "notes": "Commit 5ef2dee7dfea"
 }

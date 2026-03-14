@@ -129,8 +129,8 @@ Beispiel:
   "light_enabled": true,
   "light": {"r": 255, "g": 180, "b": 60, "w": 20},
   "ota": {
-    "current_version": "0.0.7-dev",
-    "latest_version": "0.0.7-dev",
+    "current_version": "0.0.8-dev",
+    "latest_version": "0.0.8-dev",
     "update_available": false
   }
 }
