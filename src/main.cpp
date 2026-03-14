@@ -382,6 +382,11 @@ void startAccessPoint(void);
 void setupCaptivePortal(void);
 void handleRoot(void);
 void handleSave(void);
+void handleApiConfigGet(void);
+void handleApiConfigPost(void);
+void handleApiShowGet(void);
+void handleApiShowPost(void);
+void handleApiLightGet(void);
 void handleLightConfig(void);
 void handleNotFound(void);
 void handleStatus(void);
@@ -398,12 +403,243 @@ bool isLegacyOtaManifestUrl(const String &url);
 String defaultApSsid(void);
 String defaultDeviceId(void);
 String rgbToHex(uint8_t r, uint8_t g, uint8_t b);
+void sanitizeConfig(void);
+void applyConfigToRuntime(bool wifiChanged, bool mqttChanged, bool publishStates = true);
+void buildLightStatusJson(JsonDocument &doc);
+void buildStatusJson(JsonDocument &doc);
+void buildOtaStatusJson(JsonDocument &doc);
+void buildConfigJson(JsonObject root);
+bool parseJsonBody(JsonDocument &doc, String &errorText);
+void sendJsonDocument(int statusCode, JsonDocument &doc);
+void sendJsonError(int statusCode, const String &errorText);
 uint32_t clampU32(uint32_t value, uint32_t minValue, uint32_t maxValue);
 uint32_t clampMinU32(uint32_t value, uint32_t minValue);
 uint32_t secToMs(uint32_t seconds);
 uint32_t msToSec(uint32_t milliseconds);
 uint8_t clampU8(int value);
 void scheduleConfigSave(void);
+
+void sanitizeConfig()
+{
+  config.wifiSsid.trim();
+  config.wifiPassword.trim();
+  config.mqttHost.trim();
+  config.mqttUser.trim();
+  config.mqttPassword.trim();
+  config.mqttTopic.trim();
+  config.otaManifestUrl.trim();
+  if (config.otaManifestUrl.length() == 0 || isLegacyOtaManifestUrl(config.otaManifestUrl))
+  {
+    config.otaManifestUrl = String(OTA_MANIFEST_URL);
+  }
+
+  if (config.mqttPort == 0)
+  {
+    config.mqttPort = 1883;
+  }
+  if (config.mqttTopic.length() == 0 || config.mqttTopic == "vacubear" || config.mqttTopic.startsWith("vacubear/"))
+  {
+    config.mqttTopic = deviceId;
+  }
+
+  config.showLengthMs = clampU32(config.showLengthMs, SHOW_LENGTH_MIN_MS, SHOW_LENGTH_MAX_MS);
+  config.showNachlaufMs = clampMinU32(config.showNachlaufMs, SHOW_NACHLAUF_MIN_MS);
+}
+
+void applyConfigToRuntime(bool wifiChanged, bool mqttChanged, bool publishStates)
+{
+  showStatus.showDuration = config.showLengthMs;
+  showStatus.showNachlauf = config.showNachlaufMs;
+
+  if (wifiChanged)
+  {
+    if (config.wifiSsid.length() == 0)
+    {
+      startAccessPoint();
+      if (!captivePortalEnabled)
+      {
+        setupCaptivePortal();
+      }
+    }
+    else
+    {
+      WiFi.mode(captivePortalEnabled ? WIFI_AP_STA : WIFI_STA);
+      WiFi.begin(config.wifiSsid.c_str(), config.wifiPassword.c_str());
+      wifiStartupPending = true;
+      wifiStartupAt = millis();
+      lastWifiRetryAt = wifiStartupAt;
+      bootIndicatorActive = HAS_LED_OUTPUT;
+    }
+  }
+
+  if (mqttChanged)
+  {
+    updateMqttTopics();
+    if (mqttClient.connected())
+    {
+      mqttClient.disconnect();
+    }
+    lastMqttReconnectAt = 0;
+  }
+
+  if (publishStates)
+  {
+    publishConfigState(true);
+    if (HAS_LED_OUTPUT)
+    {
+      publishLightState(true);
+    }
+    publishTelemetry(true);
+  }
+}
+
+void buildLightStatusJson(JsonDocument &doc)
+{
+  unsigned long now = millis();
+  doc["enabled"] = config.lightEnabled;
+  doc["preview_remaining_ms"] = isLightPreviewActive(now) ? (uint32_t)(lightControl.previewUntilAt - now) : 0;
+  doc["show_running"] = showStatus.isRunning;
+  JsonObject color = doc["color"].to<JsonObject>();
+  color["r"] = config.lightR;
+  color["g"] = config.lightG;
+  color["b"] = config.lightB;
+  color["w"] = config.lightW;
+}
+
+void buildStatusJson(JsonDocument &status)
+{
+  status["wifi_connected"] = WiFi.status() == WL_CONNECTED;
+  status["sta_ip"] = WiFi.localIP().toString();
+  status["ap_enabled"] = captivePortalEnabled;
+  status["ap_ip"] = WiFi.softAPIP().toString();
+  status["show_running"] = showStatus.isRunning;
+  status["show_length"] = config.showLengthMs;
+  status["show_nachlauf"] = config.showNachlaufMs;
+  status["pump_pwm"] = pumpControl.currentPwm;
+  status["pump_target_pwm"] = pumpControl.targetPwm;
+  if (HAS_LED_OUTPUT)
+  {
+    unsigned long now = millis();
+    status["light_enabled"] = config.lightEnabled;
+    status["led_count"] = LED_COUNT;
+    status["light_level"] = lightControl.currentLevel;
+    status["light_target_level"] = lightControl.targetLevel;
+    status["light_on_until_at"] = lightControl.onUntilAt;
+    status["light_preview_remaining_ms"] = isLightPreviewActive(now) ? (uint32_t)(lightControl.previewUntilAt - now) : 0;
+
+    JsonObject color = status["light"].to<JsonObject>();
+    color["r"] = config.lightR;
+    color["g"] = config.lightG;
+    color["b"] = config.lightB;
+    color["w"] = config.lightW;
+  }
+
+  JsonObject ota = status["ota"].to<JsonObject>();
+  ota["current_version"] = otaStatus.currentVersion;
+  ota["latest_version"] = otaStatus.latestVersion;
+  ota["update_available"] = otaStatus.updateAvailable;
+  ota["check_in_progress"] = otaStatus.checkInProgress;
+  ota["update_in_progress"] = otaStatus.updateInProgress;
+  ota["phase"] = otaStatus.phase;
+  ota["source"] = otaStatus.source;
+  ota["status_text"] = otaStatus.statusText;
+  ota["reboot_pending"] = otaStatus.rebootPending;
+  ota["progress_bytes"] = otaStatus.progressBytes;
+  ota["progress_total"] = otaStatus.progressTotal;
+  ota["progress_percent"] = otaStatus.progressPercent;
+  ota["last_error"] = otaStatus.lastError;
+  ota["last_check_ms"] = otaStatus.lastCheckAt;
+  ota["reboot_at_ms"] = otaStatus.rebootAt;
+}
+
+void buildOtaStatusJson(JsonDocument &status)
+{
+  status["configured"] = config.otaManifestUrl.length() > 0;
+  status["manifest_url"] = config.otaManifestUrl;
+  status["wifi_connected"] = WiFi.status() == WL_CONNECTED;
+  status["current_version"] = otaStatus.currentVersion;
+  status["latest_version"] = otaStatus.latestVersion;
+  status["firmware_url"] = otaStatus.firmwareUrl;
+  status["release_notes"] = otaStatus.releaseNotes;
+  status["update_available"] = otaStatus.updateAvailable;
+  status["check_in_progress"] = otaStatus.checkInProgress;
+  status["update_in_progress"] = otaStatus.updateInProgress;
+  status["phase"] = otaStatus.phase;
+  status["source"] = otaStatus.source;
+  status["status_text"] = otaStatus.statusText;
+  status["reboot_pending"] = otaStatus.rebootPending;
+  status["progress_bytes"] = otaStatus.progressBytes;
+  status["progress_total"] = otaStatus.progressTotal;
+  status["progress_percent"] = otaStatus.progressPercent;
+  status["last_error"] = otaStatus.lastError;
+  status["last_check_ms"] = otaStatus.lastCheckAt;
+  status["reboot_at_ms"] = otaStatus.rebootAt;
+  status["interval_ms"] = OTA_CHECK_INTERVAL_MS;
+}
+
+void buildConfigJson(JsonObject root)
+{
+  root["device_id"] = deviceId;
+  JsonObject wifi = root["wifi"].to<JsonObject>();
+  wifi["ssid"] = config.wifiSsid;
+  wifi["password_set"] = config.wifiPassword.length() > 0;
+
+  JsonObject mqtt = root["mqtt"].to<JsonObject>();
+  mqtt["host"] = config.mqttHost;
+  mqtt["port"] = config.mqttPort;
+  mqtt["user"] = config.mqttUser;
+  mqtt["password_set"] = config.mqttPassword.length() > 0;
+  mqtt["topic"] = config.mqttTopic;
+
+  JsonObject ota = root["ota"].to<JsonObject>();
+  ota["manifest_url"] = config.otaManifestUrl;
+
+  JsonObject show = root["show"].to<JsonObject>();
+  show["length_ms"] = config.showLengthMs;
+  show["nachlauf_ms"] = config.showNachlaufMs;
+  show["length_s"] = msToSec(config.showLengthMs);
+  show["nachlauf_s"] = msToSec(config.showNachlaufMs);
+
+  JsonObject light = root["light"].to<JsonObject>();
+  light["enabled"] = config.lightEnabled;
+  light["r"] = config.lightR;
+  light["g"] = config.lightG;
+  light["b"] = config.lightB;
+  light["w"] = config.lightW;
+}
+
+bool parseJsonBody(JsonDocument &doc, String &errorText)
+{
+  String raw = server.arg("plain");
+  if (raw.length() == 0)
+  {
+    errorText = "Leerer JSON-Body";
+    return false;
+  }
+
+  DeserializationError err = deserializeJson(doc, raw);
+  if (err)
+  {
+    errorText = String("JSON ungueltig: ") + err.c_str();
+    return false;
+  }
+  return true;
+}
+
+void sendJsonDocument(int statusCode, JsonDocument &doc)
+{
+  String out;
+  serializeJson(doc, out);
+  server.send(statusCode, "application/json", out);
+}
+
+void sendJsonError(int statusCode, const String &errorText)
+{
+  JsonDocument doc;
+  doc["ok"] = false;
+  doc["error"] = errorText;
+  sendJsonDocument(statusCode, doc);
+}
 
 void setup()
 {
@@ -2508,12 +2744,22 @@ void setupWebServer()
   // Web-API:
   // - "/"          Konfigseite
   // - "/save"      Konfig speichern + reboot
-  // - "/status"    Laufzeitstatus JSON
-  // - "/ota/*"     OTA-Status, Check, Update
+  // - "/status"    Laufzeitstatus JSON (legacy)
+  // - "/api/*"     REST-Endpunkte
+  // - "/ota/*"     OTA-Status, Check, Update (legacy + UI)
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/status", HTTP_GET, handleStatus);
+  server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/config", HTTP_GET, handleApiConfigGet);
+  server.on("/api/config", HTTP_POST, handleApiConfigPost);
+  server.on("/api/show", HTTP_GET, handleApiShowGet);
+  server.on("/api/show", HTTP_POST, handleApiShowPost);
+  server.on("/api/light", HTTP_GET, handleApiLightGet);
   server.on("/api/light", HTTP_POST, handleLightConfig);
+  server.on("/api/ota/status", HTTP_GET, handleOtaStatus);
+  server.on("/api/ota/check", HTTP_POST, handleOtaCheck);
+  server.on("/api/ota/update", HTTP_POST, handleOtaUpdate);
   server.on("/ota/status", HTTP_GET, handleOtaStatus);
   server.on("/ota/check", HTTP_POST, handleOtaCheck);
   server.on("/ota/update", HTTP_POST, handleOtaUpdate);
@@ -2599,35 +2845,8 @@ void handleSave()
     }
   }
 
-  config.wifiSsid.trim();
-  config.wifiPassword.trim();
-  config.mqttHost.trim();
-  config.mqttUser.trim();
-  config.mqttPassword.trim();
-  config.mqttTopic.trim();
-  config.otaManifestUrl.trim();
-  if (config.otaManifestUrl.length() == 0 || isLegacyOtaManifestUrl(config.otaManifestUrl))
-  {
-    config.otaManifestUrl = String(OTA_MANIFEST_URL);
-  }
-
-  if (config.mqttPort == 0)
-  {
-    config.mqttPort = 1883;
-  }
-  if (config.mqttTopic.length() == 0 || config.mqttTopic == "vacubear" || config.mqttTopic.startsWith("vacubear/"))
-  {
-    config.mqttTopic = deviceId;
-  }
-
-  showStatus.showDuration = config.showLengthMs;
-  showStatus.showNachlauf = config.showNachlaufMs;
-  publishConfigState(true);
-  if (HAS_LED_OUTPUT)
-  {
-    publishLightState(true);
-  }
-  publishTelemetry(true);
+  sanitizeConfig();
+  applyConfigToRuntime(true, true, true);
 
   if (!saveConfig())
   {
@@ -2642,66 +2861,407 @@ void handleSave()
   ESP.restart();
 }
 
+void handleApiConfigGet()
+{
+  LOGD("HTTP GET /api/config");
+  JsonDocument doc;
+  buildConfigJson(doc.to<JsonObject>());
+  sendJsonDocument(200, doc);
+}
+
+void handleApiConfigPost()
+{
+  LOGI("HTTP POST /api/config");
+  JsonDocument doc;
+  String errorText;
+  if (!parseJsonBody(doc, errorText))
+  {
+    sendJsonError(400, errorText);
+    return;
+  }
+
+  bool wifiChanged = false;
+  bool mqttChanged = false;
+  bool lightChanged = false;
+  bool lightColorChanged = false;
+
+  if (doc["wifi"].is<JsonObject>())
+  {
+    JsonObject wifi = doc["wifi"].as<JsonObject>();
+    if (!wifi["ssid"].isNull())
+    {
+      String value = wifi["ssid"].as<String>();
+      if (config.wifiSsid != value)
+      {
+        config.wifiSsid = value;
+        wifiChanged = true;
+      }
+    }
+    if (!wifi["password"].isNull())
+    {
+      String value = wifi["password"].as<String>();
+      if (config.wifiPassword != value)
+      {
+        config.wifiPassword = value;
+        wifiChanged = true;
+      }
+    }
+  }
+
+  if (doc["mqtt"].is<JsonObject>())
+  {
+    JsonObject mqtt = doc["mqtt"].as<JsonObject>();
+    if (!mqtt["host"].isNull())
+    {
+      String value = mqtt["host"].as<String>();
+      if (config.mqttHost != value)
+      {
+        config.mqttHost = value;
+        mqttChanged = true;
+      }
+    }
+    if (!mqtt["port"].isNull())
+    {
+      uint16_t value = (uint16_t)clampU32((uint32_t)mqtt["port"].as<unsigned long>(), 1, 65535);
+      if (config.mqttPort != value)
+      {
+        config.mqttPort = value;
+        mqttChanged = true;
+      }
+    }
+    if (!mqtt["user"].isNull())
+    {
+      String value = mqtt["user"].as<String>();
+      if (config.mqttUser != value)
+      {
+        config.mqttUser = value;
+        mqttChanged = true;
+      }
+    }
+    if (!mqtt["password"].isNull())
+    {
+      String value = mqtt["password"].as<String>();
+      if (config.mqttPassword != value)
+      {
+        config.mqttPassword = value;
+        mqttChanged = true;
+      }
+    }
+    if (!mqtt["topic"].isNull())
+    {
+      String value = mqtt["topic"].as<String>();
+      if (config.mqttTopic != value)
+      {
+        config.mqttTopic = value;
+        mqttChanged = true;
+      }
+    }
+  }
+
+  if (doc["ota"].is<JsonObject>())
+  {
+    JsonObject ota = doc["ota"].as<JsonObject>();
+    if (!ota["manifest_url"].isNull())
+    {
+      config.otaManifestUrl = ota["manifest_url"].as<String>();
+    }
+  }
+
+  if (doc["show"].is<JsonObject>())
+  {
+    JsonObject show = doc["show"].as<JsonObject>();
+    if (!show["length_ms"].isNull())
+    {
+      config.showLengthMs = clampU32(show["length_ms"].as<unsigned long>(), SHOW_LENGTH_MIN_MS, SHOW_LENGTH_MAX_MS);
+    }
+    else if (!show["length_s"].isNull())
+    {
+      config.showLengthMs = clampU32(secToMs(show["length_s"].as<unsigned long>()), SHOW_LENGTH_MIN_MS, SHOW_LENGTH_MAX_MS);
+    }
+
+    if (!show["nachlauf_ms"].isNull())
+    {
+      config.showNachlaufMs = clampMinU32(show["nachlauf_ms"].as<unsigned long>(), SHOW_NACHLAUF_MIN_MS);
+    }
+    else if (!show["nachlauf_s"].isNull())
+    {
+      config.showNachlaufMs = clampMinU32(secToMs(show["nachlauf_s"].as<unsigned long>()), SHOW_NACHLAUF_MIN_MS);
+    }
+  }
+
+  if (HAS_LED_OUTPUT && doc["light"].is<JsonObject>())
+  {
+    JsonObject light = doc["light"].as<JsonObject>();
+    if (!light["enabled"].isNull())
+    {
+      bool value = light["enabled"].as<bool>();
+      if (config.lightEnabled != value)
+      {
+        config.lightEnabled = value;
+        lightChanged = true;
+      }
+    }
+    if (!light["r"].isNull())
+    {
+      uint8_t value = clampU8(light["r"].as<int>());
+      if (config.lightR != value)
+      {
+        config.lightR = value;
+        lightChanged = true;
+        lightColorChanged = true;
+      }
+    }
+    if (!light["g"].isNull())
+    {
+      uint8_t value = clampU8(light["g"].as<int>());
+      if (config.lightG != value)
+      {
+        config.lightG = value;
+        lightChanged = true;
+        lightColorChanged = true;
+      }
+    }
+    if (!light["b"].isNull())
+    {
+      uint8_t value = clampU8(light["b"].as<int>());
+      if (config.lightB != value)
+      {
+        config.lightB = value;
+        lightChanged = true;
+        lightColorChanged = true;
+      }
+    }
+    if (!light["w"].isNull())
+    {
+      uint8_t value = clampU8(light["w"].as<int>());
+      if (config.lightW != value)
+      {
+        config.lightW = value;
+        lightChanged = true;
+        lightColorChanged = true;
+      }
+    }
+  }
+
+  sanitizeConfig();
+  if (!saveConfig())
+  {
+    sendJsonError(500, "Konfiguration konnte nicht gespeichert werden");
+    return;
+  }
+
+  if (lightColorChanged && !showStatus.isRunning)
+  {
+    requestLightPreview();
+  }
+  else if (!config.lightEnabled && !showStatus.isRunning)
+  {
+    lightControl.previewUntilAt = 0;
+  }
+
+  applyConfigToRuntime(wifiChanged, mqttChanged, true);
+
+  JsonDocument response;
+  response["ok"] = true;
+  response["wifi_changed"] = wifiChanged;
+  response["mqtt_changed"] = mqttChanged;
+  response["light_changed"] = lightChanged;
+  buildConfigJson(response["config"].to<JsonObject>());
+  sendJsonDocument(200, response);
+}
+
+void handleApiShowGet()
+{
+  LOGD("HTTP GET /api/show");
+  JsonDocument doc;
+  doc["running"] = showStatus.isRunning;
+  doc["phase"] = getShowPhase();
+  doc["length_ms"] = config.showLengthMs;
+  doc["nachlauf_ms"] = config.showNachlaufMs;
+  doc["end_at_ms"] = showStatus.endAt;
+  doc["open_valve_at_ms"] = showStatus.openValveAt;
+  sendJsonDocument(200, doc);
+}
+
+void handleApiShowPost()
+{
+  LOGI("HTTP POST /api/show");
+  JsonDocument doc;
+  String errorText;
+  if (!parseJsonBody(doc, errorText))
+  {
+    sendJsonError(400, errorText);
+    return;
+  }
+
+  String state = doc["state"] | "";
+  state.trim();
+  state.toUpperCase();
+  if (state == "ON")
+  {
+    startShow();
+  }
+  else if (state == "OFF")
+  {
+    stopShow();
+  }
+  else
+  {
+    sendJsonError(400, "state muss ON oder OFF sein");
+    return;
+  }
+
+  publishShowState(true);
+  publishTelemetry(true);
+  JsonDocument response;
+  response["ok"] = true;
+  response["queued_state"] = state;
+  response["running"] = showStatus.isRunning;
+  response["phase"] = getShowPhase();
+  sendJsonDocument(202, response);
+}
+
+void handleApiLightGet()
+{
+  LOGD("HTTP GET /api/light");
+  if (!HAS_LED_OUTPUT)
+  {
+    sendJsonError(404, "Keine LED-Hardware konfiguriert");
+    return;
+  }
+  JsonDocument doc;
+  buildLightStatusJson(doc);
+  sendJsonDocument(200, doc);
+}
+
 void handleLightConfig()
 {
   LOGI("HTTP /api/light requested");
   if (!HAS_LED_OUTPUT)
   {
-    server.send(404, "application/json", "{\"error\":\"Keine LED-Hardware konfiguriert\"}");
+    sendJsonError(404, "Keine LED-Hardware konfiguriert");
     return;
   }
 
   bool changed = false;
   bool colorChanged = false;
-  bool previewRequested = server.hasArg("preview") && server.arg("preview") != "0";
+  bool previewRequested = false;
+  JsonDocument requestDoc;
+  String errorText;
+  bool hasJsonBody = server.arg("plain").length() > 0;
 
-  if (server.hasArg("enabled"))
+  if (hasJsonBody)
   {
-    bool newEnabled = server.arg("enabled") != "0";
-    if (config.lightEnabled != newEnabled)
+    if (!parseJsonBody(requestDoc, errorText))
     {
-      config.lightEnabled = newEnabled;
-      changed = true;
+      sendJsonError(400, errorText);
+      return;
+    }
+    if (!requestDoc["enabled"].isNull())
+    {
+      bool newEnabled = requestDoc["enabled"].as<bool>();
+      if (config.lightEnabled != newEnabled)
+      {
+        config.lightEnabled = newEnabled;
+        changed = true;
+      }
+    }
+    if (!requestDoc["preview"].isNull())
+    {
+      previewRequested = requestDoc["preview"].as<bool>();
+    }
+    if (!requestDoc["r"].isNull())
+    {
+      uint8_t value = clampU8(requestDoc["r"].as<int>());
+      if (config.lightR != value)
+      {
+        config.lightR = value;
+        changed = true;
+        colorChanged = true;
+      }
+    }
+    if (!requestDoc["g"].isNull())
+    {
+      uint8_t value = clampU8(requestDoc["g"].as<int>());
+      if (config.lightG != value)
+      {
+        config.lightG = value;
+        changed = true;
+        colorChanged = true;
+      }
+    }
+    if (!requestDoc["b"].isNull())
+    {
+      uint8_t value = clampU8(requestDoc["b"].as<int>());
+      if (config.lightB != value)
+      {
+        config.lightB = value;
+        changed = true;
+        colorChanged = true;
+      }
+    }
+    if (!requestDoc["w"].isNull())
+    {
+      uint8_t value = clampU8(requestDoc["w"].as<int>());
+      if (config.lightW != value)
+      {
+        config.lightW = value;
+        changed = true;
+        colorChanged = true;
+      }
     }
   }
-  if (server.hasArg("r"))
+  else
   {
-    uint8_t value = clampU8(server.arg("r").toInt());
-    if (config.lightR != value)
+    previewRequested = server.hasArg("preview") && server.arg("preview") != "0";
+    if (server.hasArg("enabled"))
     {
-      config.lightR = value;
-      changed = true;
-      colorChanged = true;
+      bool newEnabled = server.arg("enabled") != "0";
+      if (config.lightEnabled != newEnabled)
+      {
+        config.lightEnabled = newEnabled;
+        changed = true;
+      }
     }
-  }
-  if (server.hasArg("g"))
-  {
-    uint8_t value = clampU8(server.arg("g").toInt());
-    if (config.lightG != value)
+    if (server.hasArg("r"))
     {
-      config.lightG = value;
-      changed = true;
-      colorChanged = true;
+      uint8_t value = clampU8(server.arg("r").toInt());
+      if (config.lightR != value)
+      {
+        config.lightR = value;
+        changed = true;
+        colorChanged = true;
+      }
     }
-  }
-  if (server.hasArg("b"))
-  {
-    uint8_t value = clampU8(server.arg("b").toInt());
-    if (config.lightB != value)
+    if (server.hasArg("g"))
     {
-      config.lightB = value;
-      changed = true;
-      colorChanged = true;
+      uint8_t value = clampU8(server.arg("g").toInt());
+      if (config.lightG != value)
+      {
+        config.lightG = value;
+        changed = true;
+        colorChanged = true;
+      }
     }
-  }
-  if (server.hasArg("w"))
-  {
-    uint8_t value = clampU8(server.arg("w").toInt());
-    if (config.lightW != value)
+    if (server.hasArg("b"))
     {
-      config.lightW = value;
-      changed = true;
-      colorChanged = true;
+      uint8_t value = clampU8(server.arg("b").toInt());
+      if (config.lightB != value)
+      {
+        config.lightB = value;
+        changed = true;
+        colorChanged = true;
+      }
+    }
+    if (server.hasArg("w"))
+    {
+      uint8_t value = clampU8(server.arg("w").toInt());
+      if (config.lightW != value)
+      {
+        config.lightW = value;
+        changed = true;
+        colorChanged = true;
+      }
     }
   }
 
@@ -2721,102 +3281,26 @@ void handleLightConfig()
     publishTelemetry(true);
   }
 
-  unsigned long now = millis();
   JsonDocument status;
-  status["enabled"] = config.lightEnabled;
+  buildLightStatusJson(status);
   status["preview_requested"] = previewRequested || colorChanged;
-  status["preview_remaining_ms"] = isLightPreviewActive(now) ? (uint32_t)(lightControl.previewUntilAt - now) : 0;
-  JsonObject color = status["color"].to<JsonObject>();
-  color["r"] = config.lightR;
-  color["g"] = config.lightG;
-  color["b"] = config.lightB;
-  color["w"] = config.lightW;
-  String out;
-  serializeJson(status, out);
-  server.send(200, "application/json", out);
+  sendJsonDocument(200, status);
 }
 
 void handleStatus()
 {
   LOGD("HTTP GET /status");
   JsonDocument status;
-  status["wifi_connected"] = WiFi.status() == WL_CONNECTED;
-  status["sta_ip"] = WiFi.localIP().toString();
-  status["ap_enabled"] = captivePortalEnabled;
-  status["ap_ip"] = WiFi.softAPIP().toString();
-  status["show_running"] = showStatus.isRunning;
-  status["show_length"] = config.showLengthMs;
-  status["show_nachlauf"] = config.showNachlaufMs;
-  status["pump_pwm"] = pumpControl.currentPwm;
-  status["pump_target_pwm"] = pumpControl.targetPwm;
-  if (HAS_LED_OUTPUT)
-  {
-    unsigned long now = millis();
-    status["light_enabled"] = config.lightEnabled;
-    status["led_count"] = LED_COUNT;
-    status["light_level"] = lightControl.currentLevel;
-    status["light_target_level"] = lightControl.targetLevel;
-    status["light_on_until_at"] = lightControl.onUntilAt;
-    status["light_preview_remaining_ms"] = isLightPreviewActive(now) ? (uint32_t)(lightControl.previewUntilAt - now) : 0;
-
-    JsonObject color = status["light"].to<JsonObject>();
-    color["r"] = config.lightR;
-    color["g"] = config.lightG;
-    color["b"] = config.lightB;
-    color["w"] = config.lightW;
-  }
-
-  JsonObject ota = status["ota"].to<JsonObject>();
-  ota["current_version"] = otaStatus.currentVersion;
-  ota["latest_version"] = otaStatus.latestVersion;
-  ota["update_available"] = otaStatus.updateAvailable;
-  ota["check_in_progress"] = otaStatus.checkInProgress;
-  ota["update_in_progress"] = otaStatus.updateInProgress;
-  ota["phase"] = otaStatus.phase;
-  ota["source"] = otaStatus.source;
-  ota["status_text"] = otaStatus.statusText;
-  ota["reboot_pending"] = otaStatus.rebootPending;
-  ota["progress_bytes"] = otaStatus.progressBytes;
-  ota["progress_total"] = otaStatus.progressTotal;
-  ota["progress_percent"] = otaStatus.progressPercent;
-  ota["last_error"] = otaStatus.lastError;
-  ota["last_check_ms"] = otaStatus.lastCheckAt;
-  ota["reboot_at_ms"] = otaStatus.rebootAt;
-
-  String out;
-  serializeJson(status, out);
-  server.send(200, "application/json", out);
+  buildStatusJson(status);
+  sendJsonDocument(200, status);
 }
 
 void handleOtaStatus()
 {
   LOGD("HTTP GET /ota/status");
   JsonDocument status;
-  status["configured"] = config.otaManifestUrl.length() > 0;
-  status["manifest_url"] = config.otaManifestUrl;
-  status["wifi_connected"] = WiFi.status() == WL_CONNECTED;
-  status["current_version"] = otaStatus.currentVersion;
-  status["latest_version"] = otaStatus.latestVersion;
-  status["firmware_url"] = otaStatus.firmwareUrl;
-  status["release_notes"] = otaStatus.releaseNotes;
-  status["update_available"] = otaStatus.updateAvailable;
-  status["check_in_progress"] = otaStatus.checkInProgress;
-  status["update_in_progress"] = otaStatus.updateInProgress;
-  status["phase"] = otaStatus.phase;
-  status["source"] = otaStatus.source;
-  status["status_text"] = otaStatus.statusText;
-  status["reboot_pending"] = otaStatus.rebootPending;
-  status["progress_bytes"] = otaStatus.progressBytes;
-  status["progress_total"] = otaStatus.progressTotal;
-  status["progress_percent"] = otaStatus.progressPercent;
-  status["last_error"] = otaStatus.lastError;
-  status["last_check_ms"] = otaStatus.lastCheckAt;
-  status["reboot_at_ms"] = otaStatus.rebootAt;
-  status["interval_ms"] = OTA_CHECK_INTERVAL_MS;
-
-  String out;
-  serializeJson(status, out);
-  server.send(200, "application/json", out);
+  buildOtaStatusJson(status);
+  sendJsonDocument(200, status);
 }
 
 void handleOtaCheck()
@@ -3106,30 +3590,7 @@ void loadConfig()
     saveConfig();
   }
 
-  config.wifiSsid.trim();
-  config.wifiPassword.trim();
-  config.mqttHost.trim();
-  config.mqttUser.trim();
-  config.mqttPassword.trim();
-  config.mqttTopic.trim();
-  config.otaManifestUrl.trim();
-  if (config.otaManifestUrl.length() == 0 || isLegacyOtaManifestUrl(config.otaManifestUrl))
-  {
-    config.otaManifestUrl = String(OTA_MANIFEST_URL);
-  }
-
-  if (config.mqttPort == 0)
-  {
-    config.mqttPort = 1883;
-  }
-  if (config.mqttTopic.length() == 0 || config.mqttTopic == "vacubear" || config.mqttTopic.startsWith("vacubear/"))
-  {
-    config.mqttTopic = deviceId;
-  }
-
-  config.showLengthMs = clampU32(config.showLengthMs, SHOW_LENGTH_MIN_MS, SHOW_LENGTH_MAX_MS);
-  config.showNachlaufMs = clampMinU32(config.showNachlaufMs, SHOW_NACHLAUF_MIN_MS);
-
+  sanitizeConfig();
   showStatus.showDuration = config.showLengthMs;
   showStatus.showNachlauf = config.showNachlaufMs;
 }

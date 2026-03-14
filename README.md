@@ -68,6 +68,316 @@ Das Skript deployed branchbezogen nach:
 - `http://ota.kinkbear.de/<branch>/manifest.json`
 - `http://ota.kinkbear.de/<branch>/firmware.bin`
 
+## REST-API
+
+Die REST-API nutzt bewusst die bereits vorhandene `ESP8266WebServer`-Instanz. Es wird keine zusaetzliche HTTP-Bibliothek und kein zweiter Server gestartet. Das haelt den Speicherdruck auf dem ESP8266 niedrig und vermeidet doppelte Logik.
+
+Rahmenbedingungen:
+
+- Format: JSON fuer Anfrage und Antwort
+- Schreibende Requests: `POST`
+- Lesende Requests: `GET`
+- Authentifizierung: derzeit keine
+- Passwort-Felder sind in Lese-Responses absichtlich **nicht** im Klartext enthalten. Stattdessen werden nur `password_set`-Flags geliefert.
+- Die bisherigen UI-/Legacy-Endpunkte wie `/status` und `/ota/*` bleiben aus Kompatibilitaetsgruenden erhalten.
+
+### REST-Endpunkte
+
+| Endpoint | Methode | Zweck |
+| --- | --- | --- |
+| `/api/status` | `GET` | Laufzeitstatus des Geraets |
+| `/api/config` | `GET` | Aktuelle Konfiguration ohne Klartext-Passwoerter |
+| `/api/config` | `POST` | Teilweises Aktualisieren der Konfiguration |
+| `/api/show` | `GET` | Aktueller Show-Status |
+| `/api/show` | `POST` | Show starten oder stoppen |
+| `/api/light` | `GET` | Aktueller Beleuchtungsstatus |
+| `/api/light` | `POST` | Beleuchtung konfigurieren und optional Vorschau ausloesen |
+| `/api/ota/status` | `GET` | OTA-Status und letzter Update-Check |
+| `/api/ota/check` | `POST` | OTA-Manifest-Pruefung anstossen |
+| `/api/ota/update` | `POST` | OTA-Installation starten, wenn ein Update verfuegbar ist |
+
+### `GET /api/status`
+
+Liefert den kompakten Laufzeitstatus fuer UIs, Health-Checks oder externe Automationen.
+
+Wichtige Felder:
+
+- `wifi_connected`
+- `sta_ip`
+- `ap_enabled`
+- `show_running`
+- `show_length`
+- `show_nachlauf`
+- `pump_pwm`
+- `pump_target_pwm`
+- `light_enabled`
+- `light_level`
+- `light_target_level`
+- `light_preview_remaining_ms`
+- `ota.*`
+
+Beispiel:
+
+```json
+{
+  "wifi_connected": true,
+  "sta_ip": "192.168.1.42",
+  "show_running": false,
+  "show_length": 10000,
+  "show_nachlauf": 20000,
+  "pump_pwm": 0,
+  "light_enabled": true,
+  "light": {"r": 255, "g": 180, "b": 60, "w": 20},
+  "ota": {
+    "current_version": "0.0.7-dev",
+    "latest_version": "0.0.7-dev",
+    "update_available": false
+  }
+}
+```
+
+### `GET /api/config`
+
+Liefert die aktuell gespeicherte Konfiguration. Passwoerter werden nicht im Klartext zurueckgegeben.
+
+Beispiel:
+
+```json
+{
+  "device_id": "vacubear-AABBCCDDEEFF",
+  "wifi": {
+    "ssid": "MeinWLAN",
+    "password_set": true
+  },
+  "mqtt": {
+    "host": "192.168.1.10",
+    "port": 1883,
+    "user": "mqtt-user",
+    "password_set": true,
+    "topic": "vacubear-AABBCCDDEEFF"
+  },
+  "ota": {
+    "manifest_url": "http://ota.kinkbear.de/master/manifest.json"
+  },
+  "show": {
+    "length_ms": 10000,
+    "nachlauf_ms": 20000,
+    "length_s": 10,
+    "nachlauf_s": 20
+  },
+  "light": {
+    "enabled": true,
+    "r": 255,
+    "g": 255,
+    "b": 255,
+    "w": 0
+  }
+}
+```
+
+### `POST /api/config`
+
+Aktualisiert Konfigurationswerte partiell. Nicht vorhandene Felder bleiben unveraendert. Die Felder werden nach denselben Regeln wie im Webinterface validiert und begrenzt.
+
+Unterstuetzte Bloecke:
+
+- `wifi.ssid`
+- `wifi.password`
+- `mqtt.host`
+- `mqtt.port`
+- `mqtt.user`
+- `mqtt.password`
+- `mqtt.topic`
+- `ota.manifest_url`
+- `show.length_ms` oder `show.length_s`
+- `show.nachlauf_ms` oder `show.nachlauf_s`
+- `light.enabled`
+- `light.r`
+- `light.g`
+- `light.b`
+- `light.w`
+
+Wirkung zur Laufzeit:
+
+- WiFi-Aenderungen stossen direkt einen neuen Verbindungsaufbau an
+- MQTT-Aenderungen initialisieren die MQTT-Topics neu und triggern einen Reconnect
+- Show- und Lichtwerte werden sofort uebernommen
+- Eine Farbaenderung ausserhalb der Show startet automatisch die 5-Sekunden-Vorschau
+
+Beispiel-Request:
+
+```json
+{
+  "mqtt": {
+    "host": "192.168.1.20",
+    "port": 1883,
+    "topic": "vacubear-labor"
+  },
+  "show": {
+    "length_s": 12,
+    "nachlauf_s": 25
+  },
+  "light": {
+    "enabled": true,
+    "r": 255,
+    "g": 120,
+    "b": 40,
+    "w": 30
+  }
+}
+```
+
+Beispiel-Response:
+
+```json
+{
+  "ok": true,
+  "wifi_changed": false,
+  "mqtt_changed": true,
+  "light_changed": true,
+  "config": {
+    "device_id": "vacubear-AABBCCDDEEFF"
+  }
+}
+```
+
+### `GET /api/show`
+
+Liefert den aktuellen Show-Zustand mit Phase und Zeitstempeln.
+
+Wichtige Felder:
+
+- `running`
+- `phase`
+- `length_ms`
+- `nachlauf_ms`
+- `end_at_ms`
+- `open_valve_at_ms`
+
+### `POST /api/show`
+
+Steuert die Show direkt.
+
+Request:
+
+```json
+{
+  "state": "ON"
+}
+```
+
+Zulaessige Werte:
+
+- `ON`
+- `OFF`
+
+Hinweis: Der Start ist intern asynchron. Die Firmware setzt ein Start-Flag und uebernimmt die Zeitberechnung im naechsten `loop()`-Durchlauf.
+
+### `GET /api/light`
+
+Liefert den aktuellen Beleuchtungsstatus.
+
+Wichtige Felder:
+
+- `enabled`
+- `preview_remaining_ms`
+- `show_running`
+- `color.r`
+- `color.g`
+- `color.b`
+- `color.w`
+
+### `POST /api/light`
+
+Unterstuetzt sowohl `application/json` als auch `application/x-www-form-urlencoded`, damit derselbe Endpunkt vom Webinterface und von externen Clients genutzt werden kann.
+
+Unterstuetzte Felder:
+
+- `enabled`
+- `r`
+- `g`
+- `b`
+- `w`
+- `preview`
+
+Beispiel:
+
+```json
+{
+  "enabled": true,
+  "r": 255,
+  "g": 180,
+  "b": 80,
+  "w": 20,
+  "preview": true
+}
+```
+
+Verhalten:
+
+- `enabled` schaltet die Show-Beleuchtung logisch frei oder aus
+- RGBW-Werte aktualisieren die gespeicherte Beleuchtung
+- `preview = true` startet eine 5-Sekunden-Vorschau ausserhalb einer laufenden Show
+
+### `GET /api/ota/status`
+
+Liefert den aktuellen OTA-Status.
+
+Wichtige Felder:
+
+- `configured`
+- `manifest_url`
+- `current_version`
+- `latest_version`
+- `firmware_url`
+- `release_notes`
+- `update_available`
+- `check_in_progress`
+- `update_in_progress`
+- `phase`
+- `status_text`
+- `progress_bytes`
+- `progress_total`
+- `progress_percent`
+- `last_error`
+
+### `POST /api/ota/check`
+
+Stoesst einen Manifest-Check an. Der Request queued den Check nur. Der eigentliche Ablauf passiert asynchron in `loop()`.
+
+Erfolgsantwort:
+
+```json
+{
+  "ok": true,
+  "queued": true
+}
+```
+
+Typische Fehlerbedingungen:
+
+- OTA-Manifest-URL fehlt
+- WLAN nicht verbunden
+- bereits laufender OTA-Check oder Update
+
+### `POST /api/ota/update`
+
+Startet die Installation eines bereits gefundenen Updates. Auch hier wird der Vorgang nur in die Firmware-Loop eingereiht.
+
+Voraussetzungen:
+
+- WLAN verbunden
+- keine laufende Show
+- kein paralleler OTA-Vorgang
+- `update_available = true`
+
+### Speicher- und Sicherheitsbewertung
+
+- Die REST-API ist auf dem vorhandenen Webserver implementiert und benoetigt keine weitere Netzwerkschicht.
+- JSON-Dokumente bleiben bewusst klein und thematisch getrennt, um Heap und Fragmentierung zu begrenzen.
+- Im letzten Build liegt der RAM-Verbrauch bei `55260 / 81920`, Flash bei `550339 / 1044464`.
+- Die API ist derzeit ungeschuetzt. Sie sollte deshalb nur in vertrauenswuerdigen Netzen oder hinter einer vorgeschalteten Absicherung genutzt werden.
+
 ## MQTT und Home Assistant
 
 ### Basislogik
