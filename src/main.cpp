@@ -385,6 +385,7 @@ void handleSave(void);
 void handleAppJs(void);
 void handleApiConfigGet(void);
 void handleApiConfigPost(void);
+void handleApiWifiScan(void);
 void handleApiShowGet(void);
 void handleApiShowPost(void);
 void handleApiLightGet(void);
@@ -2769,6 +2770,7 @@ void setupWebServer()
   server.on("/save", HTTP_POST, handleSave);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/wifi/scan", HTTP_GET, handleApiWifiScan);
   server.on("/api/config", HTTP_GET, handleApiConfigGet);
   server.on("/api/config", HTTP_POST, handleApiConfigPost);
   server.on("/api/show", HTTP_GET, handleApiShowGet);
@@ -2857,6 +2859,92 @@ function requestJson(path, method, body, contentType, onSuccess, onError, timeou
 
 function apiJson(path, method, onSuccess, onError, timeoutMs) {
   requestJson(path, method || 'GET', null, null, onSuccess, onError, timeoutMs);
+}
+
+function describeWifiNetwork(network) {
+  var parts = [];
+  var rssi = Number(network && network.rssi);
+  if (network && network.secure) {
+    parts.push('gesichert');
+  } else {
+    parts.push('offen');
+  }
+  if (!isNaN(rssi) && rssi !== 0) {
+    parts.push(rssi + ' dBm');
+  }
+  return parts.join(' | ');
+}
+
+function renderWifiNetworks(networks) {
+  var select = document.getElementById('wifi-network-list');
+  var status = document.getElementById('wifi-scan-status');
+  var ssidInput = document.getElementById('ssid');
+  var currentSsid = ssidInput ? ssidInput.value : '';
+  var i;
+  var option;
+  if (!select) return;
+  select.options.length = 0;
+  if (!networks || !networks.length) {
+    option = document.createElement('option');
+    option.value = '';
+    option.text = 'Keine Netzwerke gefunden';
+    select.appendChild(option);
+    if (status) status.innerHTML = 'Es wurden keine sichtbaren WLAN-Netzwerke gefunden.';
+    return;
+  }
+  for (i = 0; i < networks.length; i++) {
+    option = document.createElement('option');
+    option.value = networks[i].ssid || '';
+    option.text = (networks[i].ssid || '(ohne SSID)') + ' - ' + describeWifiNetwork(networks[i]);
+    if (currentSsid && option.value === currentSsid) {
+      option.selected = true;
+    }
+    select.appendChild(option);
+  }
+  if (status) {
+    status.innerHTML = String(networks.length) + ' WLAN-Netzwerke gefunden.';
+  }
+}
+
+function applySelectedWifiSsid() {
+  var select = document.getElementById('wifi-network-list');
+  var ssidInput = document.getElementById('ssid');
+  if (!select || !ssidInput || !select.value) return;
+  ssidInput.value = select.value;
+}
+
+function refreshWifiScan() {
+  var status = document.getElementById('wifi-scan-status');
+  if (status) {
+    status.innerHTML = 'Suche nach verfuegbaren WLAN-Netzwerken...';
+  }
+  apiJson(
+    '/api/wifi/scan',
+    'GET',
+    function(response) {
+      renderWifiNetworks(response.networks || []);
+    },
+    function(error) {
+      if (status) {
+        status.innerHTML = 'WLAN-Scan fehlgeschlagen: ' + error.message;
+      }
+    },
+    15000
+  );
+}
+
+function initWifiControls() {
+  var select = document.getElementById('wifi-network-list');
+  var status = document.getElementById('wifi-scan-status');
+  if (!select) return;
+  select.onchange = applySelectedWifiSsid;
+  if (select.options && select.options.length) {
+    if (status) {
+      status.innerHTML = String(select.options.length) + ' WLAN-Netzwerke vorgeladen.';
+    }
+  } else if (status) {
+    status.innerHTML = 'Noch keine WLAN-Netzwerke geladen.';
+  }
 }
 
 function formatBytes(value) {
@@ -3193,6 +3281,7 @@ function initLightControls() {
 }
 
 refreshOta();
+initWifiControls();
 initLightControls();
 )rawliteral";
   server.send_P(200, "application/javascript", APP_JS);
@@ -3277,6 +3366,35 @@ void handleSave()
   sendHtmlPage("Gespeichert. Das Geraet startet neu...");
   delay(500);
   ESP.restart();
+}
+
+void handleApiWifiScan()
+{
+  LOGD("HTTP GET /api/wifi/scan");
+  int networkCount = WiFi.scanNetworks();
+  if (networkCount < 0)
+  {
+    sendJsonError(500, "WLAN-Scan fehlgeschlagen");
+    return;
+  }
+
+  JsonDocument doc;
+  JsonArray networks = doc["networks"].to<JsonArray>();
+  for (int i = 0; i < networkCount; i++)
+  {
+    String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0)
+    {
+      continue;
+    }
+    JsonObject network = networks.add<JsonObject>();
+    network["ssid"] = ssid;
+    network["rssi"] = WiFi.RSSI(i);
+    network["secure"] = WiFi.encryptionType(i) != ENC_TYPE_NONE;
+  }
+  WiFi.scanDelete();
+  doc["ok"] = true;
+  sendJsonDocument(200, doc);
 }
 
 void handleApiConfigGet()
@@ -4264,7 +4382,7 @@ String buildHtmlPage(const String &message)
   // Einfache, eingebettete Setup-Seite ohne externe Assets.
   // Vorteil: laeuft auch im AP/Captive-Portal-Modus robust.
   int networkCount = WiFi.scanNetworks();
-  String options;
+  String networkOptions;
   if (networkCount > 0)
   {
     for (int i = 0; i < networkCount; i++)
@@ -4274,7 +4392,17 @@ String buildHtmlPage(const String &message)
       {
         continue;
       }
-      options += "<option value='" + htmlEscape(ssid) + "'>";
+      String optionText = htmlEscape(ssid) + " - ";
+      optionText += (WiFi.encryptionType(i) == ENC_TYPE_NONE) ? "offen" : "gesichert";
+      optionText += " | ";
+      optionText += String(WiFi.RSSI(i));
+      optionText += " dBm";
+      networkOptions += "<option value='" + htmlEscape(ssid) + "'";
+      if (ssid == config.wifiSsid)
+      {
+        networkOptions += " selected";
+      }
+      networkOptions += ">" + optionText + "</option>";
     }
   }
   WiFi.scanDelete();
@@ -4293,10 +4421,11 @@ String buildHtmlPage(const String &message)
   html += ".wrap{max-width:760px;margin:24px auto;padding:0 14px;}";
   html += ".card{background:#fff;border-radius:12px;padding:16px;box-shadow:0 6px 22px rgba(0,0,0,.08);}";
   html += "label{display:block;font-weight:600;margin-top:12px;}";
-  html += "input{width:100%;padding:10px;border-radius:8px;border:1px solid #c8d1db;margin-top:6px;box-sizing:border-box;}";
+  html += "input,select{width:100%;padding:10px;border-radius:8px;border:1px solid #c8d1db;margin-top:6px;box-sizing:border-box;}";
   html += "input[type='checkbox']{width:auto;margin:0;}";
   html += "input[type='range']{padding:0;border:0;}";
   html += "input[type='color']{padding:4px;height:52px;}";
+  html += "select[size]{min-height:150px;}";
   html += "button{margin-top:16px;padding:11px 16px;background:#005bbb;color:#fff;border:0;border-radius:8px;font-weight:700;cursor:pointer;}";
   html += ".btn-secondary{background:#4b5563;margin-right:10px;}";
   html += ".btn-danger{background:#b91c1c;}";
@@ -4327,8 +4456,20 @@ String buildHtmlPage(const String &message)
   }
 
   html += "<form method='post' action='/save'>";
-  html += "<label>WiFi SSID</label><input name='ssid' list='ssid-list' value='" + htmlEscape(config.wifiSsid) + "' required>";
-  html += "<datalist id='ssid-list'>" + options + "</datalist>";
+  html += "<label for='ssid'>WiFi SSID</label><input id='ssid' name='ssid' value='" + htmlEscape(config.wifiSsid) + "' required>";
+  html += "<label for='wifi-network-list'>Verfuegbare WLAN-Netzwerke</label>";
+  html += "<select id='wifi-network-list' size='6'>";
+  if (networkOptions.length() > 0)
+  {
+    html += networkOptions;
+  }
+  else
+  {
+    html += "<option value=''>Keine Netzwerke gefunden</option>";
+  }
+  html += "</select>";
+  html += "<div class='row'><button type='button' class='btn-secondary' onclick='applySelectedWifiSsid()'>Auswahl uebernehmen</button><button type='button' class='btn-upload' onclick='refreshWifiScan()'>Netzwerke aktualisieren</button></div>";
+  html += "<div id='wifi-scan-status' class='small'></div>";
   html += "<label>WiFi Passwort</label><input name='wifi_password' type='password' value='" + htmlEscape(config.wifiPassword) + "'>";
   html += "<label>MQTT Host</label><input name='mqtt_host' value='" + htmlEscape(config.mqttHost) + "'>";
   html += "<label>MQTT Port</label><input name='mqtt_port' type='number' min='1' max='65535' value='" + String(config.mqttPort) + "'>";
