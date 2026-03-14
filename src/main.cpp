@@ -2810,9 +2810,29 @@ function parseJsonText(text) {
   }
 }
 
-function requestJson(path, method, body, contentType, onSuccess, onError) {
+var otaPollTimer = null;
+var otaPollFailureCount = 0;
+var otaLocalBusyState = '';
+
+function otaSetLocalBusyState(state) {
+  otaLocalBusyState = state || '';
+}
+
+function otaClearLocalBusyState() {
+  otaLocalBusyState = '';
+}
+
+function scheduleOtaRefresh(delayMs) {
+  if (otaPollTimer) {
+    clearTimeout(otaPollTimer);
+  }
+  otaPollTimer = setTimeout(refreshOta, Math.max(0, Number(delayMs || 0)));
+}
+
+function requestJson(path, method, body, contentType, onSuccess, onError, timeoutMs) {
   var xhr = new XMLHttpRequest();
   xhr.open(method || 'GET', path, true);
+  xhr.timeout = Number(timeoutMs || 8000);
   if (contentType) {
     xhr.setRequestHeader('Content-Type', contentType);
   }
@@ -2829,11 +2849,14 @@ function requestJson(path, method, body, contentType, onSuccess, onError) {
   xhr.onerror = function() {
     if (onError) onError(new Error('Verbindung fehlgeschlagen'), {}, xhr);
   };
+  xhr.ontimeout = function() {
+    if (onError) onError(new Error('Zeitueberschreitung beim Warten auf Antwort'), {}, xhr);
+  };
   xhr.send(body || null);
 }
 
-function apiJson(path, method, onSuccess, onError) {
-  requestJson(path, method || 'GET', null, null, onSuccess, onError);
+function apiJson(path, method, onSuccess, onError, timeoutMs) {
+  requestJson(path, method || 'GET', null, null, onSuccess, onError, timeoutMs);
 }
 
 function formatBytes(value) {
@@ -2984,7 +3007,13 @@ function renderOta(status) {
   var el = document.getElementById('ota-box');
   var text = '';
   var progressText = status.status_text || status.phase || 'Bereit';
+  var busy = !!(status.check_in_progress || status.update_in_progress || status.reboot_pending ||
+    status.phase === 'queued' || status.phase === 'checking' || status.phase === 'downloading' || status.phase === 'flashing');
   if (!el) return;
+  otaPollFailureCount = 0;
+  if (!busy) {
+    otaClearLocalBusyState();
+  }
   text += 'Konfiguriert: ' + (status.configured ? 'ja' : 'nein') + '<br>';
   text += 'Manifest URL: ' + (status.manifest_url || '-') + '<br>';
   text += 'WLAN verbunden: ' + (status.wifi_connected ? 'ja' : 'nein') + '<br>';
@@ -3010,6 +3039,31 @@ function renderOta(status) {
     progressText += ' - Neustart ausstehend';
   }
   setOtaProgress(status.progress_percent || 0, progressText);
+  scheduleOtaRefresh(busy ? 2000 : 5000);
+}
+
+function renderOtaOfflineHint(error) {
+  var el = document.getElementById('ota-box');
+  var message = '';
+  if (!el) return;
+  if (otaLocalBusyState === 'update') {
+    message = 'Online-Update wurde gestartet.<br>' +
+      'Waehend Download, Flash und Neustart antwortet das Geraet zeitweise nicht auf Statusabfragen.<br>' +
+      'Bitte das Geraet in dieser Phase nicht manuell neu starten oder ausschalten.<br>' +
+      'Letzter Verbindungsfehler: ' + (error && error.message ? error.message : 'unbekannt');
+    el.innerHTML = message;
+    setOtaProgress(100, 'Update laeuft oder Neustart wird vorbereitet. Verbindung wird erneut geprueft...');
+    return;
+  }
+  if (otaLocalBusyState === 'check') {
+    message = 'OTA-Pruefung wurde gestartet.<br>' +
+      'Waehend der Pruefung kann die Statusabfrage kurzzeitig aussetzen.<br>' +
+      'Letzter Verbindungsfehler: ' + (error && error.message ? error.message : 'unbekannt');
+    el.innerHTML = message;
+    setOtaProgress(0, 'Pruefe erneut auf Rueckmeldung...');
+    return;
+  }
+  el.innerHTML = 'OTA-Status konnte nicht geladen werden: ' + (error && error.message ? error.message : 'unbekannt');
 }
 
 function refreshOta() {
@@ -3020,9 +3074,19 @@ function refreshOta() {
       renderOta(status);
     },
     function(error) {
-      var el = document.getElementById('ota-box');
-      if (el) el.innerHTML = 'OTA-Status konnte nicht geladen werden: ' + error.message;
-    }
+      otaPollFailureCount += 1;
+      renderOtaOfflineHint(error);
+      if (otaLocalBusyState === 'update') {
+        scheduleOtaRefresh(Math.min(15000, 4000 + (otaPollFailureCount * 1000)));
+        return;
+      }
+      if (otaLocalBusyState === 'check') {
+        scheduleOtaRefresh(Math.min(10000, 2500 + (otaPollFailureCount * 1000)));
+        return;
+      }
+      scheduleOtaRefresh(8000);
+    },
+    2500
   );
 }
 
@@ -3031,12 +3095,15 @@ function otaCheck() {
     '/ota/check',
     'POST',
     function() {
-      setTimeout(refreshOta, 300);
-      setTimeout(refreshOta, 1500);
+      otaSetLocalBusyState('check');
+      setOtaProgress(0, 'OTA-Pruefung wurde gestartet...');
+      scheduleOtaRefresh(400);
     },
     function(error) {
       alert('OTA-Check fehlgeschlagen: ' + error.message);
-    }
+      scheduleOtaRefresh(2000);
+    },
+    5000
   );
 }
 
@@ -3046,11 +3113,15 @@ function otaUpdate() {
     '/ota/update',
     'POST',
     function() {
-      setTimeout(refreshOta, 200);
+      otaSetLocalBusyState('update');
+      setOtaProgress(100, 'Online-Update wurde gestartet. Das Geraet kann waehrend Download, Flash und Neustart kurzzeitig nicht antworten.');
+      scheduleOtaRefresh(1500);
     },
     function(error) {
       alert('OTA-Update fehlgeschlagen: ' + error.message);
-    }
+      scheduleOtaRefresh(2000);
+    },
+    5000
   );
 }
 
@@ -3123,7 +3194,6 @@ function initLightControls() {
 
 refreshOta();
 initLightControls();
-setInterval(refreshOta, 1000);
 )rawliteral";
   server.send_P(200, "application/javascript", APP_JS);
 }
@@ -3670,6 +3740,8 @@ void handleOtaCheck()
     return;
   }
 
+  otaStatus.lastError = "";
+  otaResetProgress("queued", "manifest", "OTA-Pruefung wurde gestartet");
   otaCheckRequested = true;
   server.send(202, "application/json", "{\"ok\":true,\"queued\":true}");
 }
@@ -3698,6 +3770,8 @@ void handleOtaUpdate()
     return;
   }
 
+  otaStatus.lastError = "";
+  otaResetProgress("queued", "manifest", "Online-Update wurde gestartet");
   otaUpdateRequested = true;
   server.send(202, "application/json", "{\"ok\":true,\"queued\":true}");
 }
