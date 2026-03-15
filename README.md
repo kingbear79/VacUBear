@@ -2,6 +2,11 @@
 
 Dieses Projekt laeuft auf ESP8266/ESP-12F und steuert Pumpen, Ventil, OTA und die optionale RGBW-Beleuchtung fuer VacUBear.
 
+## Dokumentation
+
+- Technische Projekt- und Schnittstellenbeschreibung: [README.md](/Users/christianschweden/Documents/PlatformIO/Projects/VacUBear/README.md)
+- Endbenutzer-Handbuch: [docs/ENDUSER_HANDBUCH.md](/Users/christianschweden/Documents/PlatformIO/Projects/VacUBear/docs/ENDUSER_HANDBUCH.md)
+
 ## Build
 
 - PlatformIO Environment: `esp12f`
