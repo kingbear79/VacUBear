@@ -424,6 +424,7 @@ void setupCaptivePortal(void);
 void handleRoot(void);
 void handleSave(void);
 void handleAppJs(void);
+void handleCaptiveProbe(void);
 void handleApiConfigGet(void);
 void handleApiConfigPost(void);
 void handleApiWifiScan(void);
@@ -3029,6 +3030,15 @@ void setupWebServer()
   // - "/ota/*"     OTA-Status, Check, Update (legacy + UI)
   server.on("/", HTTP_GET, handleRoot);
   server.on("/app.js", HTTP_GET, handleAppJs);
+  server.on("/generate_204", HTTP_GET, handleCaptiveProbe);
+  server.on("/gen_204", HTTP_GET, handleCaptiveProbe);
+  server.on("/hotspot-detect.html", HTTP_GET, handleCaptiveProbe);
+  server.on("/library/test/success.html", HTTP_GET, handleCaptiveProbe);
+  server.on("/success.txt", HTTP_GET, handleCaptiveProbe);
+  server.on("/connecttest.txt", HTTP_GET, handleCaptiveProbe);
+  server.on("/redirect", HTTP_GET, handleCaptiveProbe);
+  server.on("/fwlink", HTTP_GET, handleCaptiveProbe);
+  server.on("/ncsi.txt", HTTP_GET, handleCaptiveProbe);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/api/status", HTTP_GET, handleStatus);
@@ -3547,6 +3557,16 @@ initWifiControls();
 initLightControls();
 )rawliteral";
   server.send_P(200, "application/javascript", APP_JS);
+}
+
+void handleCaptiveProbe()
+{
+  LOGD("HTTP captive probe: %s", server.uri().c_str());
+  if (handleCaptivePortalRedirect())
+  {
+    return;
+  }
+  sendHtmlPage();
 }
 
 void handleSave()
