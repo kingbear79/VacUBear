@@ -97,6 +97,7 @@ static const uint16_t LIGHT_LEVEL_MAX = 1023;
 static const uint32_t LIGHT_UPDATE_MS = 20UL;
 static const uint32_t BUTTON_LIGHT_TOGGLE_MS = 3000UL;
 static const uint32_t BUTTON_AP_MODE_MS = 10000UL;
+static const uint32_t BUTTON_BOOT_GUARD_MS = 1200UL;
 static const uint32_t BOOT_PULSE_PERIOD_MS = 1600UL;
 static const uint16_t BOOT_PULSE_LEVEL_MIN = 32;
 static const uint16_t BOOT_PULSE_LEVEL_MAX = 768;
@@ -358,8 +359,10 @@ bool apModeIndicatorActive = false;
 unsigned long buttonPressedAt = 0;
 bool buttonApModeTriggered = false;
 bool buttonLightToggleArmed = false;
+bool buttonInputUnlocked = false;
+unsigned long buttonUnlockAt = 0;
 #if LED_COUNT > 0
-NeoPixelBus<NeoGrbwFeature, NeoEsp8266BitBang800KbpsMethod> lightBus(LED_COUNT, PIN_LED);
+NeoPixelBus<NeoGrbwFeature, NeoEsp8266BitBangSk6812Method> lightBus(LED_COUNT, PIN_LED);
 #endif
 
 // -----------------------------------------------------------------------------
@@ -405,6 +408,7 @@ void mqttLoop(void);
 void mqttEnsureConnected(void);
 void mqttCallback(char *topic, byte *payload, unsigned int length);
 void updateMqttTopics(void);
+void clearStaleCommandTopics(void);
 void publishAvailability(const char *state, bool retained = true);
 void publishShowState(bool retained = true);
 void publishLightState(bool retained = true);
@@ -717,6 +721,8 @@ void setup()
   digitalWrite(PIN_VENTIL, LOW);
 
   button.begin();
+  buttonInputUnlocked = false;
+  buttonUnlockAt = millis() + BUTTON_BOOT_GUARD_MS;
 
   if (!LittleFS.begin())
   {
@@ -810,6 +816,20 @@ void loop()
 void handleButtonInput()
 {
   button.read();
+
+  if (!buttonInputUnlocked)
+  {
+    if (millis() < buttonUnlockAt || button.isPressed())
+    {
+      return;
+    }
+    buttonInputUnlocked = true;
+    buttonPressedAt = 0;
+    buttonApModeTriggered = false;
+    buttonLightToggleArmed = false;
+    LOGI("Button input unlocked after boot guard");
+    return;
+  }
 
   if (button.wasPressed())
   {
@@ -2074,6 +2094,23 @@ void mqttLoop()
   mqttClient.loop();
 }
 
+void clearStaleCommandTopics()
+{
+  // Command-Topics sollten nicht retained sein.
+  // Loescht alte retained Kommandos, damit beim Power-On keine stale Befehle
+  // (z. B. show/set=ON) direkt nach dem Subscribe wieder zugestellt werden.
+  mqttClient.publish(topicShowSet.c_str(), "", true);
+  if (HAS_LED_OUTPUT)
+  {
+    mqttClient.publish(topicLightSet.c_str(), "", true);
+    mqttClient.publish(topicLightRgbSet.c_str(), "", true);
+    mqttClient.publish(topicLightRgbwSet.c_str(), "", true);
+  }
+  mqttClient.publish(topicCfgShowLengthSet.c_str(), "", true);
+  mqttClient.publish(topicCfgNachlaufSet.c_str(), "", true);
+  mqttClient.publish(topicOtaInstall.c_str(), "", true);
+}
+
 void mqttEnsureConnected()
 {
   // Nicht blockierender Reconnect mit Zeitabstand, damit loop() reaktiv bleibt.
@@ -2120,6 +2157,7 @@ void mqttEnsureConnected()
   }
 
   LOGI("MQTT connected");
+  clearStaleCommandTopics();
 
   mqttClient.subscribe(topicShowSet.c_str());
   if (HAS_LED_OUTPUT)
