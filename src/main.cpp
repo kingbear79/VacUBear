@@ -362,7 +362,7 @@ bool buttonLightToggleArmed = false;
 bool buttonInputUnlocked = false;
 unsigned long buttonUnlockAt = 0;
 #if LED_COUNT > 0
-NeoPixelBus<NeoGrbwFeature, NeoEsp8266BitBangSk6812Method> lightBus(LED_COUNT, PIN_LED);
+NeoPixelBus<NeoGrbwFeature, NeoEsp8266BitBangSk6812NoIntrMethod> lightBus(LED_COUNT, PIN_LED);
 #endif
 
 // -----------------------------------------------------------------------------
@@ -862,8 +862,8 @@ void handleButtonInput()
     return;
   }
 
-  unsigned long pressedMs = (buttonPressedAt > 0) ? (button.lastChange() - buttonPressedAt) : 0;
-  LOGI("Button released after %lu ms", pressedMs);
+  unsigned long pressDurationMs = (buttonPressedAt > 0) ? (button.lastChange() - buttonPressedAt) : 0;
+  LOGI("Button released after %lu ms", pressDurationMs);
 
   if (buttonApModeTriggered)
   {
