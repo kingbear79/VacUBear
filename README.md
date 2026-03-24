@@ -256,8 +256,10 @@ Wichtige Felder:
 - `phase`
 - `length_ms`
 - `nachlauf_ms`
+- `fade_in_done_at_ms`
 - `end_at_ms`
 - `open_valve_at_ms`
+- `finish_at_ms`
 
 ### `POST /api/show`
 
@@ -468,13 +470,15 @@ Detailfelder:
 | `WiFi.Status` | `Connected` oder `Disconnected` |
 | `Show.Aktiv` | `true`, wenn die Show gerade laeuft |
 | `Show.Status` | `ON` oder `OFF` |
-| `Show.Phase` | `Pause`, `Vakuumieren`, `Haltezeit` oder `Belueften` |
+| `Show.Phase` | `Pause`, `FadeIn`, `Vakuumieren`, `Haltezeit` oder `FadeOut` |
 | `Show.LaengeMs` | Show-Laenge in Millisekunden |
 | `Show.NachlaufMs` | Nachlaufzeit in Millisekunden |
 | `Show.LaengeS` | Show-Laenge in Sekunden |
 | `Show.NachlaufS` | Nachlaufzeit in Sekunden |
-| `Show.EndAt` | Zeitstempel fuer Show-Ende in `millis()` |
+| `Show.FadeInDoneAt` | Zeitstempel, ab dem Pumpen und Ventil umgeschaltet werden duerfen |
+| `Show.EndAt` | Zeitstempel fuer das Ende der Vakuumierphase in `millis()` |
 | `Show.OpenValveAt` | Zeitstempel fuer das Oeffnen des Ventils in `millis()` |
+| `Show.FinishAt` | Zeitstempel fuer das Ende der Show nach dem FadeOut |
 | `Pumpen.PWM` | Aktuell ausgegebener PWM-Wert |
 | `Pumpen.TargetPWM` | Ziel-PWM fuer Softstart/Softstop |
 | `Lichtfarbe.Enabled` | Gespeicherte Show-Freigabe fuer die Beleuchtung |

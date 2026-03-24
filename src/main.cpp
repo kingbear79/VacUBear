@@ -163,23 +163,28 @@ struct AppConfig
 // Laufzeitstatus der Show.
 //
 // Begriffe:
-// - now < endAt        -> "Vakuumieren" (Pumpen AN, Ventil geschlossen)
-// - endAt .. openValve -> "Haltezeit"   (Pumpen AUS, Ventil geschlossen)
-// - >= openValveAt     -> "Belueften"   (Ventil offen) bis Show-Ende
+// - now < fadeInDoneAt -> "FadeIn"      (nur Licht blendet ein)
+// - fadeInDoneAt .. endAt        -> "Vakuumieren" (Pumpen AN, Ventil geschlossen)
+// - endAt .. openValveAt         -> "Haltezeit"   (Pumpen AUS, Ventil geschlossen)
+// - openValveAt .. finishAt      -> "FadeOut"     (Ventil offen, Licht blendet aus)
 class ShowStatus
 {
 public:
   bool isRunning;
+  unsigned long fadeInDoneAt;
   unsigned long endAt;
   unsigned long openValveAt;
+  unsigned long finishAt;
   bool shouldStart;
   unsigned long showDuration;
   unsigned long showNachlauf;
 
   ShowStatus()
       : isRunning(false),
+        fadeInDoneAt(0),
         endAt(0),
         openValveAt(0),
+        finishAt(0),
         shouldStart(false),
         showDuration(SHOW_LENGTH),
         showNachlauf(SHOW_NACHLAUF)
@@ -931,8 +936,7 @@ void startShow()
 
 void stopShow()
 {
-  // Stop erzwingt den fruehen Uebergang in die Belueften-Phase:
-  // endAt/openValveAt werden auf "sofort" gesetzt (kleine Sicherheitstoleranz).
+  // Stop erzwingt den fruehen Uebergang in die Belueften-/FadeOut-Phase.
   if (!showStatus.isRunning)
   {
     LOGD("stopShow ignored: not running");
@@ -940,10 +944,13 @@ void stopShow()
   }
   LOGI("stopShow requested");
   unsigned long stopAt = millis() + 10;
+  unsigned long fadeOutMs = (HAS_LED_OUTPUT && config.lightEnabled) ? LED_FADE_OUT_MS : 0UL;
+  showStatus.fadeInDoneAt = stopAt;
   showStatus.endAt = stopAt;
   showStatus.openValveAt = stopAt;
-  lightControl.onUntilAt = showStatus.openValveAt + LED_AFTER_BELUEFTEN_MS;
-  LOGD("Light hold updated after stop: onUntilAt=%lu", lightControl.onUntilAt);
+  showStatus.finishAt = stopAt + fadeOutMs;
+  lightControl.onUntilAt = showStatus.openValveAt;
+  LOGD("Show stop transitions: openValveAt=%lu finishAt=%lu", showStatus.openValveAt, showStatus.finishAt);
 }
 
 void handleShow()
@@ -952,27 +959,45 @@ void handleShow()
   // Alle Aktoren werden hier konsistent aus "Zeitfenster + Status" abgeleitet.
   if (showStatus.shouldStart)
   {
-    showStatus.endAt = millis() + showStatus.showDuration;
+    unsigned long now = millis();
+    unsigned long fadeInMs = (HAS_LED_OUTPUT && config.lightEnabled) ? LED_FADE_IN_MS : 0UL;
+    unsigned long fadeOutMs = (HAS_LED_OUTPUT && config.lightEnabled) ? LED_FADE_OUT_MS : 0UL;
+    showStatus.fadeInDoneAt = now + fadeInMs;
+    showStatus.endAt = showStatus.fadeInDoneAt + showStatus.showDuration;
     showStatus.openValveAt = showStatus.endAt + showStatus.showNachlauf;
+    showStatus.finishAt = showStatus.openValveAt + fadeOutMs;
     showStatus.shouldStart = false;
     showStatus.isRunning = true;
-    lightControl.onUntilAt = showStatus.openValveAt + LED_AFTER_BELUEFTEN_MS;
+    lightControl.onUntilAt = showStatus.openValveAt;
     setLightTargetLevel(LIGHT_LEVEL_MAX);
-    LOGI("Show started: Vakuumieren=%lu ms, Haltezeit=%lu ms", showStatus.showDuration, showStatus.showNachlauf);
-    LOGD("Light hold until %lu", lightControl.onUntilAt);
+    LOGI("Show started: FadeIn=%lu ms, Vakuumieren=%lu ms, Haltezeit=%lu ms, FadeOut=%lu ms",
+         fadeInMs, showStatus.showDuration, showStatus.showNachlauf, fadeOutMs);
+    LOGD("Show timeline: fadeInDoneAt=%lu endAt=%lu openValveAt=%lu finishAt=%lu",
+         showStatus.fadeInDoneAt, showStatus.endAt, showStatus.openValveAt, showStatus.finishAt);
   }
 
   if (showStatus.isRunning)
   {
-    if (millis() < showStatus.endAt)
+    unsigned long now = millis();
+    if (now < showStatus.fadeInDoneAt)
+    {
+      setPumpTarget(false);
+      digitalWrite(PIN_VENTIL, LOW);
+    }
+    else if (now < showStatus.endAt)
     {
       setPumpTarget(true);
       digitalWrite(PIN_VENTIL, HIGH);
     }
-    else if (millis() < showStatus.openValveAt)
+    else if (now < showStatus.openValveAt)
     {
       setPumpTarget(false);
       digitalWrite(PIN_VENTIL, HIGH);
+    }
+    else if (now < showStatus.finishAt)
+    {
+      setPumpTarget(false);
+      digitalWrite(PIN_VENTIL, LOW);
     }
     else
     {
@@ -1372,8 +1397,8 @@ void applyBootIndicator()
 void updateLightControl()
 {
   // Licht ist aktiv:
-  // - waehrend showStatus.isRunning
-  // - plus Nachlauf LED_AFTER_BELUEFTEN_MS nach Belueftungsbeginn
+  // - waehrend FadeIn, Vakuumieren und Haltezeit
+  // - nicht waehrend FadeOut; dort blendet das Licht kontrolliert aus
   if (updateLightFeedback())
   {
     return;
@@ -1386,7 +1411,7 @@ void updateLightControl()
   }
 
   unsigned long now = millis();
-  bool lightWindowActive = config.lightEnabled && showStatus.isRunning;
+  bool lightWindowActive = config.lightEnabled && showStatus.isRunning && (int32_t)(showStatus.openValveAt - now) > 0;
   if (!lightWindowActive && config.lightEnabled && lightControl.onUntilAt > 0)
   {
     lightWindowActive = (int32_t)(lightControl.onUntilAt - now) > 0;
@@ -1448,6 +1473,10 @@ void setSafeOutputState()
   bootIndicatorActive = false;
   showStatus.shouldStart = false;
   showStatus.isRunning = false;
+  showStatus.fadeInDoneAt = 0;
+  showStatus.endAt = 0;
+  showStatus.openValveAt = 0;
+  showStatus.finishAt = 0;
   setPumpTarget(false);
   pumpControl.currentPwm = 0;
   applyPumpPwm(0);
@@ -2913,6 +2942,10 @@ const char *getShowPhase()
   unsigned long now = millis();
   if (showStatus.isRunning)
   {
+    if (now < showStatus.fadeInDoneAt)
+    {
+      return "FadeIn";
+    }
     if (now < showStatus.endAt)
     {
       return "Vakuumieren";
@@ -2921,12 +2954,12 @@ const char *getShowPhase()
     {
       return "Haltezeit";
     }
-    return "Belueften";
+    return "FadeOut";
   }
 
-  if (showStatus.openValveAt > 0 && (now - showStatus.openValveAt) < 2000UL)
+  if (showStatus.finishAt > 0 && (now - showStatus.finishAt) < 2000UL)
   {
-    return "Belueften";
+    return "FadeOut";
   }
   return "Pause";
 }
@@ -2965,8 +2998,10 @@ void publishTelemetry(bool force)
   show["NachlaufMs"] = config.showNachlaufMs;
   show["LaengeS"] = msToSec(config.showLengthMs);
   show["NachlaufS"] = msToSec(config.showNachlaufMs);
+  show["FadeInDoneAt"] = showStatus.fadeInDoneAt;
   show["EndAt"] = showStatus.endAt;
   show["OpenValveAt"] = showStatus.openValveAt;
+  show["FinishAt"] = showStatus.finishAt;
 
   JsonObject pumpen = doc["Pumpen"].to<JsonObject>();
   pumpen["PWM"] = pumpControl.currentPwm;
@@ -4000,8 +4035,10 @@ void handleApiShowGet()
   doc["phase"] = getShowPhase();
   doc["length_ms"] = config.showLengthMs;
   doc["nachlauf_ms"] = config.showNachlaufMs;
+  doc["fade_in_done_at_ms"] = showStatus.fadeInDoneAt;
   doc["end_at_ms"] = showStatus.endAt;
   doc["open_valve_at_ms"] = showStatus.openValveAt;
+  doc["finish_at_ms"] = showStatus.finishAt;
   sendJsonDocument(200, doc);
 }
 
@@ -4040,6 +4077,10 @@ void handleApiShowPost()
   response["queued_state"] = state;
   response["running"] = showStatus.isRunning;
   response["phase"] = getShowPhase();
+  response["fade_in_done_at_ms"] = showStatus.fadeInDoneAt;
+  response["end_at_ms"] = showStatus.endAt;
+  response["open_valve_at_ms"] = showStatus.openValveAt;
+  response["finish_at_ms"] = showStatus.finishAt;
   sendJsonDocument(202, response);
 }
 
