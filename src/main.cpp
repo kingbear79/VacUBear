@@ -355,6 +355,7 @@ String topicCfgShowLengthState;
 String topicCfgNachlaufSet;
 String topicCfgNachlaufState;
 String topicOtaInstall;
+String topicOtaState;
 String topicAvailability;
 String topicTeleState;
 PumpSoftControl pumpControl;
@@ -364,6 +365,7 @@ OtaStatus otaStatus;
 bool otaCheckRequested = false;
 bool otaUpdateRequested = false;
 bool otaBootCheckPending = true;
+uint8_t otaLastPublishedProgressPercent = 255;
 bool wifiStartupPending = false;
 unsigned long wifiStartupAt = 0;
 bool bootIndicatorActive = false;
@@ -427,6 +429,7 @@ void publishAvailability(const char *state, bool retained = true);
 void publishShowState(bool retained = true);
 void publishLightState(bool retained = true);
 void publishConfigState(bool retained = true);
+void publishOtaUpdateState(bool retained = true);
 void publishDiscovery(void);
 void publishUpdateDiscovery(void);
 void publishSensorDiscovery(void);
@@ -639,6 +642,36 @@ void buildOtaStatusJson(JsonDocument &status)
   status["last_check_ms"] = otaStatus.lastCheckAt;
   status["reboot_at_ms"] = otaStatus.rebootAt;
   status["interval_ms"] = OTA_CHECK_INTERVAL_MS;
+}
+
+void publishOtaUpdateState(bool retained)
+{
+  if (!mqttClient.connected())
+  {
+    return;
+  }
+
+  JsonDocument doc;
+  const bool installBusy = otaStatus.updateInProgress || otaStatus.rebootPending;
+  const bool hasPendingUpdate = otaStatus.updateAvailable || installBusy;
+  const String effectiveLatestVersion = hasPendingUpdate && otaStatus.latestVersion.length() > 0
+                                            ? otaStatus.latestVersion
+                                            : otaStatus.currentVersion;
+
+  doc["installed_version"] = otaStatus.currentVersion;
+  doc["latest_version"] = effectiveLatestVersion;
+  doc["title"] = "VacUBear Firmware";
+  doc["release_summary"] = otaStatus.releaseNotes;
+  doc["in_progress"] = installBusy;
+  if (installBusy)
+  {
+    doc["update_percentage"] = otaStatus.rebootPending ? 100 : otaStatus.progressPercent;
+  }
+
+  String payload;
+  serializeJson(doc, payload);
+  mqttClient.publish(topicOtaState.c_str(), payload.c_str(), retained);
+  LOGD("MQTT TX ota_update_state=%s", payload.c_str());
 }
 
 void buildConfigJson(JsonObject root)
@@ -1616,14 +1649,23 @@ void otaResetProgress(const String &phase, const String &source, const String &s
   otaStatus.progressBytes = 0;
   otaStatus.progressTotal = 0;
   otaStatus.progressPercent = 0;
+  otaLastPublishedProgressPercent = 255;
   otaStatus.rebootPending = false;
   otaStatus.rebootAt = 0;
+  if (mqttClient.connected())
+  {
+    publishOtaUpdateState(true);
+  }
 }
 
 void otaSetPhase(const String &phase, const String &statusText)
 {
   otaStatus.phase = phase;
   otaStatus.statusText = statusText.length() > 0 ? statusText : phase;
+  if (mqttClient.connected())
+  {
+    publishOtaUpdateState(true);
+  }
 }
 
 void otaSetProgress(size_t current, size_t total)
@@ -1643,10 +1685,23 @@ void otaSetProgress(size_t current, size_t total)
   {
     otaStatus.progressPercent = 0;
   }
+  if (mqttClient.connected())
+  {
+    if (otaStatus.progressPercent == 100 ||
+        otaLastPublishedProgressPercent == 255 ||
+        otaStatus.progressPercent == 0 ||
+        otaStatus.progressPercent >= (uint8_t)(otaLastPublishedProgressPercent + 5))
+    {
+      otaLastPublishedProgressPercent = otaStatus.progressPercent;
+      publishOtaUpdateState(true);
+    }
+  }
 }
 
 void otaScheduleRestart(const String &statusText)
 {
+  otaStatus.currentVersion = otaStatus.latestVersion.length() > 0 ? otaStatus.latestVersion : otaStatus.currentVersion;
+  otaStatus.updateAvailable = false;
   otaStatus.updateInProgress = false;
   otaStatus.rebootPending = true;
   otaStatus.rebootAt = millis() + OTA_RESTART_DELAY_MS;
@@ -1668,6 +1723,7 @@ void otaFinalizeFailure(const String &errorText)
   otaSetPhase("failed", errorText.length() > 0 ? errorText : "OTA-Update fehlgeschlagen");
   if (mqttClient.connected())
   {
+    publishOtaUpdateState(true);
     publishTelemetry(true);
   }
 }
@@ -2017,10 +2073,9 @@ bool otaApplyUpdate()
   setSafeOutputState();
   if (mqttClient.connected())
   {
+    publishOtaUpdateState(true);
     publishTelemetry(true);
-    publishAvailability("offline", true);
   }
-  mqttClient.disconnect();
 
   BearSSL::WiFiClientSecure secureClient;
   WiFiClient plainClient;
@@ -2270,6 +2325,7 @@ void mqttEnsureConnected()
     publishLightState(true);
   }
   publishConfigState(true);
+  publishOtaUpdateState(true);
   publishTelemetry(true);
 }
 
@@ -2678,8 +2734,7 @@ void publishUpdateDiscovery()
   cfg["device_class"] = "firmware";
   cfg["command_topic"] = topicOtaInstall;
   cfg["payload_install"] = "install";
-  cfg["state_topic"] = topicTeleState;
-  cfg["value_template"] = "{{ {'installed_version': value_json.OTA.CurrentVersion, 'latest_version': value_json.OTA.LatestVersion, 'title': 'VacUBear Firmware', 'release_summary': value_json.OTA.ReleaseNotes, 'in_progress': value_json.OTA.UpdateInProgress } | to_json }}";
+  cfg["state_topic"] = topicOtaState;
   cfg["availability_topic"] = topicAvailability;
   cfg["payload_available"] = "online";
   cfg["payload_not_available"] = "offline";
@@ -3080,6 +3135,7 @@ void updateMqttTopics()
   topicCfgNachlaufSet = topicBase + "/config/nachlauf_s/set";
   topicCfgNachlaufState = topicBase + "/config/nachlauf_s/state";
   topicOtaInstall = topicBase + "/ota/update/install";
+  topicOtaState = topicBase + "/ota/update/state";
   topicAvailability = topicBase + "/availability";
   topicTeleState = "tele/" + deviceId + "/STATE";
   LOGI("MQTT topics initialized: base=%s", topicBase.c_str());

@@ -421,6 +421,7 @@ Voraussetzungen:
 | `<base>/config/nachlauf_s/set` | zu Geraet | Ganzzahl in Sekunden | Setzt die Nachlaufzeit |
 | `<base>/config/nachlauf_s/state` | vom Geraet | Ganzzahl in Sekunden | Aktuell gespeicherte Nachlaufzeit |
 | `<base>/ota/update/install` | zu Geraet | `install` | Startet ein OTA-Update, wenn bereits ein Update gefunden wurde |
+| `<base>/ota/update/state` | vom Geraet | JSON | Retainter OTA-Zustand fuer Home Assistant (`installed_version`, `latest_version`, `in_progress`, `update_percentage`) |
 | `<base>/availability` | vom Geraet | `online`, `offline` | MQTT-Verfuegbarkeit des Moduls |
 | `tele/<deviceId>/STATE` | vom Geraet | JSON | Sammeltelemetrie fuer HA, Diagnose und Automationen |
 
