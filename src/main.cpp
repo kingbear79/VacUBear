@@ -12,7 +12,10 @@
 #include <ArduinoJson.h>
 #include "pins.h"
 #if LED_COUNT > 0
-#include <NeoPixelBus.h>
+extern "C"
+{
+#include "esp8266_peri.h"
+}
 #endif
 
 // -----------------------------------------------------------------------------
@@ -104,6 +107,10 @@ static const uint16_t BOOT_PULSE_LEVEL_MAX = 768;
 static const uint32_t LIGHT_FEEDBACK_ON_MS = 160UL;
 static const uint32_t LIGHT_FEEDBACK_OFF_MS = 140UL;
 static const uint8_t LIGHT_FEEDBACK_BLINK_COUNT = 3;
+static const uint32_t SK6812_BIT_TOTAL_NS = 1250UL;
+static const uint32_t SK6812_T0H_NS = 350UL;
+static const uint32_t SK6812_T1H_NS = 700UL;
+static const uint32_t SK6812_RESET_US = 90UL;
 static const uint32_t TELEMETRY_INTERVAL_MS = TELEMETRY_INTERVAL_MS_CFG;
 
 static const char *CONFIG_FILE = "/config.json";
@@ -362,7 +369,7 @@ bool buttonLightToggleArmed = false;
 bool buttonInputUnlocked = false;
 unsigned long buttonUnlockAt = 0;
 #if LED_COUNT > 0
-NeoPixelBus<NeoGrbwFeature, NeoEsp8266BitBangSk6812NoIntrMethod> lightBus(LED_COUNT, PIN_LED);
+uint32_t lightPinMask = (1UL << PIN_LED);
 #endif
 
 // -----------------------------------------------------------------------------
@@ -379,6 +386,8 @@ void applyPumpPwm(uint16_t pwm);
 void setupLightControl(void);
 void updateLightControl(void);
 void setLightTargetLevel(uint16_t level);
+void lightDriverBegin(void);
+void lightDriverShow(uint8_t r, uint8_t g, uint8_t b, uint8_t w);
 void applyIndicatorColor(uint8_t r, uint8_t g, uint8_t b, uint8_t w, bool force = false);
 void applyLightOutput(bool force = false);
 void applyBootIndicator(void);
@@ -1058,6 +1067,70 @@ void applyPumpPwm(uint16_t pwm)
   analogWrite(PIN_PUMPE2, pwm);
 }
 
+#if LED_COUNT > 0
+static inline uint32_t IRAM_ATTR lightCyclesForNs(uint32_t ns)
+{
+  return (clockCyclesPerMicrosecond() * ns + 999UL) / 1000UL;
+}
+
+static inline void IRAM_ATTR lightWaitUntil(uint32_t startCycle, uint32_t targetCycles)
+{
+  while ((int32_t)(esp_get_cycle_count() - startCycle) < (int32_t)targetCycles)
+  {
+  }
+}
+
+static inline void IRAM_ATTR lightWriteByte(uint8_t value,
+                                            uint32_t pinMask,
+                                            uint32_t bitTotalCycles,
+                                            uint32_t t0hCycles,
+                                            uint32_t t1hCycles)
+{
+  for (uint8_t mask = 0x80; mask != 0; mask >>= 1)
+  {
+    GPOS = pinMask;
+    uint32_t bitStart = esp_get_cycle_count();
+    lightWaitUntil(bitStart, (value & mask) ? t1hCycles : t0hCycles);
+    GPOC = pinMask;
+    lightWaitUntil(bitStart, bitTotalCycles);
+  }
+}
+#endif
+
+void lightDriverBegin(void)
+{
+#if LED_COUNT > 0
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LOW);
+#endif
+}
+
+void lightDriverShow(uint8_t r, uint8_t g, uint8_t b, uint8_t w)
+{
+#if LED_COUNT > 0
+  const uint32_t bitTotalCycles = lightCyclesForNs(SK6812_BIT_TOTAL_NS);
+  const uint32_t t0hCycles = lightCyclesForNs(SK6812_T0H_NS);
+  const uint32_t t1hCycles = lightCyclesForNs(SK6812_T1H_NS);
+
+  noInterrupts();
+  for (uint16_t i = 0; i < LED_COUNT; i++)
+  {
+    // SK6812 RGBW verwendet in dieser Hardware die Byte-Reihenfolge GRBW.
+    lightWriteByte(g, lightPinMask, bitTotalCycles, t0hCycles, t1hCycles);
+    lightWriteByte(r, lightPinMask, bitTotalCycles, t0hCycles, t1hCycles);
+    lightWriteByte(b, lightPinMask, bitTotalCycles, t0hCycles, t1hCycles);
+    lightWriteByte(w, lightPinMask, bitTotalCycles, t0hCycles, t1hCycles);
+  }
+  interrupts();
+  delayMicroseconds(SK6812_RESET_US);
+#else
+  (void)r;
+  (void)g;
+  (void)b;
+  (void)w;
+#endif
+}
+
 void setupLightControl()
 {
   // Lichtzustand immer definiert resetten, auch wenn LED_COUNT=0 ist.
@@ -1073,9 +1146,8 @@ void setupLightControl()
   lightControl.outputInitialized = false;
 
 #if LED_COUNT > 0
-  lightBus.Begin();
-  lightBus.ClearTo(RgbwColor(0, 0, 0, 0));
-  lightBus.Show();
+  lightDriverBegin();
+  lightDriverShow(0, 0, 0, 0);
   lightControl.outputInitialized = true;
   LOGI("Light output configured: count=%u pin=%d", (unsigned int)LED_COUNT, (int)PIN_LED);
 #else
@@ -1156,12 +1228,7 @@ void applyIndicatorColor(uint8_t r, uint8_t g, uint8_t b, uint8_t w, bool force)
     return;
   }
 
-  RgbwColor outColor(r, g, b, w);
-  for (uint16_t i = 0; i < LED_COUNT; i++)
-  {
-    lightBus.SetPixelColor(i, outColor);
-  }
-  lightBus.Show();
+  lightDriverShow(r, g, b, w);
 
   lightControl.lastR = r;
   lightControl.lastG = g;
@@ -1201,12 +1268,7 @@ void applyLightOutput(bool force)
     return;
   }
 
-  RgbwColor outColor(scaledR, scaledG, scaledB, scaledW);
-  for (uint16_t i = 0; i < LED_COUNT; i++)
-  {
-    lightBus.SetPixelColor(i, outColor);
-  }
-  lightBus.Show();
+  lightDriverShow(scaledR, scaledG, scaledB, scaledW);
 
   lightControl.lastR = scaledR;
   lightControl.lastG = scaledG;
