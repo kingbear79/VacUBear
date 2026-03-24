@@ -323,7 +323,7 @@ bool wifiStartupPending = false;
 unsigned long wifiStartupAt = 0;
 bool bootIndicatorActive = false;
 #if LED_COUNT > 0
-NeoPixelBus<NeoGrbwFeature, NeoEsp8266BitBang800KbpsMethod> lightBus(LED_COUNT, PIN_LED);
+NeoPixelBus<NeoGrbwFeature, NeoEsp8266BitBangSk6812NoIntrMethod> lightBus(LED_COUNT, PIN_LED);
 #endif
 
 // -----------------------------------------------------------------------------
