@@ -2,6 +2,11 @@
 
 Dieses Projekt laeuft auf ESP8266/ESP-12F und steuert Pumpen, Ventil, OTA und die optionale RGBW-Beleuchtung fuer VacUBear.
 
+## Dokumentation
+
+- Technische Projekt- und Schnittstellenbeschreibung: [README.md](/Users/christianschweden/Documents/PlatformIO/Projects/VacUBear/README.md)
+- Endbenutzer-Handbuch: [docs/ENDUSER_HANDBUCH.md](/Users/christianschweden/Documents/PlatformIO/Projects/VacUBear/docs/ENDUSER_HANDBUCH.md)
+
 ## Build
 
 - PlatformIO Environment: `esp12f`
@@ -129,8 +134,8 @@ Beispiel:
   "light_enabled": true,
   "light": {"r": 255, "g": 180, "b": 60, "w": 20},
   "ota": {
-    "current_version": "0.0.7-dev",
-    "latest_version": "0.0.7-dev",
+    "current_version": "0.1.0-passionate_gimp",
+    "latest_version": "0.1.0-passionate_gimp",
     "update_available": false
   }
 }
@@ -394,7 +399,8 @@ Voraussetzungen:
 - Waehren der Show leuchten die LEDs nur, wenn `Beleuchtung = ON` ist.
 - Ausserhalb der Show bleiben die LEDs aus.
 - Ausnahmen: rotes Pulsieren beim Booten und eine 5-Sekunden-Vorschau nach Aenderung der Lichtfarbe im Webinterface oder per MQTT.
-- Der RGB-Farbanteil wird als Farbe gesetzt, der Weiss-Kanal separat als `W`-Wert.
+- Home Assistant steuert die Lichtfarbe bewusst nur als `RGB`, damit kein kuehl wirkender Weiss-Anteil in die Farbe eingemischt wird.
+- Der Weiss-Kanal bleibt separat ueber Webinterface, REST und das direkte MQTT-RGBW-Topic konfigurierbar.
 
 ### Steuer- und Status-Topics
 
@@ -404,6 +410,8 @@ Voraussetzungen:
 | `<base>/show/state` | vom Geraet | `ON`, `OFF` | Aktueller Show-Zustand |
 | `<base>/light/set` | zu Geraet | `ON`, `OFF` oder JSON | Aktiviert oder deaktiviert die Show-Beleuchtung; JSON kann `state`, `color` und `white_value` enthalten |
 | `<base>/light/state` | vom Geraet | `ON`, `OFF` | Gespeicherter Freigabe-Zustand der Show-Beleuchtung |
+| `<base>/light/rgb/set` | zu Geraet | `r,g,b` | Setzt die RGB-Farbwerte direkt; wird von Home Assistant fuer die Lichtfarbe verwendet |
+| `<base>/light/rgb/state` | vom Geraet | `r,g,b` | Aktuell gespeicherte RGB-Farbwerte |
 | `<base>/light/rgbw/set` | zu Geraet | `r,g,b,w` | Setzt die RGBW-Farbwerte direkt |
 | `<base>/light/rgbw/state` | vom Geraet | `r,g,b,w` | Aktuell gespeicherte RGBW-Farbwerte |
 | `<base>/config/show_length_s/set` | zu Geraet | Ganzzahl in Sekunden | Setzt die Show-Laenge |
@@ -505,7 +513,7 @@ Diese Topics werden von der Firmware aktiv veroeffentlicht und muessen nicht man
 | Topic | Komponente | Zweck |
 | --- | --- | --- |
 | `homeassistant/switch/<deviceId>/show/config` | `switch` | Show starten und stoppen |
-| `homeassistant/light/<deviceId>/light/config` | `light` | Entitaet `Beleuchtung` fuer Freigabe und RGBW-Farbe |
+| `homeassistant/light/<deviceId>/light/config` | `light` | Entitaet `Beleuchtung` fuer Freigabe und RGB-Farbe; Weiss bleibt separat |
 | `homeassistant/update/<deviceId>/firmware/config` | `update` | Firmware-Update in HA |
 | `homeassistant/binary_sensor/<deviceId>/show_aktiv/config` | `binary_sensor` | Diagnosesensor fuer Show aktiv, standardmaessig deaktiviert |
 | `homeassistant/sensor/<deviceId>/show_phase/config` | `sensor` | Diagnosesensor fuer Show-Phase, standardmaessig deaktiviert |

@@ -95,9 +95,15 @@ static const uint32_t LED_AFTER_BELUEFTEN_MS = 5000UL;
 static const uint32_t LIGHT_PREVIEW_MS = 5000UL;
 static const uint16_t LIGHT_LEVEL_MAX = 1023;
 static const uint32_t LIGHT_UPDATE_MS = 20UL;
+static const uint32_t BUTTON_LIGHT_TOGGLE_MS = 3000UL;
+static const uint32_t BUTTON_AP_MODE_MS = 10000UL;
+static const uint32_t BUTTON_BOOT_GUARD_MS = 1200UL;
 static const uint32_t BOOT_PULSE_PERIOD_MS = 1600UL;
 static const uint16_t BOOT_PULSE_LEVEL_MIN = 32;
 static const uint16_t BOOT_PULSE_LEVEL_MAX = 768;
+static const uint32_t LIGHT_FEEDBACK_ON_MS = 160UL;
+static const uint32_t LIGHT_FEEDBACK_OFF_MS = 140UL;
+static const uint8_t LIGHT_FEEDBACK_BLINK_COUNT = 3;
 static const uint32_t TELEMETRY_INTERVAL_MS = TELEMETRY_INTERVAL_MS_CFG;
 
 static const char *CONFIG_FILE = "/config.json";
@@ -216,6 +222,30 @@ struct LightSoftControl
   }
 };
 
+struct LightFeedbackState
+{
+  bool active;
+  bool outputOn;
+  uint8_t r;
+  uint8_t g;
+  uint8_t b;
+  uint8_t w;
+  uint8_t togglesRemaining;
+  unsigned long nextToggleAt;
+
+  LightFeedbackState()
+      : active(false),
+        outputOn(false),
+        r(0),
+        g(0),
+        b(0),
+        w(0),
+        togglesRemaining(0),
+        nextToggleAt(0)
+  {
+  }
+};
+
 // OTA-Zustand inkl. letzter Pruefung und Ergebnis.
 struct OtaStatus
 {
@@ -304,6 +334,8 @@ String topicShowSet;
 String topicShowState;
 String topicLightSet;
 String topicLightState;
+String topicLightRgbSet;
+String topicLightRgbState;
 String topicLightRgbwSet;
 String topicLightRgbwState;
 String topicCfgShowLengthSet;
@@ -315,6 +347,7 @@ String topicAvailability;
 String topicTeleState;
 PumpSoftControl pumpControl;
 LightSoftControl lightControl;
+LightFeedbackState lightFeedback;
 OtaStatus otaStatus;
 bool otaCheckRequested = false;
 bool otaUpdateRequested = false;
@@ -322,6 +355,12 @@ bool otaBootCheckPending = true;
 bool wifiStartupPending = false;
 unsigned long wifiStartupAt = 0;
 bool bootIndicatorActive = false;
+bool apModeIndicatorActive = false;
+unsigned long buttonPressedAt = 0;
+bool buttonApModeTriggered = false;
+bool buttonLightToggleArmed = false;
+bool buttonInputUnlocked = false;
+unsigned long buttonUnlockAt = 0;
 #if LED_COUNT > 0
 NeoPixelBus<NeoGrbwFeature, NeoEsp8266BitBangSk6812NoIntrMethod> lightBus(LED_COUNT, PIN_LED);
 #endif
@@ -331,6 +370,7 @@ NeoPixelBus<NeoGrbwFeature, NeoEsp8266BitBangSk6812NoIntrMethod> lightBus(LED_CO
 // -----------------------------------------------------------------------------
 void startShow(void);
 void stopShow(void);
+void handleButtonInput(void);
 void handleShow(void);
 void setupPumpControl(void);
 void setPumpTarget(bool enabled);
@@ -339,10 +379,13 @@ void applyPumpPwm(uint16_t pwm);
 void setupLightControl(void);
 void updateLightControl(void);
 void setLightTargetLevel(uint16_t level);
+void applyIndicatorColor(uint8_t r, uint8_t g, uint8_t b, uint8_t w, bool force = false);
 void applyLightOutput(bool force = false);
 void applyBootIndicator(void);
 void requestLightPreview(uint32_t durationMs = LIGHT_PREVIEW_MS);
 bool isLightPreviewActive(unsigned long now);
+void requestLightBlinkFeedback(uint8_t r, uint8_t g, uint8_t b, uint8_t w, uint8_t blinkCount = LIGHT_FEEDBACK_BLINK_COUNT);
+bool updateLightFeedback(void);
 void otaLoop(void);
 bool otaCheckForUpdate(const char *reason);
 bool otaApplyUpdate(void);
@@ -365,6 +408,7 @@ void mqttLoop(void);
 void mqttEnsureConnected(void);
 void mqttCallback(char *topic, byte *payload, unsigned int length);
 void updateMqttTopics(void);
+void clearStaleCommandTopics(void);
 void publishAvailability(const char *state, bool retained = true);
 void publishShowState(bool retained = true);
 void publishLightState(bool retained = true);
@@ -378,11 +422,13 @@ const char *getShowPhase(void);
 void loadConfig(void);
 bool saveConfig(void);
 void loadLegacyConfig(const String &raw);
+void enterAccessPointMode(const char *reason);
 void startAccessPoint(void);
 void setupCaptivePortal(void);
 void handleRoot(void);
 void handleSave(void);
 void handleAppJs(void);
+void handleCaptiveProbe(void);
 void handleApiConfigGet(void);
 void handleApiConfigPost(void);
 void handleApiWifiScan(void);
@@ -472,6 +518,7 @@ void applyConfigToRuntime(bool wifiChanged, bool mqttChanged, bool publishStates
       wifiStartupAt = millis();
       lastWifiRetryAt = wifiStartupAt;
       bootIndicatorActive = HAS_LED_OUTPUT;
+      apModeIndicatorActive = false;
     }
   }
 
@@ -674,6 +721,8 @@ void setup()
   digitalWrite(PIN_VENTIL, LOW);
 
   button.begin();
+  buttonInputUnlocked = false;
+  buttonUnlockAt = millis() + BUTTON_BOOT_GUARD_MS;
 
   if (!LittleFS.begin())
   {
@@ -698,19 +747,7 @@ void loop()
   // 2) Show/Pumpen/Licht zeitbasiert fortschreiben
   // 3) Netzwerkdienste (HTTP/DNS/WiFi/MQTT/OTA) bedienen
   // 4) verzögertes Speichern ausfuehren
-  button.read();
-  if (button.wasPressed())
-  {
-    LOGI("Button pressed");
-    if (showStatus.isRunning)
-    {
-      stopShow();
-    }
-    else
-    {
-      startShow();
-    }
-  }
+  handleButtonInput();
 
   handleShow();
   updatePumpControl();
@@ -773,6 +810,100 @@ void loop()
   {
     saveConfig();
     configSavePending = false;
+  }
+}
+
+void handleButtonInput()
+{
+  button.read();
+
+  if (!buttonInputUnlocked)
+  {
+    if (millis() < buttonUnlockAt || button.isPressed())
+    {
+      return;
+    }
+    buttonInputUnlocked = true;
+    buttonPressedAt = 0;
+    buttonApModeTriggered = false;
+    buttonLightToggleArmed = false;
+    LOGI("Button input unlocked after boot guard");
+    return;
+  }
+
+  if (button.wasPressed())
+  {
+    buttonPressedAt = button.lastChange();
+    buttonApModeTriggered = false;
+    buttonLightToggleArmed = false;
+    LOGI("Button pressed");
+  }
+
+  if (button.isPressed() &&
+      !buttonApModeTriggered &&
+      !buttonLightToggleArmed &&
+      button.pressedFor(BUTTON_LIGHT_TOGGLE_MS))
+  {
+    buttonLightToggleArmed = true;
+    LOGI("Button long press armed for light toggle");
+  }
+
+  if (button.isPressed() &&
+      !buttonApModeTriggered &&
+      button.pressedFor(BUTTON_AP_MODE_MS))
+  {
+    buttonApModeTriggered = true;
+    enterAccessPointMode("button-longpress");
+    return;
+  }
+
+  if (!button.wasReleased())
+  {
+    return;
+  }
+
+  unsigned long pressDurationMs = (buttonPressedAt > 0) ? (button.lastChange() - buttonPressedAt) : 0;
+  LOGI("Button released after %lu ms", pressDurationMs);
+  (void)pressDurationMs;
+
+  if (buttonApModeTriggered)
+  {
+    return;
+  }
+
+  if (buttonLightToggleArmed)
+  {
+    buttonLightToggleArmed = false;
+    if (HAS_LED_OUTPUT && showStatus.isRunning)
+    {
+      config.lightEnabled = !config.lightEnabled;
+      scheduleConfigSave();
+      publishLightState(true);
+      publishTelemetry(true);
+      if (config.lightEnabled)
+      {
+        requestLightBlinkFeedback(0, 255, 0, 0);
+      }
+      else
+      {
+        requestLightBlinkFeedback(255, 0, 0, 0);
+      }
+      LOGI("Show lighting toggled via long press -> %s", config.lightEnabled ? "on" : "off");
+    }
+    else
+    {
+      LOGI("Long press ignored: show not running or LED output disabled");
+    }
+    return;
+  }
+
+  if (showStatus.isRunning)
+  {
+    stopShow();
+  }
+  else
+  {
+    startShow();
   }
 }
 
@@ -935,6 +1066,10 @@ void setupLightControl()
   lightControl.onUntilAt = 0;
   lightControl.previewUntilAt = 0;
   lightControl.lastUpdateAt = 0;
+  lightFeedback.active = false;
+  lightFeedback.outputOn = false;
+  lightFeedback.togglesRemaining = 0;
+  lightFeedback.nextToggleAt = 0;
   lightControl.outputInitialized = false;
 
 #if LED_COUNT > 0
@@ -972,6 +1107,25 @@ bool isLightPreviewActive(unsigned long now)
   return false;
 }
 
+void requestLightBlinkFeedback(uint8_t r, uint8_t g, uint8_t b, uint8_t w, uint8_t blinkCount)
+{
+  if (!HAS_LED_OUTPUT || blinkCount == 0)
+  {
+    return;
+  }
+  lightFeedback.active = true;
+  lightFeedback.outputOn = false;
+  lightFeedback.r = r;
+  lightFeedback.g = g;
+  lightFeedback.b = b;
+  lightFeedback.w = w;
+  // LED-Schreibzugriffe nur im regulaeren Loop-Pfad ausfuehren.
+  // Das vermeidet spontane Show()-Transfers aus Button-/MQTT-/Web-Callbacks.
+  lightFeedback.togglesRemaining = (uint8_t)(blinkCount * 2U);
+  lightFeedback.nextToggleAt = millis();
+  LOGD("Light feedback blink started: rgbw=%u,%u,%u,%u blinks=%u", r, g, b, w, blinkCount);
+}
+
 void setLightTargetLevel(uint16_t level)
 {
   if (level > LIGHT_LEVEL_MAX)
@@ -983,6 +1137,43 @@ void setLightTargetLevel(uint16_t level)
     lightControl.targetLevel = level;
     LOGD("Light target level -> %u", lightControl.targetLevel);
   }
+}
+
+void applyIndicatorColor(uint8_t r, uint8_t g, uint8_t b, uint8_t w, bool force)
+{
+#if LED_COUNT > 0
+  if (!HAS_LED_OUTPUT || !lightControl.outputInitialized)
+  {
+    return;
+  }
+
+  if (!force &&
+      r == lightControl.lastR &&
+      g == lightControl.lastG &&
+      b == lightControl.lastB &&
+      w == lightControl.lastW)
+  {
+    return;
+  }
+
+  RgbwColor outColor(r, g, b, w);
+  for (uint16_t i = 0; i < LED_COUNT; i++)
+  {
+    lightBus.SetPixelColor(i, outColor);
+  }
+  lightBus.Show();
+
+  lightControl.lastR = r;
+  lightControl.lastG = g;
+  lightControl.lastB = b;
+  lightControl.lastW = w;
+#else
+  (void)r;
+  (void)g;
+  (void)b;
+  (void)w;
+  (void)force;
+#endif
 }
 
 void applyLightOutput(bool force)
@@ -1023,6 +1214,50 @@ void applyLightOutput(bool force)
   lightControl.lastW = scaledW;
 #else
   (void)force;
+#endif
+}
+
+bool updateLightFeedback()
+{
+#if LED_COUNT > 0
+  if (!lightFeedback.active)
+  {
+    return false;
+  }
+
+  unsigned long now = millis();
+  if ((int32_t)(now - lightFeedback.nextToggleAt) < 0)
+  {
+    return true;
+  }
+
+  if (lightFeedback.togglesRemaining == 0)
+  {
+    lightFeedback.active = false;
+    lightControl.lastUpdateAt = now;
+    applyLightOutput(true);
+    return false;
+  }
+
+  lightFeedback.outputOn = !lightFeedback.outputOn;
+  if (lightFeedback.outputOn)
+  {
+    applyIndicatorColor(lightFeedback.r, lightFeedback.g, lightFeedback.b, lightFeedback.w, true);
+    lightFeedback.nextToggleAt = now + LIGHT_FEEDBACK_ON_MS;
+  }
+  else
+  {
+    applyIndicatorColor(0, 0, 0, 0, true);
+    lightFeedback.nextToggleAt = now + LIGHT_FEEDBACK_OFF_MS;
+  }
+  lightFeedback.togglesRemaining--;
+  if (lightFeedback.togglesRemaining == 0 && !lightFeedback.outputOn)
+  {
+    lightFeedback.active = false;
+  }
+  return lightFeedback.active;
+#else
+  return false;
 #endif
 }
 
@@ -1068,17 +1303,7 @@ void applyBootIndicator()
     return;
   }
 
-  RgbwColor outColor(scaledR, 0, 0, 0);
-  for (uint16_t i = 0; i < LED_COUNT; i++)
-  {
-    lightBus.SetPixelColor(i, outColor);
-  }
-  lightBus.Show();
-
-  lightControl.lastR = scaledR;
-  lightControl.lastG = 0;
-  lightControl.lastB = 0;
-  lightControl.lastW = 0;
+  applyIndicatorColor(scaledR, 0, 0, 0, true);
 #endif
 }
 
@@ -1087,7 +1312,12 @@ void updateLightControl()
   // Licht ist aktiv:
   // - waehrend showStatus.isRunning
   // - plus Nachlauf LED_AFTER_BELUEFTEN_MS nach Belueftungsbeginn
-  if (bootIndicatorActive)
+  if (updateLightFeedback())
+  {
+    return;
+  }
+
+  if (bootIndicatorActive || apModeIndicatorActive)
   {
     applyBootIndicator();
     return;
@@ -1161,6 +1391,7 @@ void setSafeOutputState()
   applyPumpPwm(0);
   lightControl.onUntilAt = 0;
   lightControl.previewUntilAt = 0;
+  lightFeedback.active = false;
   lightControl.currentLevel = 0;
   lightControl.targetLevel = 0;
   applyLightOutput(true);
@@ -1206,7 +1437,7 @@ static size_t extractVersionNumbers(const String &version, uint32_t *outParts, s
 static int versionQualifierRank(const String &version)
 {
   // Reihenfolge fuer Prae-Release-Tags:
-  // dev < alpha < beta < rc < stable
+  // dev < alpha < beta < rc < stable/custom-release-name
   String lower = version;
   lower.toLowerCase();
 
@@ -1233,8 +1464,8 @@ static int versionQualifierRank(const String &version)
     return 0;
   }
 
-  // Unknown prerelease tag stays below stable.
-  return 0;
+  // Unbekannte Suffixe gelten als benannte Stable-Releases.
+  return 4;
 }
 
 int compareVersionStrings(const String &lhs, const String &rhs)
@@ -1828,6 +2059,10 @@ void handleWiFiStartup()
   {
     wifiStartupPending = false;
     bootIndicatorActive = false;
+    if (!captivePortalEnabled)
+    {
+      apModeIndicatorActive = false;
+    }
     LOGI("STA connected. IP=%s", WiFi.localIP().toString().c_str());
     return;
   }
@@ -1859,6 +2094,23 @@ void mqttLoop()
   }
 
   mqttClient.loop();
+}
+
+void clearStaleCommandTopics()
+{
+  // Command-Topics sollten nicht retained sein.
+  // Loescht alte retained Kommandos, damit beim Power-On keine stale Befehle
+  // (z. B. show/set=ON) direkt nach dem Subscribe wieder zugestellt werden.
+  mqttClient.publish(topicShowSet.c_str(), "", true);
+  if (HAS_LED_OUTPUT)
+  {
+    mqttClient.publish(topicLightSet.c_str(), "", true);
+    mqttClient.publish(topicLightRgbSet.c_str(), "", true);
+    mqttClient.publish(topicLightRgbwSet.c_str(), "", true);
+  }
+  mqttClient.publish(topicCfgShowLengthSet.c_str(), "", true);
+  mqttClient.publish(topicCfgNachlaufSet.c_str(), "", true);
+  mqttClient.publish(topicOtaInstall.c_str(), "", true);
 }
 
 void mqttEnsureConnected()
@@ -1907,11 +2159,13 @@ void mqttEnsureConnected()
   }
 
   LOGI("MQTT connected");
+  clearStaleCommandTopics();
 
   mqttClient.subscribe(topicShowSet.c_str());
   if (HAS_LED_OUTPUT)
   {
     mqttClient.subscribe(topicLightSet.c_str());
+    mqttClient.subscribe(topicLightRgbSet.c_str());
     mqttClient.subscribe(topicLightRgbwSet.c_str());
   }
   mqttClient.subscribe(topicCfgShowLengthSet.c_str());
@@ -1934,6 +2188,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
   // Erwartete Payloads:
   // - show/set: ON|OFF
   // - light/set: ON|OFF oder JSON
+  // - light/rgb/set: "r,g,b"
   // - light/rgbw/set: "r,g,b,w"
   // - config/*/set: Sekundenwerte
   String topicStr(topic);
@@ -1961,7 +2216,7 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
     return;
   }
 
-  if (!HAS_LED_OUTPUT && (topicStr == topicLightSet || topicStr == topicLightRgbwSet))
+  if (!HAS_LED_OUTPUT && (topicStr == topicLightSet || topicStr == topicLightRgbSet || topicStr == topicLightRgbwSet))
   {
     LOGD("Ignoring light MQTT command (LED_COUNT=0)");
     return;
@@ -2070,6 +2325,33 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
     }
     publishLightState(true);
     publishTelemetry(true);
+    return;
+  }
+
+  if (HAS_LED_OUTPUT && topicStr == topicLightRgbSet)
+  {
+    int r = -1;
+    int g = -1;
+    int b = -1;
+    int parsed = sscanf(payloadStr.c_str(), "%d,%d,%d", &r, &g, &b);
+    if (parsed == 3)
+    {
+      config.lightR = clampU8(r);
+      config.lightG = clampU8(g);
+      config.lightB = clampU8(b);
+      LOGI("Beleuchtung updated via RGB topic: %u,%u,%u", config.lightR, config.lightG, config.lightB);
+      if (!showStatus.isRunning)
+      {
+        requestLightPreview();
+      }
+      scheduleConfigSave();
+      publishLightState(true);
+      publishTelemetry(true);
+    }
+    else
+    {
+      LOGW("Invalid RGB payload on %s: %s", topicStr.c_str(), payloadStr.c_str());
+    }
     return;
   }
 
@@ -2201,9 +2483,11 @@ void publishLightState(bool retained)
     return;
   }
   mqttClient.publish(topicLightState.c_str(), config.lightEnabled ? "ON" : "OFF", retained);
+  String rgb = String(config.lightR) + "," + String(config.lightG) + "," + String(config.lightB);
+  mqttClient.publish(topicLightRgbState.c_str(), rgb.c_str(), retained);
   String rgbw = String(config.lightR) + "," + String(config.lightG) + "," + String(config.lightB) + "," + String(config.lightW);
   mqttClient.publish(topicLightRgbwState.c_str(), rgbw.c_str(), retained);
-  LOGD("MQTT TX light_state=%s rgbw=%s", config.lightEnabled ? "ON" : "OFF", rgbw.c_str());
+  LOGD("MQTT TX light_state=%s rgb=%s rgbw=%s", config.lightEnabled ? "ON" : "OFF", rgb.c_str(), rgbw.c_str());
 }
 
 void publishConfigState(bool retained)
@@ -2258,10 +2542,10 @@ void publishDiscovery()
     lightCfg["state_topic"] = topicLightState;
     lightCfg["payload_on"] = "ON";
     lightCfg["payload_off"] = "OFF";
-    lightCfg["rgbw_command_topic"] = topicLightRgbwSet;
-    lightCfg["rgbw_state_topic"] = topicLightRgbwState;
+    lightCfg["rgb_command_topic"] = topicLightRgbSet;
+    lightCfg["rgb_state_topic"] = topicLightRgbState;
     JsonArray colorModes = lightCfg["supported_color_modes"].to<JsonArray>();
-    colorModes.add("rgbw");
+    colorModes.add("rgb");
     lightCfg["availability_topic"] = topicAvailability;
     lightCfg["payload_available"] = "online";
     lightCfg["payload_not_available"] = "offline";
@@ -2690,6 +2974,8 @@ void updateMqttTopics()
   topicShowState = topicBase + "/show/state";
   topicLightSet = topicBase + "/light/set";
   topicLightState = topicBase + "/light/state";
+  topicLightRgbSet = topicBase + "/light/rgb/set";
+  topicLightRgbState = topicBase + "/light/rgb/state";
   topicLightRgbwSet = topicBase + "/light/rgbw/set";
   topicLightRgbwState = topicBase + "/light/rgbw/state";
   topicCfgShowLengthSet = topicBase + "/config/show_length_s/set";
@@ -2713,6 +2999,7 @@ void setupWiFi()
 
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
   WiFi.hostname(deviceId.c_str());
 
   if (config.wifiSsid.length() == 0)
@@ -2728,8 +3015,24 @@ void setupWiFi()
   wifiStartupPending = true;
   wifiStartupAt = millis();
   bootIndicatorActive = HAS_LED_OUTPUT;
+  apModeIndicatorActive = false;
   lastWifiRetryAt = wifiStartupAt;
   LOGI("Connecting to WiFi SSID '%s' asynchronously...", config.wifiSsid.c_str());
+}
+
+void enterAccessPointMode(const char *reason)
+{
+  LOGI("Entering AP mode (%s)", reason);
+  stopShow();
+  setSafeOutputState();
+  wifiStartupPending = false;
+  bootIndicatorActive = false;
+  apModeIndicatorActive = HAS_LED_OUTPUT;
+  startAccessPoint();
+  if (!captivePortalEnabled)
+  {
+    setupCaptivePortal();
+  }
 }
 
 void startAccessPoint()
@@ -2737,6 +3040,8 @@ void startAccessPoint()
   // AP+STA erlaubt parallel:
   // - lokale Konfiguration ueber AP
   // - gleichzeitiger STA-Reconnect im Hintergrund
+  apModeIndicatorActive = HAS_LED_OUTPUT;
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(apSsid.c_str());
 
@@ -2767,6 +3072,15 @@ void setupWebServer()
   // - "/ota/*"     OTA-Status, Check, Update (legacy + UI)
   server.on("/", HTTP_GET, handleRoot);
   server.on("/app.js", HTTP_GET, handleAppJs);
+  server.on("/generate_204", HTTP_GET, handleCaptiveProbe);
+  server.on("/gen_204", HTTP_GET, handleCaptiveProbe);
+  server.on("/hotspot-detect.html", HTTP_GET, handleCaptiveProbe);
+  server.on("/library/test/success.html", HTTP_GET, handleCaptiveProbe);
+  server.on("/success.txt", HTTP_GET, handleCaptiveProbe);
+  server.on("/connecttest.txt", HTTP_GET, handleCaptiveProbe);
+  server.on("/redirect", HTTP_GET, handleCaptiveProbe);
+  server.on("/fwlink", HTTP_GET, handleCaptiveProbe);
+  server.on("/ncsi.txt", HTTP_GET, handleCaptiveProbe);
   server.on("/save", HTTP_POST, handleSave);
   server.on("/status", HTTP_GET, handleStatus);
   server.on("/api/status", HTTP_GET, handleStatus);
@@ -3285,6 +3599,16 @@ initWifiControls();
 initLightControls();
 )rawliteral";
   server.send_P(200, "application/javascript", APP_JS);
+}
+
+void handleCaptiveProbe()
+{
+  LOGD("HTTP captive probe: %s", server.uri().c_str());
+  if (handleCaptivePortalRedirect())
+  {
+    return;
+  }
+  sendHtmlPage();
 }
 
 void handleSave()
