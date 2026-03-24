@@ -73,6 +73,48 @@ Das Skript deployed branchbezogen nach:
 - `http://ota.kinkbear.de/<branch>/manifest.json`
 - `http://ota.kinkbear.de/<branch>/firmware.bin`
 
+### Release Notes in `manifest.json`
+
+Der Inhalt von `notes` wird beim Erzeugen des OTA-Bundles in [build_ota_bundle.sh](/Users/christianschweden/Documents/PlatformIO/Projects/VacUBear/build_ota_bundle.sh) gesetzt. `deploy_ota_bundle.sh` uebertraegt diese Information unveraendert mit dem erzeugten `manifest.json` auf den OTA-Server.
+
+Die Aufloesung erfolgt in dieser Reihenfolge:
+
+1. `OTA_NOTES`
+   Direkter String aus der Shell. Sinnvoll fuer einmalige Overrides.
+2. `OTA_NOTES_FILE`
+   Pfad auf eine lokale Text- oder Markdown-Datei.
+3. Automatische Dateisuche
+   Falls vorhanden, wird eine dieser Dateien geladen:
+   - `release_notes/<FW_VERSION>.md`
+   - `release_notes/<FW_VERSION>.txt`
+   - `release-notes/<FW_VERSION>.md`
+   - `release-notes/<FW_VERSION>.txt`
+4. Automatische Git-Auswertung
+   Wenn keine Datei vorhanden ist, erzeugt das Skript Release Notes aus den Commit-Betreffzeilen seit dem letzten Versionssprung in `platformio.ini`.
+
+Empfohlener Ablauf fuer Releases:
+
+1. `FW_VERSION` in [platformio.ini](/Users/christianschweden/Documents/PlatformIO/Projects/VacUBear/platformio.ini) erhoehen
+2. Optional eine kuratierte Datei `release_notes/<FW_VERSION>.md` anlegen
+3. `pio run -e esp12f`
+4. `./deploy_ota_bundle.sh`
+
+Beispiel fuer ein manuelles Override:
+
+```bash
+OTA_NOTES_FILE=release_notes/0.1.3-passionate_gimp.md pio run -e esp12f
+./deploy_ota_bundle.sh
+```
+
+Wenn keine manuelle Datei existiert, sieht `notes` typischerweise so aus:
+
+```text
+Aenderungen seit Version 0.1.2-passionate_gimp:
+- Improve Home Assistant OTA update state
+- Stage show actuators after LED fades
+- Replace NeoPixelBus with minimal SK6812 driver
+```
+
 ## REST-API
 
 Die REST-API nutzt bewusst die bereits vorhandene `ESP8266WebServer`-Instanz. Es wird keine zusaetzliche HTTP-Bibliothek und kein zweiter Server gestartet. Das haelt den Speicherdruck auf dem ESP8266 niedrig und vermeidet doppelte Logik.
@@ -256,8 +298,10 @@ Wichtige Felder:
 - `phase`
 - `length_ms`
 - `nachlauf_ms`
+- `fade_in_done_at_ms`
 - `end_at_ms`
 - `open_valve_at_ms`
+- `finish_at_ms`
 
 ### `POST /api/show`
 
@@ -419,6 +463,7 @@ Voraussetzungen:
 | `<base>/config/nachlauf_s/set` | zu Geraet | Ganzzahl in Sekunden | Setzt die Nachlaufzeit |
 | `<base>/config/nachlauf_s/state` | vom Geraet | Ganzzahl in Sekunden | Aktuell gespeicherte Nachlaufzeit |
 | `<base>/ota/update/install` | zu Geraet | `install` | Startet ein OTA-Update, wenn bereits ein Update gefunden wurde |
+| `<base>/ota/update/state` | vom Geraet | JSON | Retainter OTA-Zustand fuer Home Assistant (`installed_version`, `latest_version`, `in_progress`, `update_percentage`) |
 | `<base>/availability` | vom Geraet | `online`, `offline` | MQTT-Verfuegbarkeit des Moduls |
 | `tele/<deviceId>/STATE` | vom Geraet | JSON | Sammeltelemetrie fuer HA, Diagnose und Automationen |
 
@@ -468,13 +513,15 @@ Detailfelder:
 | `WiFi.Status` | `Connected` oder `Disconnected` |
 | `Show.Aktiv` | `true`, wenn die Show gerade laeuft |
 | `Show.Status` | `ON` oder `OFF` |
-| `Show.Phase` | `Pause`, `Vakuumieren`, `Haltezeit` oder `Belueften` |
+| `Show.Phase` | `Pause`, `FadeIn`, `Vakuumieren`, `Haltezeit` oder `FadeOut` |
 | `Show.LaengeMs` | Show-Laenge in Millisekunden |
 | `Show.NachlaufMs` | Nachlaufzeit in Millisekunden |
 | `Show.LaengeS` | Show-Laenge in Sekunden |
 | `Show.NachlaufS` | Nachlaufzeit in Sekunden |
-| `Show.EndAt` | Zeitstempel fuer Show-Ende in `millis()` |
+| `Show.FadeInDoneAt` | Zeitstempel, ab dem Pumpen und Ventil umgeschaltet werden duerfen |
+| `Show.EndAt` | Zeitstempel fuer das Ende der Vakuumierphase in `millis()` |
 | `Show.OpenValveAt` | Zeitstempel fuer das Oeffnen des Ventils in `millis()` |
+| `Show.FinishAt` | Zeitstempel fuer das Ende der Show nach dem FadeOut |
 | `Pumpen.PWM` | Aktuell ausgegebener PWM-Wert |
 | `Pumpen.TargetPWM` | Ziel-PWM fuer Softstart/Softstop |
 | `Lichtfarbe.Enabled` | Gespeicherte Show-Freigabe fuer die Beleuchtung |

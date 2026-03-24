@@ -12,7 +12,10 @@
 #include <ArduinoJson.h>
 #include "pins.h"
 #if LED_COUNT > 0
-#include <NeoPixelBus.h>
+extern "C"
+{
+#include "esp8266_peri.h"
+}
 #endif
 
 // -----------------------------------------------------------------------------
@@ -104,6 +107,10 @@ static const uint16_t BOOT_PULSE_LEVEL_MAX = 768;
 static const uint32_t LIGHT_FEEDBACK_ON_MS = 160UL;
 static const uint32_t LIGHT_FEEDBACK_OFF_MS = 140UL;
 static const uint8_t LIGHT_FEEDBACK_BLINK_COUNT = 3;
+static const uint32_t SK6812_BIT_TOTAL_NS = 1250UL;
+static const uint32_t SK6812_T0H_NS = 350UL;
+static const uint32_t SK6812_T1H_NS = 700UL;
+static const uint32_t SK6812_RESET_US = 90UL;
 static const uint32_t TELEMETRY_INTERVAL_MS = TELEMETRY_INTERVAL_MS_CFG;
 
 static const char *CONFIG_FILE = "/config.json";
@@ -156,23 +163,28 @@ struct AppConfig
 // Laufzeitstatus der Show.
 //
 // Begriffe:
-// - now < endAt        -> "Vakuumieren" (Pumpen AN, Ventil geschlossen)
-// - endAt .. openValve -> "Haltezeit"   (Pumpen AUS, Ventil geschlossen)
-// - >= openValveAt     -> "Belueften"   (Ventil offen) bis Show-Ende
+// - now < fadeInDoneAt -> "FadeIn"      (nur Licht blendet ein)
+// - fadeInDoneAt .. endAt        -> "Vakuumieren" (Pumpen AN, Ventil geschlossen)
+// - endAt .. openValveAt         -> "Haltezeit"   (Pumpen AUS, Ventil geschlossen)
+// - openValveAt .. finishAt      -> "FadeOut"     (Ventil offen, Licht blendet aus)
 class ShowStatus
 {
 public:
   bool isRunning;
+  unsigned long fadeInDoneAt;
   unsigned long endAt;
   unsigned long openValveAt;
+  unsigned long finishAt;
   bool shouldStart;
   unsigned long showDuration;
   unsigned long showNachlauf;
 
   ShowStatus()
       : isRunning(false),
+        fadeInDoneAt(0),
         endAt(0),
         openValveAt(0),
+        finishAt(0),
         shouldStart(false),
         showDuration(SHOW_LENGTH),
         showNachlauf(SHOW_NACHLAUF)
@@ -343,6 +355,7 @@ String topicCfgShowLengthState;
 String topicCfgNachlaufSet;
 String topicCfgNachlaufState;
 String topicOtaInstall;
+String topicOtaState;
 String topicAvailability;
 String topicTeleState;
 PumpSoftControl pumpControl;
@@ -352,6 +365,7 @@ OtaStatus otaStatus;
 bool otaCheckRequested = false;
 bool otaUpdateRequested = false;
 bool otaBootCheckPending = true;
+uint8_t otaLastPublishedProgressPercent = 255;
 bool wifiStartupPending = false;
 unsigned long wifiStartupAt = 0;
 bool bootIndicatorActive = false;
@@ -362,7 +376,7 @@ bool buttonLightToggleArmed = false;
 bool buttonInputUnlocked = false;
 unsigned long buttonUnlockAt = 0;
 #if LED_COUNT > 0
-NeoPixelBus<NeoGrbwFeature, NeoEsp8266BitBangSk6812NoIntrMethod> lightBus(LED_COUNT, PIN_LED);
+uint32_t lightPinMask = (1UL << PIN_LED);
 #endif
 
 // -----------------------------------------------------------------------------
@@ -379,6 +393,8 @@ void applyPumpPwm(uint16_t pwm);
 void setupLightControl(void);
 void updateLightControl(void);
 void setLightTargetLevel(uint16_t level);
+void lightDriverBegin(void);
+void lightDriverShow(uint8_t r, uint8_t g, uint8_t b, uint8_t w);
 void applyIndicatorColor(uint8_t r, uint8_t g, uint8_t b, uint8_t w, bool force = false);
 void applyLightOutput(bool force = false);
 void applyBootIndicator(void);
@@ -413,6 +429,7 @@ void publishAvailability(const char *state, bool retained = true);
 void publishShowState(bool retained = true);
 void publishLightState(bool retained = true);
 void publishConfigState(bool retained = true);
+void publishOtaUpdateState(bool retained = true);
 void publishDiscovery(void);
 void publishUpdateDiscovery(void);
 void publishSensorDiscovery(void);
@@ -625,6 +642,36 @@ void buildOtaStatusJson(JsonDocument &status)
   status["last_check_ms"] = otaStatus.lastCheckAt;
   status["reboot_at_ms"] = otaStatus.rebootAt;
   status["interval_ms"] = OTA_CHECK_INTERVAL_MS;
+}
+
+void publishOtaUpdateState(bool retained)
+{
+  if (!mqttClient.connected())
+  {
+    return;
+  }
+
+  JsonDocument doc;
+  const bool installBusy = otaStatus.updateInProgress || otaStatus.rebootPending;
+  const bool hasPendingUpdate = otaStatus.updateAvailable || installBusy;
+  const String effectiveLatestVersion = hasPendingUpdate && otaStatus.latestVersion.length() > 0
+                                            ? otaStatus.latestVersion
+                                            : otaStatus.currentVersion;
+
+  doc["installed_version"] = otaStatus.currentVersion;
+  doc["latest_version"] = effectiveLatestVersion;
+  doc["title"] = "VacUBear Firmware";
+  doc["release_summary"] = otaStatus.releaseNotes;
+  doc["in_progress"] = installBusy;
+  if (installBusy)
+  {
+    doc["update_percentage"] = otaStatus.rebootPending ? 100 : otaStatus.progressPercent;
+  }
+
+  String payload;
+  serializeJson(doc, payload);
+  mqttClient.publish(topicOtaState.c_str(), payload.c_str(), retained);
+  LOGD("MQTT TX ota_update_state=%s", payload.c_str());
 }
 
 void buildConfigJson(JsonObject root)
@@ -864,6 +911,7 @@ void handleButtonInput()
 
   unsigned long pressDurationMs = (buttonPressedAt > 0) ? (button.lastChange() - buttonPressedAt) : 0;
   LOGI("Button released after %lu ms", pressDurationMs);
+  (void)pressDurationMs;
 
   if (buttonApModeTriggered)
   {
@@ -921,8 +969,7 @@ void startShow()
 
 void stopShow()
 {
-  // Stop erzwingt den fruehen Uebergang in die Belueften-Phase:
-  // endAt/openValveAt werden auf "sofort" gesetzt (kleine Sicherheitstoleranz).
+  // Stop erzwingt den fruehen Uebergang in die Belueften-/FadeOut-Phase.
   if (!showStatus.isRunning)
   {
     LOGD("stopShow ignored: not running");
@@ -930,10 +977,13 @@ void stopShow()
   }
   LOGI("stopShow requested");
   unsigned long stopAt = millis() + 10;
+  unsigned long fadeOutMs = (HAS_LED_OUTPUT && config.lightEnabled) ? LED_FADE_OUT_MS : 0UL;
+  showStatus.fadeInDoneAt = stopAt;
   showStatus.endAt = stopAt;
   showStatus.openValveAt = stopAt;
-  lightControl.onUntilAt = showStatus.openValveAt + LED_AFTER_BELUEFTEN_MS;
-  LOGD("Light hold updated after stop: onUntilAt=%lu", lightControl.onUntilAt);
+  showStatus.finishAt = stopAt + fadeOutMs;
+  lightControl.onUntilAt = showStatus.openValveAt;
+  LOGD("Show stop transitions: openValveAt=%lu finishAt=%lu", showStatus.openValveAt, showStatus.finishAt);
 }
 
 void handleShow()
@@ -942,27 +992,45 @@ void handleShow()
   // Alle Aktoren werden hier konsistent aus "Zeitfenster + Status" abgeleitet.
   if (showStatus.shouldStart)
   {
-    showStatus.endAt = millis() + showStatus.showDuration;
+    unsigned long now = millis();
+    unsigned long fadeInMs = (HAS_LED_OUTPUT && config.lightEnabled) ? LED_FADE_IN_MS : 0UL;
+    unsigned long fadeOutMs = (HAS_LED_OUTPUT && config.lightEnabled) ? LED_FADE_OUT_MS : 0UL;
+    showStatus.fadeInDoneAt = now + fadeInMs;
+    showStatus.endAt = showStatus.fadeInDoneAt + showStatus.showDuration;
     showStatus.openValveAt = showStatus.endAt + showStatus.showNachlauf;
+    showStatus.finishAt = showStatus.openValveAt + fadeOutMs;
     showStatus.shouldStart = false;
     showStatus.isRunning = true;
-    lightControl.onUntilAt = showStatus.openValveAt + LED_AFTER_BELUEFTEN_MS;
+    lightControl.onUntilAt = showStatus.openValveAt;
     setLightTargetLevel(LIGHT_LEVEL_MAX);
-    LOGI("Show started: Vakuumieren=%lu ms, Haltezeit=%lu ms", showStatus.showDuration, showStatus.showNachlauf);
-    LOGD("Light hold until %lu", lightControl.onUntilAt);
+    LOGI("Show started: FadeIn=%lu ms, Vakuumieren=%lu ms, Haltezeit=%lu ms, FadeOut=%lu ms",
+         fadeInMs, showStatus.showDuration, showStatus.showNachlauf, fadeOutMs);
+    LOGD("Show timeline: fadeInDoneAt=%lu endAt=%lu openValveAt=%lu finishAt=%lu",
+         showStatus.fadeInDoneAt, showStatus.endAt, showStatus.openValveAt, showStatus.finishAt);
   }
 
   if (showStatus.isRunning)
   {
-    if (millis() < showStatus.endAt)
+    unsigned long now = millis();
+    if (now < showStatus.fadeInDoneAt)
+    {
+      setPumpTarget(false);
+      digitalWrite(PIN_VENTIL, LOW);
+    }
+    else if (now < showStatus.endAt)
     {
       setPumpTarget(true);
       digitalWrite(PIN_VENTIL, HIGH);
     }
-    else if (millis() < showStatus.openValveAt)
+    else if (now < showStatus.openValveAt)
     {
       setPumpTarget(false);
       digitalWrite(PIN_VENTIL, HIGH);
+    }
+    else if (now < showStatus.finishAt)
+    {
+      setPumpTarget(false);
+      digitalWrite(PIN_VENTIL, LOW);
     }
     else
     {
@@ -1057,6 +1125,70 @@ void applyPumpPwm(uint16_t pwm)
   analogWrite(PIN_PUMPE2, pwm);
 }
 
+#if LED_COUNT > 0
+static inline uint32_t IRAM_ATTR lightCyclesForNs(uint32_t ns)
+{
+  return (clockCyclesPerMicrosecond() * ns + 999UL) / 1000UL;
+}
+
+static inline void IRAM_ATTR lightWaitUntil(uint32_t startCycle, uint32_t targetCycles)
+{
+  while ((int32_t)(esp_get_cycle_count() - startCycle) < (int32_t)targetCycles)
+  {
+  }
+}
+
+static inline void IRAM_ATTR lightWriteByte(uint8_t value,
+                                            uint32_t pinMask,
+                                            uint32_t bitTotalCycles,
+                                            uint32_t t0hCycles,
+                                            uint32_t t1hCycles)
+{
+  for (uint8_t mask = 0x80; mask != 0; mask >>= 1)
+  {
+    GPOS = pinMask;
+    uint32_t bitStart = esp_get_cycle_count();
+    lightWaitUntil(bitStart, (value & mask) ? t1hCycles : t0hCycles);
+    GPOC = pinMask;
+    lightWaitUntil(bitStart, bitTotalCycles);
+  }
+}
+#endif
+
+void lightDriverBegin(void)
+{
+#if LED_COUNT > 0
+  pinMode(PIN_LED, OUTPUT);
+  digitalWrite(PIN_LED, LOW);
+#endif
+}
+
+void lightDriverShow(uint8_t r, uint8_t g, uint8_t b, uint8_t w)
+{
+#if LED_COUNT > 0
+  const uint32_t bitTotalCycles = lightCyclesForNs(SK6812_BIT_TOTAL_NS);
+  const uint32_t t0hCycles = lightCyclesForNs(SK6812_T0H_NS);
+  const uint32_t t1hCycles = lightCyclesForNs(SK6812_T1H_NS);
+
+  noInterrupts();
+  for (uint16_t i = 0; i < LED_COUNT; i++)
+  {
+    // SK6812 RGBW verwendet in dieser Hardware die Byte-Reihenfolge GRBW.
+    lightWriteByte(g, lightPinMask, bitTotalCycles, t0hCycles, t1hCycles);
+    lightWriteByte(r, lightPinMask, bitTotalCycles, t0hCycles, t1hCycles);
+    lightWriteByte(b, lightPinMask, bitTotalCycles, t0hCycles, t1hCycles);
+    lightWriteByte(w, lightPinMask, bitTotalCycles, t0hCycles, t1hCycles);
+  }
+  interrupts();
+  delayMicroseconds(SK6812_RESET_US);
+#else
+  (void)r;
+  (void)g;
+  (void)b;
+  (void)w;
+#endif
+}
+
 void setupLightControl()
 {
   // Lichtzustand immer definiert resetten, auch wenn LED_COUNT=0 ist.
@@ -1072,9 +1204,8 @@ void setupLightControl()
   lightControl.outputInitialized = false;
 
 #if LED_COUNT > 0
-  lightBus.Begin();
-  lightBus.ClearTo(RgbwColor(0, 0, 0, 0));
-  lightBus.Show();
+  lightDriverBegin();
+  lightDriverShow(0, 0, 0, 0);
   lightControl.outputInitialized = true;
   LOGI("Light output configured: count=%u pin=%d", (unsigned int)LED_COUNT, (int)PIN_LED);
 #else
@@ -1113,14 +1244,15 @@ void requestLightBlinkFeedback(uint8_t r, uint8_t g, uint8_t b, uint8_t w, uint8
     return;
   }
   lightFeedback.active = true;
-  lightFeedback.outputOn = true;
+  lightFeedback.outputOn = false;
   lightFeedback.r = r;
   lightFeedback.g = g;
   lightFeedback.b = b;
   lightFeedback.w = w;
-  lightFeedback.togglesRemaining = (uint8_t)((blinkCount * 2U) - 1U);
-  lightFeedback.nextToggleAt = millis() + LIGHT_FEEDBACK_ON_MS;
-  applyIndicatorColor(r, g, b, w, true);
+  // LED-Schreibzugriffe nur im regulaeren Loop-Pfad ausfuehren.
+  // Das vermeidet spontane Show()-Transfers aus Button-/MQTT-/Web-Callbacks.
+  lightFeedback.togglesRemaining = (uint8_t)(blinkCount * 2U);
+  lightFeedback.nextToggleAt = millis();
   LOGD("Light feedback blink started: rgbw=%u,%u,%u,%u blinks=%u", r, g, b, w, blinkCount);
 }
 
@@ -1154,12 +1286,7 @@ void applyIndicatorColor(uint8_t r, uint8_t g, uint8_t b, uint8_t w, bool force)
     return;
   }
 
-  RgbwColor outColor(r, g, b, w);
-  for (uint16_t i = 0; i < LED_COUNT; i++)
-  {
-    lightBus.SetPixelColor(i, outColor);
-  }
-  lightBus.Show();
+  lightDriverShow(r, g, b, w);
 
   lightControl.lastR = r;
   lightControl.lastG = g;
@@ -1199,12 +1326,7 @@ void applyLightOutput(bool force)
     return;
   }
 
-  RgbwColor outColor(scaledR, scaledG, scaledB, scaledW);
-  for (uint16_t i = 0; i < LED_COUNT; i++)
-  {
-    lightBus.SetPixelColor(i, outColor);
-  }
-  lightBus.Show();
+  lightDriverShow(scaledR, scaledG, scaledB, scaledW);
 
   lightControl.lastR = scaledR;
   lightControl.lastG = scaledG;
@@ -1308,8 +1430,8 @@ void applyBootIndicator()
 void updateLightControl()
 {
   // Licht ist aktiv:
-  // - waehrend showStatus.isRunning
-  // - plus Nachlauf LED_AFTER_BELUEFTEN_MS nach Belueftungsbeginn
+  // - waehrend FadeIn, Vakuumieren und Haltezeit
+  // - nicht waehrend FadeOut; dort blendet das Licht kontrolliert aus
   if (updateLightFeedback())
   {
     return;
@@ -1322,7 +1444,7 @@ void updateLightControl()
   }
 
   unsigned long now = millis();
-  bool lightWindowActive = config.lightEnabled && showStatus.isRunning;
+  bool lightWindowActive = config.lightEnabled && showStatus.isRunning && (int32_t)(showStatus.openValveAt - now) > 0;
   if (!lightWindowActive && config.lightEnabled && lightControl.onUntilAt > 0)
   {
     lightWindowActive = (int32_t)(lightControl.onUntilAt - now) > 0;
@@ -1384,6 +1506,10 @@ void setSafeOutputState()
   bootIndicatorActive = false;
   showStatus.shouldStart = false;
   showStatus.isRunning = false;
+  showStatus.fadeInDoneAt = 0;
+  showStatus.endAt = 0;
+  showStatus.openValveAt = 0;
+  showStatus.finishAt = 0;
   setPumpTarget(false);
   pumpControl.currentPwm = 0;
   applyPumpPwm(0);
@@ -1523,14 +1649,23 @@ void otaResetProgress(const String &phase, const String &source, const String &s
   otaStatus.progressBytes = 0;
   otaStatus.progressTotal = 0;
   otaStatus.progressPercent = 0;
+  otaLastPublishedProgressPercent = 255;
   otaStatus.rebootPending = false;
   otaStatus.rebootAt = 0;
+  if (mqttClient.connected())
+  {
+    publishOtaUpdateState(true);
+  }
 }
 
 void otaSetPhase(const String &phase, const String &statusText)
 {
   otaStatus.phase = phase;
   otaStatus.statusText = statusText.length() > 0 ? statusText : phase;
+  if (mqttClient.connected())
+  {
+    publishOtaUpdateState(true);
+  }
 }
 
 void otaSetProgress(size_t current, size_t total)
@@ -1550,10 +1685,23 @@ void otaSetProgress(size_t current, size_t total)
   {
     otaStatus.progressPercent = 0;
   }
+  if (mqttClient.connected())
+  {
+    if (otaStatus.progressPercent == 100 ||
+        otaLastPublishedProgressPercent == 255 ||
+        otaStatus.progressPercent == 0 ||
+        otaStatus.progressPercent >= (uint8_t)(otaLastPublishedProgressPercent + 5))
+    {
+      otaLastPublishedProgressPercent = otaStatus.progressPercent;
+      publishOtaUpdateState(true);
+    }
+  }
 }
 
 void otaScheduleRestart(const String &statusText)
 {
+  otaStatus.currentVersion = otaStatus.latestVersion.length() > 0 ? otaStatus.latestVersion : otaStatus.currentVersion;
+  otaStatus.updateAvailable = false;
   otaStatus.updateInProgress = false;
   otaStatus.rebootPending = true;
   otaStatus.rebootAt = millis() + OTA_RESTART_DELAY_MS;
@@ -1575,6 +1723,7 @@ void otaFinalizeFailure(const String &errorText)
   otaSetPhase("failed", errorText.length() > 0 ? errorText : "OTA-Update fehlgeschlagen");
   if (mqttClient.connected())
   {
+    publishOtaUpdateState(true);
     publishTelemetry(true);
   }
 }
@@ -1924,10 +2073,9 @@ bool otaApplyUpdate()
   setSafeOutputState();
   if (mqttClient.connected())
   {
+    publishOtaUpdateState(true);
     publishTelemetry(true);
-    publishAvailability("offline", true);
   }
-  mqttClient.disconnect();
 
   BearSSL::WiFiClientSecure secureClient;
   WiFiClient plainClient;
@@ -2177,6 +2325,7 @@ void mqttEnsureConnected()
     publishLightState(true);
   }
   publishConfigState(true);
+  publishOtaUpdateState(true);
   publishTelemetry(true);
 }
 
@@ -2585,8 +2734,7 @@ void publishUpdateDiscovery()
   cfg["device_class"] = "firmware";
   cfg["command_topic"] = topicOtaInstall;
   cfg["payload_install"] = "install";
-  cfg["state_topic"] = topicTeleState;
-  cfg["value_template"] = "{{ {'installed_version': value_json.OTA.CurrentVersion, 'latest_version': value_json.OTA.LatestVersion, 'title': 'VacUBear Firmware', 'release_summary': value_json.OTA.ReleaseNotes, 'in_progress': value_json.OTA.UpdateInProgress } | to_json }}";
+  cfg["state_topic"] = topicOtaState;
   cfg["availability_topic"] = topicAvailability;
   cfg["payload_available"] = "online";
   cfg["payload_not_available"] = "offline";
@@ -2849,6 +2997,10 @@ const char *getShowPhase()
   unsigned long now = millis();
   if (showStatus.isRunning)
   {
+    if (now < showStatus.fadeInDoneAt)
+    {
+      return "FadeIn";
+    }
     if (now < showStatus.endAt)
     {
       return "Vakuumieren";
@@ -2857,12 +3009,12 @@ const char *getShowPhase()
     {
       return "Haltezeit";
     }
-    return "Belueften";
+    return "FadeOut";
   }
 
-  if (showStatus.openValveAt > 0 && (now - showStatus.openValveAt) < 2000UL)
+  if (showStatus.finishAt > 0 && (now - showStatus.finishAt) < 2000UL)
   {
-    return "Belueften";
+    return "FadeOut";
   }
   return "Pause";
 }
@@ -2901,8 +3053,10 @@ void publishTelemetry(bool force)
   show["NachlaufMs"] = config.showNachlaufMs;
   show["LaengeS"] = msToSec(config.showLengthMs);
   show["NachlaufS"] = msToSec(config.showNachlaufMs);
+  show["FadeInDoneAt"] = showStatus.fadeInDoneAt;
   show["EndAt"] = showStatus.endAt;
   show["OpenValveAt"] = showStatus.openValveAt;
+  show["FinishAt"] = showStatus.finishAt;
 
   JsonObject pumpen = doc["Pumpen"].to<JsonObject>();
   pumpen["PWM"] = pumpControl.currentPwm;
@@ -2981,6 +3135,7 @@ void updateMqttTopics()
   topicCfgNachlaufSet = topicBase + "/config/nachlauf_s/set";
   topicCfgNachlaufState = topicBase + "/config/nachlauf_s/state";
   topicOtaInstall = topicBase + "/ota/update/install";
+  topicOtaState = topicBase + "/ota/update/state";
   topicAvailability = topicBase + "/availability";
   topicTeleState = "tele/" + deviceId + "/STATE";
   LOGI("MQTT topics initialized: base=%s", topicBase.c_str());
@@ -2997,6 +3152,7 @@ void setupWiFi()
 
   WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
   WiFi.hostname(deviceId.c_str());
 
   if (config.wifiSsid.length() == 0)
@@ -3038,6 +3194,7 @@ void startAccessPoint()
   // - lokale Konfiguration ueber AP
   // - gleichzeitiger STA-Reconnect im Hintergrund
   apModeIndicatorActive = HAS_LED_OUTPUT;
+  WiFi.setSleepMode(WIFI_NONE_SLEEP);
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(apSsid.c_str());
 
@@ -3934,8 +4091,10 @@ void handleApiShowGet()
   doc["phase"] = getShowPhase();
   doc["length_ms"] = config.showLengthMs;
   doc["nachlauf_ms"] = config.showNachlaufMs;
+  doc["fade_in_done_at_ms"] = showStatus.fadeInDoneAt;
   doc["end_at_ms"] = showStatus.endAt;
   doc["open_valve_at_ms"] = showStatus.openValveAt;
+  doc["finish_at_ms"] = showStatus.finishAt;
   sendJsonDocument(200, doc);
 }
 
@@ -3974,6 +4133,10 @@ void handleApiShowPost()
   response["queued_state"] = state;
   response["running"] = showStatus.isRunning;
   response["phase"] = getShowPhase();
+  response["fade_in_done_at_ms"] = showStatus.fadeInDoneAt;
+  response["end_at_ms"] = showStatus.endAt;
+  response["open_valve_at_ms"] = showStatus.openValveAt;
+  response["finish_at_ms"] = showStatus.finishAt;
   sendJsonDocument(202, response);
 }
 
