@@ -4,7 +4,7 @@
 
 namespace ShowVariantImpl
 {
-static constexpr unsigned long kValveOpenSettleMs = 2000UL;
+static constexpr unsigned long kValveOpenSettleMs = 10000UL;
 
 inline unsigned long valveInflationStartAt(const ShowStatus &status)
 {
