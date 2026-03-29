@@ -5,11 +5,17 @@
 namespace ShowVariantImpl
 {
 static constexpr unsigned long kValveJoggleIntervalMs = 200UL;
-static constexpr uint8_t kValveJoggleCount = 5U;
+static constexpr uint8_t kValveJoggleCycleCount = 5U;
+static constexpr unsigned long kValveOpenSettleMs = 1000UL;
 
 inline unsigned long valveJoggleDurationMs()
 {
-  return kValveJoggleIntervalMs * kValveJoggleCount;
+  return kValveJoggleIntervalMs * 2UL * kValveJoggleCycleCount;
+}
+
+inline unsigned long valveInflationStartAt(const ShowStatus &status)
+{
+  return status.openValveAt + valveJoggleDurationMs() + kValveOpenSettleMs;
 }
 
 inline void requestShowStart(ShowStatus &status)
@@ -63,7 +69,7 @@ inline void tickShow(ShowStatus &status,
     status.vacuumEndAt = status.fadeInDoneAt + status.showDuration;
     status.holdEndAt = status.vacuumEndAt + status.showNachlauf;
     status.openValveAt = status.holdEndAt;
-    status.finishAt = status.openValveAt + valveJoggleDurationMs() + status.showInflate;
+    status.finishAt = valveInflationStartAt(status) + status.showInflate;
     status.shouldStart = false;
     status.inflateSkipped = false;
     status.isRunning = true;
@@ -86,9 +92,15 @@ inline void tickShow(ShowStatus &status,
     if (!status.inflateSkipped && now < (status.openValveAt + valveJoggleDurationMs()))
     {
       unsigned long elapsedMs = now - status.openValveAt;
-      uint8_t toggleStep = (uint8_t)(elapsedMs / kValveJoggleIntervalMs) + 1U;
+      uint8_t toggleStep = (uint8_t)(elapsedMs / kValveJoggleIntervalMs);
       outputs.pumpMode = PUMP_MODE_OFF;
-      outputs.valveOpen = (toggleStep & 0x01U) != 0U;
+      outputs.valveOpen = (toggleStep & 0x01U) == 0U;
+      return;
+    }
+    if (!status.inflateSkipped && now < valveInflationStartAt(status))
+    {
+      outputs.pumpMode = PUMP_MODE_OFF;
+      outputs.valveOpen = true;
       return;
     }
     if (now < status.finishAt)
@@ -120,6 +132,10 @@ inline const char *getShowPhase(const ShowStatus &status, unsigned long now)
     if (!status.inflateSkipped && now < (status.openValveAt + valveJoggleDurationMs()))
     {
       return "Ventil loesen";
+    }
+    if (!status.inflateSkipped && now < valveInflationStartAt(status))
+    {
+      return "Ventil offen";
     }
     if (now < status.finishAt)
     {
