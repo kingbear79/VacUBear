@@ -20,6 +20,7 @@ static constexpr char kLegacyVariantId[] = "";
 static constexpr bool kSupportsLighting = true;
 static constexpr bool kSupportsInflation = false;
 static constexpr bool kValveOpenHigh = false;
+static constexpr uint32_t kBootInflateDurationMs = 0UL;
 static constexpr uint32_t kDefaultShowLengthMs = 10000UL;
 static constexpr uint32_t kDefaultShowNachlaufMs = 20000UL;
 static constexpr uint16_t kDefaultMqttPort = 1883;

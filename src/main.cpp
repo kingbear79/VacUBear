@@ -357,6 +357,8 @@ bool wifiStartupPending = false;
 unsigned long wifiStartupAt = 0;
 bool bootIndicatorActive = false;
 bool apModeIndicatorActive = false;
+bool bootInflateActive = false;
+unsigned long bootInflateUntilAt = 0;
 unsigned long buttonPressedAt = 0;
 bool buttonApModeTriggered = false;
 bool buttonLightToggleArmed = false;
@@ -461,6 +463,8 @@ String defaultApSsid(void);
 String defaultDeviceId(void);
 String rgbToHex(uint8_t r, uint8_t g, uint8_t b);
 void setValveOpen(bool open);
+void startBootInflate(void);
+bool updateBootInflate(unsigned long now);
 void sanitizeConfig(void);
 void applyConfigToRuntime(bool wifiChanged, bool mqttChanged, bool publishStates = true);
 void buildLightStatusJson(JsonDocument &doc);
@@ -774,9 +778,10 @@ void setup()
   pinMode(PIN_PUMPE1, OUTPUT);
   pinMode(PIN_PUMPE2, OUTPUT);
   pinMode(PIN_VENTIL, OUTPUT);
+  setValveOpen(ProductVariant::kBootInflateDurationMs > 0);
   setupPumpControl();
   setupLightControl();
-  setValveOpen(false);
+  startBootInflate();
 
   button.begin();
   buttonInputUnlocked = false;
@@ -969,6 +974,11 @@ void startShow()
 {
   // Kein direkter Start hier: wir setzen nur ein Start-Flag.
   // handleShow() uebernimmt dann atomar die Zeitstempelberechnung.
+  if (bootInflateActive)
+  {
+    LOGI("startShow ignored: boot inflate active");
+    return;
+  }
   if (showStatus.isRunning)
   {
     LOGD("startShow ignored: already running");
@@ -997,6 +1007,14 @@ void handleShow()
   // Zentrale Show-Statemachine, die in jedem loop()-Durchlauf getaktet wird.
   // Alle Aktoren werden hier konsistent aus "Zeitfenster + Status" abgeleitet.
   unsigned long now = millis();
+  if (updateBootInflate(now))
+  {
+    if (HAS_LED_OUTPUT)
+    {
+      setLightTargetLevel(0);
+    }
+    return;
+  }
   bool wasRunning = showStatus.isRunning;
   bool startPending = showStatus.shouldStart;
   ShowOutputs outputs;
@@ -1160,6 +1178,45 @@ void setValveOpen(bool open)
 {
   const bool outputHigh = ProductVariant::kValveOpenHigh ? open : !open;
   digitalWrite(PIN_VENTIL, outputHigh ? HIGH : LOW);
+}
+
+void startBootInflate()
+{
+  if (ProductVariant::kBootInflateDurationMs == 0)
+  {
+    bootInflateActive = false;
+    bootInflateUntilAt = 0;
+    setValveOpen(false);
+    return;
+  }
+
+  bootInflateActive = true;
+  bootInflateUntilAt = millis() + ProductVariant::kBootInflateDurationMs;
+  setValveOpen(true);
+  setPumpTarget(PUMP_MODE_SECONDARY);
+  LOGI("Boot inflate active for %lu ms", ProductVariant::kBootInflateDurationMs);
+}
+
+bool updateBootInflate(unsigned long now)
+{
+  if (!bootInflateActive)
+  {
+    return false;
+  }
+
+  if ((int32_t)(bootInflateUntilAt - now) > 0)
+  {
+    setPumpTarget(PUMP_MODE_SECONDARY);
+    setValveOpen(true);
+    return true;
+  }
+
+  bootInflateActive = false;
+  bootInflateUntilAt = 0;
+  setPumpTarget(PUMP_MODE_OFF);
+  setValveOpen(false);
+  LOGI("Boot inflate finished");
+  return false;
 }
 
 #if LED_COUNT > 0
@@ -1541,6 +1598,8 @@ void setSafeOutputState()
   // Wird z. B. vor OTA aufgerufen, um alle Aktoren in sicheren Zustand
   // zu bringen (Pumpen AUS, Ventil definiert, Licht AUS).
   bootIndicatorActive = false;
+  bootInflateActive = false;
+  bootInflateUntilAt = 0;
   resetShowState(showStatus);
   setPumpTarget(PUMP_MODE_OFF);
   pumpControl.currentPwm = 0;
@@ -3087,6 +3146,10 @@ void publishSensorDiscovery()
 const char *getShowPhase()
 {
   // Menschlich lesbare Show-Phase fuer Telemetrie/UI.
+  if (bootInflateActive)
+  {
+    return "Bootschutz";
+  }
   return getShowVariantPhase(showStatus, millis());
 }
 
