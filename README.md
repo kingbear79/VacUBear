@@ -474,7 +474,7 @@ Voraussetzungen:
 | `<base>/config/show_length_s/state` | vom Geraet | Ganzzahl in Sekunden | Aktuell gespeicherte Show-Laenge |
 | `<base>/config/nachlauf_s/set` | zu Geraet | Ganzzahl in Sekunden | Setzt die Nachlaufzeit |
 | `<base>/config/nachlauf_s/state` | vom Geraet | Ganzzahl in Sekunden | Aktuell gespeicherte Nachlaufzeit |
-| `<base>/config/inflate_s/set` | zu Geraet | Ganzzahl in Sekunden | Nur bei Varianten mit aktiver Aufblas-Phase: setzt die Aufblas-Zeit; die Firmware begrenzt sie auf die Vakuumierzeit |
+| `<base>/config/inflate_s/set` | zu Geraet | Ganzzahl in Sekunden | Nur bei Varianten mit aktiver Aufblas-Phase: setzt die Aufblas-Zeit; die Firmware akzeptiert jeden nichtnegativen Wert |
 | `<base>/config/inflate_s/state` | vom Geraet | Ganzzahl in Sekunden | Nur bei Varianten mit aktiver Aufblas-Phase: aktuell gespeicherte Aufblas-Zeit |
 | `<base>/ota/update/install` | zu Geraet | `install` | Startet ein OTA-Update, wenn bereits ein Update gefunden wurde |
 | `<base>/ota/update/state` | vom Geraet | JSON | Retainter OTA-Zustand fuer Home Assistant (`installed_version`, `latest_version`, `in_progress`, `update_percentage`) |

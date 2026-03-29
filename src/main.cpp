@@ -84,8 +84,6 @@ static const uint32_t SHOW_LENGTH_MIN_S = 10UL;
 static const uint32_t SHOW_LENGTH_MAX_S = 60UL;
 static const uint32_t SHOW_NACHLAUF_MIN_S = 5UL;
 static const uint32_t SHOW_INFLATE_MIN_S = 0UL;
-static const uint32_t SHOW_INFLATE_MAX_FACTOR_NUM = 3UL;
-static const uint32_t SHOW_INFLATE_MAX_FACTOR_DEN = 2UL;
 static const uint32_t SHOW_LENGTH_MIN_MS = SHOW_LENGTH_MIN_S * 1000UL;
 static const uint32_t SHOW_LENGTH_MAX_MS = SHOW_LENGTH_MAX_S * 1000UL;
 static const uint32_t SHOW_NACHLAUF_MIN_MS = SHOW_NACHLAUF_MIN_S * 1000UL;
@@ -130,7 +128,6 @@ static const bool SUPPORTS_INFLATION = ProductVariant::kSupportsInflation;
 
 uint32_t defaultInflateDurationMs(uint32_t showLengthMs);
 uint32_t clampInflateDurationMs(uint32_t valueMs, uint32_t showLengthMs);
-uint32_t maxInflateDurationMs(uint32_t showLengthMs);
 
 // Persistente Anwender-Konfiguration (LittleFS JSON).
 struct AppConfig
@@ -381,7 +378,6 @@ void updatePumpControl(void);
 void applyPumpPwm(uint16_t pwm);
 uint32_t defaultInflateDurationMs(uint32_t showLengthMs);
 uint32_t clampInflateDurationMs(uint32_t valueMs, uint32_t showLengthMs);
-uint32_t maxInflateDurationMs(uint32_t showLengthMs);
 void setupLightControl(void);
 void updateLightControl(void);
 void setLightTargetLevel(uint16_t level);
@@ -3078,8 +3074,7 @@ void publishSensorDiscovery()
     cfg["command_topic"] = topicCfgInflateSet;
     cfg["state_topic"] = topicCfgInflateState;
     cfg["unit_of_measurement"] = "s";
-    cfg["min"] = SHOW_LENGTH_MIN_S;
-    cfg["max"] = (SHOW_LENGTH_MAX_S * SHOW_INFLATE_MAX_FACTOR_NUM) / SHOW_INFLATE_MAX_FACTOR_DEN;
+    cfg["min"] = SHOW_INFLATE_MIN_S;
     cfg["step"] = 1;
     cfg["mode"] = "box";
     cfg["availability_topic"] = topicAvailability;
@@ -5022,29 +5017,13 @@ uint32_t defaultInflateDurationMs(uint32_t showLengthMs)
   return showLengthMs;
 }
 
-uint32_t maxInflateDurationMs(uint32_t showLengthMs)
-{
-  if (!SUPPORTS_INFLATION || showLengthMs == 0)
-    return 0;
-
-  uint64_t scaled = (uint64_t)showLengthMs * SHOW_INFLATE_MAX_FACTOR_NUM;
-  scaled /= SHOW_INFLATE_MAX_FACTOR_DEN;
-  if (scaled > UINT32_MAX)
-    return UINT32_MAX;
-  return (uint32_t)scaled;
-}
-
 uint32_t clampInflateDurationMs(uint32_t valueMs, uint32_t showLengthMs)
 {
+  (void)showLengthMs;
   if (!SUPPORTS_INFLATION)
     return 0;
 
-  uint32_t minMs = (showLengthMs > 0) ? showLengthMs : (SHOW_INFLATE_MIN_S * 1000UL);
-  uint32_t maxMs = maxInflateDurationMs(showLengthMs);
-  uint32_t clampedMs = clampMinU32(valueMs, minMs);
-  if (maxMs > 0 && clampedMs > maxMs)
-    clampedMs = maxMs;
-  return clampedMs;
+  return clampMinU32(valueMs, SHOW_INFLATE_MIN_S * 1000UL);
 }
 
 uint32_t clampMinU32(uint32_t value, uint32_t minValue)
@@ -5218,8 +5197,8 @@ String buildHtmlPage(const String &message)
   html += "<label>Nachlaufzeit (ms)</label><input name='show_nachlauf' type='number' min='" + String(SHOW_NACHLAUF_MIN_MS) + "' value='" + String(config.showNachlaufMs) + "'>";
   if (SUPPORTS_INFLATION)
   {
-    html += "<label>Aufblaszeit (ms)</label><input name='show_inflate' type='number' min='" + String(config.showLengthMs) + "' max='" + String(maxInflateDurationMs(config.showLengthMs)) + "' value='" + String(config.showInflateMs) + "'>";
-    html += "<div class='small'>Die Aufblaszeit ist immer mindestens so lang wie die Vakuumierzeit und wird maximal auf Vakuumierzeit + 50% begrenzt. Beide Pumpen laufen dadurch niemals gleichzeitig.</div>";
+    html += "<label>Aufblaszeit (ms)</label><input name='show_inflate' type='number' min='0' value='" + String(config.showInflateMs) + "'>";
+    html += "<div class='small'>Die Aufblaszeit ist frei einstellbar. Die Firmware verwirft nur negative Werte.</div>";
   }
   if (HAS_LED_OUTPUT)
   {
