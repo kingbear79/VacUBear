@@ -776,7 +776,7 @@ void setup()
   pinMode(PIN_VENTIL, OUTPUT);
   setupPumpControl();
   setupLightControl();
-  digitalWrite(PIN_VENTIL, LOW);
+  setValveOpen(false);
 
   button.begin();
   buttonInputUnlocked = false;
@@ -1158,7 +1158,8 @@ void applyPumpPwm(uint16_t pwm)
 
 void setValveOpen(bool open)
 {
-  digitalWrite(PIN_VENTIL, open ? HIGH : LOW);
+  const bool outputHigh = ProductVariant::kValveOpenHigh ? open : !open;
+  digitalWrite(PIN_VENTIL, outputHigh ? HIGH : LOW);
 }
 
 #if LED_COUNT > 0
@@ -1553,7 +1554,7 @@ void setSafeOutputState()
   lightControl.currentLevel = 0;
   lightControl.targetLevel = 0;
   applyLightOutput(true);
-  digitalWrite(PIN_VENTIL, LOW);
+  setValveOpen(false);
 }
 
 static bool isDigitChar(char c)

@@ -101,10 +101,6 @@ inline const char *getShowPhase(const ShowStatus &status, unsigned long now)
     {
       return "Haltezeit";
     }
-    if (now < status.openValveAt)
-    {
-      return "Aufblasen";
-    }
     if (now < status.finishAt)
     {
       return status.inflateSkipped ? "Belueften" : "Aufblasen";
