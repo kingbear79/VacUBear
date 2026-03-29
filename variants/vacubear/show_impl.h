@@ -52,6 +52,7 @@ inline void tickShow(ShowStatus &status,
     status.openValveAt = status.holdEndAt;
     status.finishAt = status.openValveAt + effectiveFadeOutMs;
     status.shouldStart = false;
+    status.inflateSkipped = false;
     status.isRunning = true;
     lightOnUntilAt = status.openValveAt;
     outputs.applyLightTarget = true;
@@ -128,5 +129,6 @@ inline void resetShowState(ShowStatus &status)
   status.holdEndAt = 0;
   status.openValveAt = 0;
   status.finishAt = 0;
+  status.inflateSkipped = false;
 }
 } // namespace ShowVariantImpl

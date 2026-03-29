@@ -28,7 +28,8 @@ inline bool requestShowStop(ShowStatus &status, unsigned long now, bool lighting
   status.vacuumEndAt = stopAt;
   status.holdEndAt = stopAt;
   status.openValveAt = stopAt;
-  status.finishAt = stopAt;
+  status.finishAt = stopAt + 1000UL;
+  status.inflateSkipped = true;
   return true;
 }
 
@@ -53,9 +54,10 @@ inline void tickShow(ShowStatus &status,
     status.fadeInDoneAt = now;
     status.vacuumEndAt = status.fadeInDoneAt + status.showDuration;
     status.holdEndAt = status.vacuumEndAt + status.showNachlauf;
-    status.openValveAt = status.holdEndAt + status.showInflate;
-    status.finishAt = status.openValveAt;
+    status.openValveAt = status.holdEndAt;
+    status.finishAt = status.openValveAt + status.showInflate;
     status.shouldStart = false;
+    status.inflateSkipped = false;
     status.isRunning = true;
   }
 
@@ -64,25 +66,19 @@ inline void tickShow(ShowStatus &status,
     if (now < status.vacuumEndAt)
     {
       outputs.pumpMode = PUMP_MODE_PRIMARY;
-      outputs.valveOpen = true;
+      outputs.valveOpen = false;
       return;
     }
     if (now < status.holdEndAt)
     {
       outputs.pumpMode = PUMP_MODE_OFF;
-      outputs.valveOpen = true;
-      return;
-    }
-    if (now < status.openValveAt)
-    {
-      outputs.pumpMode = PUMP_MODE_SECONDARY;
-      outputs.valveOpen = true;
+      outputs.valveOpen = false;
       return;
     }
     if (now < status.finishAt)
     {
-      outputs.pumpMode = PUMP_MODE_OFF;
-      outputs.valveOpen = false;
+      outputs.pumpMode = status.inflateSkipped ? PUMP_MODE_OFF : PUMP_MODE_SECONDARY;
+      outputs.valveOpen = true;
       return;
     }
 
@@ -109,6 +105,10 @@ inline const char *getShowPhase(const ShowStatus &status, unsigned long now)
     {
       return "Aufblasen";
     }
+    if (now < status.finishAt)
+    {
+      return status.inflateSkipped ? "Belueften" : "Aufblasen";
+    }
     return "Belueften";
   }
 
@@ -129,5 +129,6 @@ inline void resetShowState(ShowStatus &status)
   status.holdEndAt = 0;
   status.openValveAt = 0;
   status.finishAt = 0;
+  status.inflateSkipped = false;
 }
 } // namespace ShowVariantImpl

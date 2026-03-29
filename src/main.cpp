@@ -84,6 +84,8 @@ static const uint32_t SHOW_LENGTH_MIN_S = 10UL;
 static const uint32_t SHOW_LENGTH_MAX_S = 60UL;
 static const uint32_t SHOW_NACHLAUF_MIN_S = 5UL;
 static const uint32_t SHOW_INFLATE_MIN_S = 0UL;
+static const uint32_t SHOW_INFLATE_MAX_FACTOR_NUM = 3UL;
+static const uint32_t SHOW_INFLATE_MAX_FACTOR_DEN = 2UL;
 static const uint32_t SHOW_LENGTH_MIN_MS = SHOW_LENGTH_MIN_S * 1000UL;
 static const uint32_t SHOW_LENGTH_MAX_MS = SHOW_LENGTH_MAX_S * 1000UL;
 static const uint32_t SHOW_NACHLAUF_MIN_MS = SHOW_NACHLAUF_MIN_S * 1000UL;
@@ -126,6 +128,10 @@ static const bool HAS_LED_OUTPUT = false;
 #endif
 static const bool SUPPORTS_INFLATION = ProductVariant::kSupportsInflation;
 
+uint32_t defaultInflateDurationMs(uint32_t showLengthMs);
+uint32_t clampInflateDurationMs(uint32_t valueMs, uint32_t showLengthMs);
+uint32_t maxInflateDurationMs(uint32_t showLengthMs);
+
 // Persistente Anwender-Konfiguration (LittleFS JSON).
 struct AppConfig
 {
@@ -157,7 +163,7 @@ struct AppConfig
         otaManifestUrl(DEFAULT_OTA_MANIFEST_URL),
         showLengthMs(DEFAULT_SHOW_LENGTH_MS),
         showNachlaufMs(DEFAULT_SHOW_NACHLAUF_MS),
-        showInflateMs((ProductVariant::kSupportsInflation && DEFAULT_SHOW_LENGTH_MS > 0) ? ((DEFAULT_SHOW_LENGTH_MS * 2UL) / 3UL) : 0UL),
+        showInflateMs(defaultInflateDurationMs(DEFAULT_SHOW_LENGTH_MS)),
         lightEnabled(true),
         lightR(255),
         lightG(255),
@@ -302,7 +308,7 @@ struct ParsedHttpUrl
 Button button(PIN_TASTER, 25, true);
 ShowStatus showStatus(DEFAULT_SHOW_LENGTH_MS,
                       DEFAULT_SHOW_NACHLAUF_MS,
-                      (ProductVariant::kSupportsInflation && DEFAULT_SHOW_LENGTH_MS > 0) ? ((DEFAULT_SHOW_LENGTH_MS * 2UL) / 3UL) : 0UL);
+                      defaultInflateDurationMs(DEFAULT_SHOW_LENGTH_MS));
 AppConfig config;
 ESP8266WebServer server(80);
 DNSServer dnsServer;
@@ -373,6 +379,7 @@ void updatePumpControl(void);
 void applyPumpPwm(uint16_t pwm);
 uint32_t defaultInflateDurationMs(uint32_t showLengthMs);
 uint32_t clampInflateDurationMs(uint32_t valueMs, uint32_t showLengthMs);
+uint32_t maxInflateDurationMs(uint32_t showLengthMs);
 void setupLightControl(void);
 void updateLightControl(void);
 void setLightTargetLevel(uint16_t level);
@@ -3011,8 +3018,8 @@ void publishSensorDiscovery()
     cfg["command_topic"] = topicCfgInflateSet;
     cfg["state_topic"] = topicCfgInflateState;
     cfg["unit_of_measurement"] = "s";
-    cfg["min"] = SHOW_INFLATE_MIN_S;
-    cfg["max"] = SHOW_LENGTH_MAX_S;
+    cfg["min"] = SHOW_LENGTH_MIN_S;
+    cfg["max"] = (SHOW_LENGTH_MAX_S * SHOW_INFLATE_MAX_FACTOR_NUM) / SHOW_INFLATE_MAX_FACTOR_DEN;
     cfg["step"] = 1;
     cfg["mode"] = "box";
     cfg["availability_topic"] = topicAvailability;
@@ -4946,9 +4953,21 @@ uint32_t clampU32(uint32_t value, uint32_t minValue, uint32_t maxValue)
 
 uint32_t defaultInflateDurationMs(uint32_t showLengthMs)
 {
+  if (!SUPPORTS_INFLATION)
+    return 0;
+  return showLengthMs;
+}
+
+uint32_t maxInflateDurationMs(uint32_t showLengthMs)
+{
   if (!SUPPORTS_INFLATION || showLengthMs == 0)
     return 0;
-  return (showLengthMs * 2UL) / 3UL;
+
+  uint64_t scaled = (uint64_t)showLengthMs * SHOW_INFLATE_MAX_FACTOR_NUM;
+  scaled /= SHOW_INFLATE_MAX_FACTOR_DEN;
+  if (scaled > UINT32_MAX)
+    return UINT32_MAX;
+  return (uint32_t)scaled;
 }
 
 uint32_t clampInflateDurationMs(uint32_t valueMs, uint32_t showLengthMs)
@@ -4956,9 +4975,11 @@ uint32_t clampInflateDurationMs(uint32_t valueMs, uint32_t showLengthMs)
   if (!SUPPORTS_INFLATION)
     return 0;
 
-  uint32_t clampedMs = clampMinU32(valueMs, SHOW_INFLATE_MIN_S * 1000UL);
-  if (clampedMs > showLengthMs)
-    clampedMs = showLengthMs;
+  uint32_t minMs = (showLengthMs > 0) ? showLengthMs : (SHOW_INFLATE_MIN_S * 1000UL);
+  uint32_t maxMs = maxInflateDurationMs(showLengthMs);
+  uint32_t clampedMs = clampMinU32(valueMs, minMs);
+  if (maxMs > 0 && clampedMs > maxMs)
+    clampedMs = maxMs;
   return clampedMs;
 }
 
@@ -5133,8 +5154,8 @@ String buildHtmlPage(const String &message)
   html += "<label>Nachlaufzeit (ms)</label><input name='show_nachlauf' type='number' min='" + String(SHOW_NACHLAUF_MIN_MS) + "' value='" + String(config.showNachlaufMs) + "'>";
   if (SUPPORTS_INFLATION)
   {
-    html += "<label>Aufblaszeit (ms)</label><input name='show_inflate' type='number' min='0' max='" + String(config.showLengthMs) + "' value='" + String(config.showInflateMs) + "'>";
-    html += "<div class='small'>Die Aufblaszeit wird automatisch auf die letzte Vakuumierzeit begrenzt, damit beide Pumpen niemals gleichzeitig laufen und die Hardware geschuetzt bleibt.</div>";
+    html += "<label>Aufblaszeit (ms)</label><input name='show_inflate' type='number' min='" + String(config.showLengthMs) + "' max='" + String(maxInflateDurationMs(config.showLengthMs)) + "' value='" + String(config.showInflateMs) + "'>";
+    html += "<div class='small'>Die Aufblaszeit ist immer mindestens so lang wie die Vakuumierzeit und wird maximal auf Vakuumierzeit + 50% begrenzt. Beide Pumpen laufen dadurch niemals gleichzeitig.</div>";
   }
   if (HAS_LED_OUTPUT)
   {

@@ -20,6 +20,7 @@ struct ShowStatus
   unsigned long openValveAt;
   unsigned long finishAt;
   bool shouldStart;
+  bool inflateSkipped;
   unsigned long showDuration;
   unsigned long showNachlauf;
   unsigned long showInflate;
@@ -32,6 +33,7 @@ struct ShowStatus
         openValveAt(0),
         finishAt(0),
         shouldStart(false),
+        inflateSkipped(false),
         showDuration(defaultDuration),
         showNachlauf(defaultNachlauf),
         showInflate(defaultInflate)
