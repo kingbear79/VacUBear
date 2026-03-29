@@ -11,6 +11,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include "pins.h"
+#include "variant_config.h"
 #if LED_COUNT > 0
 extern "C"
 {
@@ -46,9 +47,6 @@ extern "C"
 #define LOGW(...)
 #define LOGD(...)
 #endif
-
-#define SHOW_LENGTH 10000UL
-#define SHOW_NACHLAUF 20000UL
 
 #ifndef FW_VERSION
 #define FW_VERSION "0.0.0-dev"
@@ -112,9 +110,13 @@ static const uint32_t SK6812_T0H_NS = 350UL;
 static const uint32_t SK6812_T1H_NS = 700UL;
 static const uint32_t SK6812_RESET_US = 90UL;
 static const uint32_t TELEMETRY_INTERVAL_MS = TELEMETRY_INTERVAL_MS_CFG;
+static const uint32_t DEFAULT_SHOW_LENGTH_MS = ProductVariant::kDefaultShowLengthMs;
+static const uint32_t DEFAULT_SHOW_NACHLAUF_MS = ProductVariant::kDefaultShowNachlaufMs;
+static const uint16_t DEFAULT_MQTT_PORT = ProductVariant::kDefaultMqttPort;
+static const char *DEFAULT_OTA_MANIFEST_URL = (OTA_MANIFEST_URL[0] != '\0') ? OTA_MANIFEST_URL : ProductVariant::kDefaultOtaManifestUrl;
 
 static const char *CONFIG_FILE = "/config.json";
-static const char *DEVICE_PREFIX = "vacubear";
+static const char *DEVICE_PREFIX = ProductVariant::kId;
 #if LED_COUNT > 0
 static const bool HAS_LED_OUTPUT = true;
 #else
@@ -144,13 +146,13 @@ struct AppConfig
       : wifiSsid(""),
         wifiPassword(""),
         mqttHost(""),
-        mqttPort(1883),
+        mqttPort(DEFAULT_MQTT_PORT),
         mqttUser(""),
         mqttPassword(""),
         mqttTopic(""),
-        otaManifestUrl(OTA_MANIFEST_URL),
-        showLengthMs(SHOW_LENGTH),
-        showNachlaufMs(SHOW_NACHLAUF),
+        otaManifestUrl(DEFAULT_OTA_MANIFEST_URL),
+        showLengthMs(DEFAULT_SHOW_LENGTH_MS),
+        showNachlaufMs(DEFAULT_SHOW_NACHLAUF_MS),
         lightEnabled(true),
         lightR(255),
         lightG(255),
@@ -186,8 +188,8 @@ public:
         openValveAt(0),
         finishAt(0),
         shouldStart(false),
-        showDuration(SHOW_LENGTH),
-        showNachlauf(SHOW_NACHLAUF)
+        showDuration(DEFAULT_SHOW_LENGTH_MS),
+        showNachlauf(DEFAULT_SHOW_NACHLAUF_MS)
   {
   }
 };
@@ -466,6 +468,7 @@ String buildHtmlPage(const String &message = "");
 void sendHtmlPage(const String &message = "", int statusCode = 200);
 bool isIpAddress(const String &host);
 bool isLegacyOtaManifestUrl(const String &url);
+bool isLegacyDefaultMqttTopic(const String &topic);
 String defaultApSsid(void);
 String defaultDeviceId(void);
 String rgbToHex(uint8_t r, uint8_t g, uint8_t b);
@@ -496,14 +499,14 @@ void sanitizeConfig()
   config.otaManifestUrl.trim();
   if (config.otaManifestUrl.length() == 0 || isLegacyOtaManifestUrl(config.otaManifestUrl))
   {
-    config.otaManifestUrl = String(OTA_MANIFEST_URL);
+    config.otaManifestUrl = String(DEFAULT_OTA_MANIFEST_URL);
   }
 
   if (config.mqttPort == 0)
   {
-    config.mqttPort = 1883;
+    config.mqttPort = DEFAULT_MQTT_PORT;
   }
-  if (config.mqttTopic.length() == 0 || config.mqttTopic == "vacubear" || config.mqttTopic.startsWith("vacubear/"))
+  if (config.mqttTopic.length() == 0 || isLegacyDefaultMqttTopic(config.mqttTopic))
   {
     config.mqttTopic = deviceId;
   }
@@ -660,7 +663,7 @@ void publishOtaUpdateState(bool retained)
 
   doc["installed_version"] = otaStatus.currentVersion;
   doc["latest_version"] = effectiveLatestVersion;
-  doc["title"] = "VacUBear Firmware";
+  doc["title"] = ProductVariant::kFirmwareTitle;
   doc["release_summary"] = otaStatus.releaseNotes;
   doc["in_progress"] = installBusy;
   if (installBusy)
@@ -757,7 +760,7 @@ void setup()
 {
   // setup() initialisiert nur. Die eigentliche Ablaufsteuerung passiert in loop().
   Serial.begin(115200);
-  LOGI("Booting VacUBear firmware");
+  LOGI("Booting %s", ProductVariant::kFirmwareTitle);
   otaStatus.currentVersion = String(FW_VERSION);
 
   pinMode(PIN_PUMPE1, OUTPUT);
@@ -2669,7 +2672,7 @@ void publishDiscovery()
   JsonObject swDevice = switchCfg["device"].to<JsonObject>();
   JsonArray swIds = swDevice["identifiers"].to<JsonArray>();
   swIds.add(deviceId);
-  swDevice["name"] = "VacUBear";
+  swDevice["name"] = ProductVariant::kDisplayName;
   swDevice["manufacturer"] = "KingBEAR";
   swDevice["model"] = "Frame-25";
 
@@ -2699,7 +2702,7 @@ void publishDiscovery()
     JsonObject lightDevice = lightCfg["device"].to<JsonObject>();
     JsonArray lightIds = lightDevice["identifiers"].to<JsonArray>();
     lightIds.add(deviceId);
-    lightDevice["name"] = "VacUBear";
+    lightDevice["name"] = ProductVariant::kDisplayName;
     lightDevice["manufacturer"] = "KingBEAR";
     lightDevice["model"] = "Frame-25";
 
@@ -2742,7 +2745,7 @@ void publishUpdateDiscovery()
   JsonObject dev = cfg["device"].to<JsonObject>();
   JsonArray ids = dev["identifiers"].to<JsonArray>();
   ids.add(deviceId);
-  dev["name"] = "VacUBear";
+  dev["name"] = ProductVariant::kDisplayName;
   dev["manufacturer"] = "KingBEAR";
   dev["model"] = "Frame-25";
 
@@ -2759,7 +2762,7 @@ void publishSensorDiscovery()
     JsonObject dev = obj["device"].to<JsonObject>();
     JsonArray ids = dev["identifiers"].to<JsonArray>();
     ids.add(deviceId);
-    dev["name"] = "VacUBear";
+    dev["name"] = ProductVariant::kDisplayName;
     dev["manufacturer"] = "KingBEAR";
     dev["model"] = "Frame-25";
   };
@@ -3113,7 +3116,7 @@ void updateMqttTopics()
   // Normalisiert Basis-Topic und erzeugt daraus alle Einzel-Topics.
   topicBase = config.mqttTopic;
   topicBase.trim();
-  if (topicBase.length() == 0 || topicBase == "vacubear" || topicBase.startsWith("vacubear/"))
+  if (topicBase.length() == 0 || isLegacyDefaultMqttTopic(topicBase))
   {
     topicBase = deviceId;
   }
@@ -4737,15 +4740,26 @@ bool isLegacyOtaManifestUrl(const String &url)
   normalized.trim();
   normalized.toLowerCase();
   return normalized.endsWith("/releases/latest/download/manifest.json") ||
-         normalized.indexOf("raw.githubusercontent.com/kingbear79/vacubear/") >= 0 ||
-         normalized.indexOf("ota.kinkbear.de/") >= 0 ||
-         normalized.indexOf("ota.kingbear.de/master/") >= 0;
+         normalized.indexOf(ProductVariant::kLegacyGitHubPathToken) >= 0 ||
+         normalized.indexOf(ProductVariant::kLegacyOtaHostToken) >= 0 ||
+         normalized.indexOf(ProductVariant::kLegacyMasterPathToken) >= 0;
+}
+
+bool isLegacyDefaultMqttTopic(const String &topic)
+{
+  String normalized = topic;
+  normalized.trim();
+  normalized.toLowerCase();
+
+  String base = ProductVariant::kId;
+  base.toLowerCase();
+  return normalized == base || normalized.startsWith(base + "/");
 }
 
 String defaultApSsid()
 {
   char buf[24];
-  snprintf(buf, sizeof(buf), "VacUBear-%06X", ESP.getChipId());
+  snprintf(buf, sizeof(buf), "%s-%06X", ProductVariant::kApSsidPrefix, ESP.getChipId());
   return String(buf);
 }
 
@@ -4901,7 +4915,7 @@ String buildHtmlPage(const String &message)
   html.reserve(24000);
   html += "<!doctype html><html><head><meta charset='utf-8'>";
   html += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>VacUBear Setup</title>";
+  html += "<title>" + String(ProductVariant::kSetupPageTitle) + "</title>";
   html += "<style>body{font-family:Arial,sans-serif;background:#f3f5f8;color:#17212b;margin:0;}";
   html += ".wrap{max-width:760px;margin:24px auto;padding:0 14px;}";
   html += ".card{background:#fff;border-radius:12px;padding:16px;box-shadow:0 6px 22px rgba(0,0,0,.08);}";
@@ -4927,7 +4941,7 @@ String buildHtmlPage(const String &message)
   html += ".progress-bar{height:100%;width:0;background:linear-gradient(90deg,#005bbb,#0f766e);transition:width .25s ease;}";
   html += "hr{border:0;border-top:1px solid #d7dee6;margin:18px 0;}";
   html += ".small{color:#5a6978;font-size:.9rem;margin-top:10px;}</style></head><body><div class='wrap'><div class='card'>";
-  html += "<h2>VacUBear WiFi / MQTT Setup</h2>";
+  html += "<h2>" + String(ProductVariant::kSetupPageHeader) + "</h2>";
   html += "<div class='status'>" + stateText + "<br>AP SSID: <strong>" + htmlEscape(apSsid) + "</strong>";
   if (captivePortalEnabled)
   {

@@ -1,5 +1,5 @@
 {
   "version": "0.1.4-passionate_gimp",
   "firmware_url": "http://ota.kingbear.de/vacubear/firmware.bin",
-  "notes": "Aenderungen seit Version 0.1.4-passionate_gimp:\n- Keine zusaetzlichen Commits seit dem letzten Versionssprung."
+  "notes": "Aenderungen seit Version 0.1.4-passionate_gimp:\n- Use project-specific OTA deployment path"
 }
