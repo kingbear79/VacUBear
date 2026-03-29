@@ -963,14 +963,14 @@ void handleShow()
   bool startPending = showStatus.shouldStart;
   ShowOutputs outputs;
 
-  tickVacubearShow(showStatus,
-                   now,
-                   HAS_LED_OUTPUT && config.lightEnabled,
-                   LED_FADE_IN_MS,
-                   LED_FADE_OUT_MS,
-                   LIGHT_LEVEL_MAX,
-                   lightControl.onUntilAt,
-                   outputs);
+  tickShowVariant(showStatus,
+                  now,
+                  HAS_LED_OUTPUT && config.lightEnabled,
+                  LED_FADE_IN_MS,
+                  LED_FADE_OUT_MS,
+                  LIGHT_LEVEL_MAX,
+                  lightControl.onUntilAt,
+                  outputs);
 
   if (outputs.applyLightTarget)
   {
@@ -2942,7 +2942,7 @@ void publishSensorDiscovery()
 const char *getShowPhase()
 {
   // Menschlich lesbare Show-Phase fuer Telemetrie/UI.
-  return getVacubearShowPhase(showStatus, millis());
+  return getShowVariantPhase(showStatus, millis());
 }
 
 void publishTelemetry(bool force)

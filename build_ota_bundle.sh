@@ -66,7 +66,51 @@ extract_repo_slug() {
 }
 
 extract_ota_manifest_url() {
-  local line
+  local value line
+
+  if value="$(python3 - "${PROJECT_DIR}" "${PIO_ENV}" <<'PY'
+import json
+import subprocess
+import sys
+
+project_dir = sys.argv[1]
+env_name = sys.argv[2]
+
+try:
+    output = subprocess.check_output(
+        ["pio", "project", "config", "--project-dir", project_dir, "--json-output"],
+        text=True,
+    )
+    config = json.loads(output)
+except Exception:
+    sys.exit(1)
+
+target_section = f"env:{env_name}"
+for section_name, entries in config:
+    if section_name != target_section:
+        continue
+    for key, value in entries:
+        if key != "build_flags":
+            continue
+        flags = value if isinstance(value, list) else str(value).splitlines()
+        for flag in flags:
+            if not isinstance(flag, str):
+                continue
+            if flag.startswith("-DOTA_MANIFEST_URL="):
+                resolved = flag.split("=", 1)[1].replace('\\"', '"').strip('"')
+                print(resolved)
+                sys.exit(0)
+    break
+
+sys.exit(1)
+PY
+)"; then
+    if [[ -n "${value}" ]]; then
+      printf '%s' "${value}"
+      return 0
+    fi
+  fi
+
   line="$(grep -E '^[[:space:]]*-DOTA_MANIFEST_URL=' "${PLATFORMIO_INI}" | head -n1 || true)"
   if [[ -z "${line}" ]]; then
     return 1

@@ -10,10 +10,26 @@ Dieses Projekt laeuft auf ESP8266/ESP-12F und steuert Pumpen, Ventil, OTA und di
 ## Build
 
 - PlatformIO Environment: `vacubear`
+- Vorbereitete zweite Variante: `ableger`
 - Kompatibilitaetsalias: `esp12f`
 - Board: `esp12e` (kompatibel zu ESP-12F)
 - Standard-OTA-Manifest: `http://ota.kingbear.de/vacubear/manifest.json`
 - Aktive Produktvariante: `variants/vacubear/variant.h`
+
+### Variantenstruktur
+
+- `variants/vacubear/`
+  Produktkonstanten und Show-Implementierung fuer VacUBear
+- `variants/ableger/`
+  vorbereitete zweite Variante als Platzhalter fuer den kuenftigen Ableger
+- `src/show/show_variant.cpp`
+  bindet die jeweilige Show-Implementierung ueber den Include-Pfad der aktiven Variante ein
+
+Aktueller Stand:
+
+- `vacubear` ist funktional der produktive Stand
+- `ableger` ist ein Build-Skelett mit eigener Variante, eigenem OTA-Pfad und deaktivierter LED-Ausgabe
+- die konkrete Ableger-Show und die finalen Benennungen koennen darauf jetzt separat aufgebaut werden
 
 ## FT232RL Programmieradapter
 

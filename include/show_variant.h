@@ -44,13 +44,13 @@ struct ShowOutputs
 
 void requestShowStart(ShowStatus &status);
 bool requestShowStop(ShowStatus &status, unsigned long now, bool lightingActive, uint32_t fadeOutMs, unsigned long &lightOnUntilAt);
-void tickVacubearShow(ShowStatus &status,
-                      unsigned long now,
-                      bool lightingActive,
-                      uint32_t fadeInMs,
-                      uint32_t fadeOutMs,
-                      uint16_t lightLevelMax,
-                      unsigned long &lightOnUntilAt,
-                      ShowOutputs &outputs);
-const char *getVacubearShowPhase(const ShowStatus &status, unsigned long now);
+void tickShowVariant(ShowStatus &status,
+                     unsigned long now,
+                     bool lightingActive,
+                     uint32_t fadeInMs,
+                     uint32_t fadeOutMs,
+                     uint16_t lightLevelMax,
+                     unsigned long &lightOnUntilAt,
+                     ShowOutputs &outputs);
+const char *getShowVariantPhase(const ShowStatus &status, unsigned long now);
 void resetShowState(ShowStatus &status);

@@ -1,6 +1,10 @@
+#pragma once
+
 #include "show_variant.h"
 
-void requestShowStart(ShowStatus &status)
+namespace ShowVariantImpl
+{
+inline void requestShowStart(ShowStatus &status)
 {
   if (status.isRunning)
   {
@@ -9,7 +13,7 @@ void requestShowStart(ShowStatus &status)
   status.shouldStart = true;
 }
 
-bool requestShowStop(ShowStatus &status, unsigned long now, bool lightingActive, uint32_t fadeOutMs, unsigned long &lightOnUntilAt)
+inline bool requestShowStop(ShowStatus &status, unsigned long now, bool lightingActive, uint32_t fadeOutMs, unsigned long &lightOnUntilAt)
 {
   if (!status.isRunning)
   {
@@ -26,14 +30,14 @@ bool requestShowStop(ShowStatus &status, unsigned long now, bool lightingActive,
   return true;
 }
 
-void tickVacubearShow(ShowStatus &status,
-                      unsigned long now,
-                      bool lightingActive,
-                      uint32_t fadeInMs,
-                      uint32_t fadeOutMs,
-                      uint16_t lightLevelMax,
-                      unsigned long &lightOnUntilAt,
-                      ShowOutputs &outputs)
+inline void tickShow(ShowStatus &status,
+                     unsigned long now,
+                     bool lightingActive,
+                     uint32_t fadeInMs,
+                     uint32_t fadeOutMs,
+                     uint16_t lightLevelMax,
+                     unsigned long &lightOnUntilAt,
+                     ShowOutputs &outputs)
 {
   outputs = ShowOutputs();
 
@@ -86,7 +90,7 @@ void tickVacubearShow(ShowStatus &status,
   outputs.valveOpen = false;
 }
 
-const char *getVacubearShowPhase(const ShowStatus &status, unsigned long now)
+inline const char *getShowPhase(const ShowStatus &status, unsigned long now)
 {
   if (status.isRunning)
   {
@@ -113,7 +117,7 @@ const char *getVacubearShowPhase(const ShowStatus &status, unsigned long now)
   return "Pause";
 }
 
-void resetShowState(ShowStatus &status)
+inline void resetShowState(ShowStatus &status)
 {
   status.shouldStart = false;
   status.isRunning = false;
@@ -122,3 +126,4 @@ void resetShowState(ShowStatus &status)
   status.openValveAt = 0;
   status.finishAt = 0;
 }
+} // namespace ShowVariantImpl
