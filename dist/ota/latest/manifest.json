@@ -1,5 +1,5 @@
 {
   "version": "0.1.5-passionate_gimp",
   "firmware_url": "http://ota.kinkbear.de/squeezebear/firmware.bin",
-  "notes": "Aenderungen seit Version 0.1.5-passionate_gimp:\n- Adjust SqueezeBear valve and inflation timing\n- Keep valve polarity shared across variants\n- Fix shared valve polarity\n- Add SqueezeBear boot inflation safeguard\n- Joggle SqueezeBear valve before inflation"
+  "notes": "Aenderungen seit Version 0.1.5-passionate_gimp:\n- Adjust SqueezeBear valve and inflation timing\n- Keep valve polarity shared across variants\n- Fix shared valve polarity\n- Add SqueezeBear boot inflation safeguard\n- Joggle SqueezeBear valve before inflation\n- Strengthen SqueezeBear valve release phase"
 }
