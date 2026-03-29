@@ -4,18 +4,11 @@
 
 namespace ShowVariantImpl
 {
-static constexpr unsigned long kValveJoggleIntervalMs = 200UL;
-static constexpr uint8_t kValveJoggleCycleCount = 5U;
-static constexpr unsigned long kValveOpenSettleMs = 1000UL;
-
-inline unsigned long valveJoggleDurationMs()
-{
-  return kValveJoggleIntervalMs * 2UL * kValveJoggleCycleCount;
-}
+static constexpr unsigned long kValveOpenSettleMs = 2000UL;
 
 inline unsigned long valveInflationStartAt(const ShowStatus &status)
 {
-  return status.openValveAt + valveJoggleDurationMs() + kValveOpenSettleMs;
+  return status.openValveAt + kValveOpenSettleMs;
 }
 
 inline void requestShowStart(ShowStatus &status)
@@ -89,14 +82,6 @@ inline void tickShow(ShowStatus &status,
       outputs.valveOpen = false;
       return;
     }
-    if (!status.inflateSkipped && now < (status.openValveAt + valveJoggleDurationMs()))
-    {
-      unsigned long elapsedMs = now - status.openValveAt;
-      uint8_t toggleStep = (uint8_t)(elapsedMs / kValveJoggleIntervalMs);
-      outputs.pumpMode = PUMP_MODE_OFF;
-      outputs.valveOpen = (toggleStep & 0x01U) == 0U;
-      return;
-    }
     if (!status.inflateSkipped && now < valveInflationStartAt(status))
     {
       outputs.pumpMode = PUMP_MODE_OFF;
@@ -128,10 +113,6 @@ inline const char *getShowPhase(const ShowStatus &status, unsigned long now)
     if (now < status.holdEndAt)
     {
       return "Haltezeit";
-    }
-    if (!status.inflateSkipped && now < (status.openValveAt + valveJoggleDurationMs()))
-    {
-      return "Ventil loesen";
     }
     if (!status.inflateSkipped && now < valveInflationStartAt(status))
     {
