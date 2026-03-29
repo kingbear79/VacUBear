@@ -4737,7 +4737,9 @@ bool isLegacyOtaManifestUrl(const String &url)
   normalized.trim();
   normalized.toLowerCase();
   return normalized.endsWith("/releases/latest/download/manifest.json") ||
-         normalized.indexOf("raw.githubusercontent.com/kingbear79/vacubear/") >= 0;
+         normalized.indexOf("raw.githubusercontent.com/kingbear79/vacubear/") >= 0 ||
+         normalized.indexOf("ota.kinkbear.de/") >= 0 ||
+         normalized.indexOf("ota.kingbear.de/master/") >= 0;
 }
 
 String defaultApSsid()

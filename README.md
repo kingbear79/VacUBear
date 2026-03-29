@@ -11,7 +11,7 @@ Dieses Projekt laeuft auf ESP8266/ESP-12F und steuert Pumpen, Ventil, OTA und di
 
 - PlatformIO Environment: `esp12f`
 - Board: `esp12e` (kompatibel zu ESP-12F)
-- Standard-OTA-Manifest: `http://ota.kinkbear.de/master/manifest.json`
+- Standard-OTA-Manifest: `http://ota.kingbear.de/vacubear/manifest.json`
 
 ## FT232RL Programmieradapter
 
@@ -51,8 +51,8 @@ Benoetigte lokale Variablen:
 - `OTA_DEPLOY_HOST`: Hostname des OTA-Servers
 - `OTA_DEPLOY_PORT`: SSH-Port, meist `22`
 - `OTA_DEPLOY_USER`: SSH-Benutzer
-- `OTA_DEPLOY_BASE`: Zielverzeichnis auf dem Server, z. B. `/var/www/ota.kinkbear.de`
-- `OTA_DEPLOY_BRANCH`: optionales Zielverzeichnis, Standard ist der aktuelle Git-Branch
+- `OTA_DEPLOY_BASE`: Basisverzeichnis auf dem Server, z. B. `/var/www/ota.kingbear.de`
+- `OTA_DEPLOY_PROJECT`: optionales Projektverzeichnis, Standard ist `vacubear`
 - `OTA_DEPLOY_SSH_KEY`: optionaler Pfad zu einem SSH-Key, Standard ist `~/.ssh/id_ed25519_ota`, falls vorhanden
 
 Die Variablen koennen direkt in der Shell oder in einer lokalen `.ota-deploy.env` stehen. Diese Datei ist in `.gitignore` hinterlegt und wird nicht versioniert.
@@ -60,18 +60,19 @@ Die Variablen koennen direkt in der Shell oder in einer lokalen `.ota-deploy.env
 Beispiel:
 
 ```bash
-OTA_DEPLOY_HOST=ota.kinkbear.de
+OTA_DEPLOY_HOST=ota.kingbear.de
 OTA_DEPLOY_PORT=22
 OTA_DEPLOY_USER=deploy
-OTA_DEPLOY_BASE=/var/www/ota.kinkbear.de
-OTA_DEPLOY_BRANCH=master
+OTA_DEPLOY_BASE=/var/www/ota.kingbear.de
+OTA_DEPLOY_PROJECT=vacubear
 OTA_DEPLOY_SSH_KEY=/Users/christianschweden/.ssh/id_ed25519_ota
 ```
 
-Das Skript deployed branchbezogen nach:
+Das Skript deployed fuer dieses Projekt standardmaessig nach:
 
-- `http://ota.kinkbear.de/<branch>/manifest.json`
-- `http://ota.kinkbear.de/<branch>/firmware.bin`
+- `http://ota.kingbear.de/vacubear/manifest.json`
+- `http://ota.kingbear.de/vacubear/firmware.bin`
+- `http://ota.kingbear.de/vacubear/index.html`
 
 ### Release Notes in `manifest.json`
 
@@ -204,7 +205,7 @@ Beispiel:
     "topic": "vacubear-AABBCCDDEEFF"
   },
   "ota": {
-    "manifest_url": "http://ota.kinkbear.de/master/manifest.json"
+    "manifest_url": "http://ota.kingbear.de/vacubear/manifest.json"
   },
   "show": {
     "length_ms": 10000,
