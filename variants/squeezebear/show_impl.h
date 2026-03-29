@@ -114,7 +114,7 @@ inline void tickShow(ShowStatus &status,
   }
 
   outputs.pumpMode = PUMP_MODE_OFF;
-  outputs.valveOpen = false;
+  outputs.valveOpen = true;
 }
 
 inline const char *getShowPhase(const ShowStatus &status, unsigned long now)

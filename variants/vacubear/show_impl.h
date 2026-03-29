@@ -64,25 +64,25 @@ inline void tickShow(ShowStatus &status,
     if (now < status.fadeInDoneAt)
     {
       outputs.pumpMode = PUMP_MODE_OFF;
-      outputs.valveOpen = false;
+      outputs.valveOpen = true;
       return;
     }
     if (now < status.vacuumEndAt)
     {
       outputs.pumpMode = PUMP_MODE_PRIMARY;
-      outputs.valveOpen = true;
+      outputs.valveOpen = false;
       return;
     }
     if (now < status.holdEndAt)
     {
       outputs.pumpMode = PUMP_MODE_OFF;
-      outputs.valveOpen = true;
+      outputs.valveOpen = false;
       return;
     }
     if (now < status.finishAt)
     {
       outputs.pumpMode = PUMP_MODE_OFF;
-      outputs.valveOpen = false;
+      outputs.valveOpen = true;
       return;
     }
 
@@ -90,7 +90,7 @@ inline void tickShow(ShowStatus &status,
   }
 
   outputs.pumpMode = PUMP_MODE_OFF;
-  outputs.valveOpen = false;
+  outputs.valveOpen = true;
 }
 
 inline const char *getShowPhase(const ShowStatus &status, unsigned long now)

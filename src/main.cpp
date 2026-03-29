@@ -778,7 +778,7 @@ void setup()
   pinMode(PIN_PUMPE1, OUTPUT);
   pinMode(PIN_PUMPE2, OUTPUT);
   pinMode(PIN_VENTIL, OUTPUT);
-  setValveOpen(ProductVariant::kBootInflateDurationMs > 0);
+  setValveOpen(true);
   setupPumpControl();
   setupLightControl();
   startBootInflate();
@@ -1186,7 +1186,7 @@ void startBootInflate()
   {
     bootInflateActive = false;
     bootInflateUntilAt = 0;
-    setValveOpen(false);
+    setValveOpen(true);
     return;
   }
 
@@ -1214,7 +1214,7 @@ bool updateBootInflate(unsigned long now)
   bootInflateActive = false;
   bootInflateUntilAt = 0;
   setPumpTarget(PUMP_MODE_OFF);
-  setValveOpen(false);
+  setValveOpen(true);
   LOGI("Boot inflate finished");
   return false;
 }
@@ -1613,7 +1613,7 @@ void setSafeOutputState()
   lightControl.currentLevel = 0;
   lightControl.targetLevel = 0;
   applyLightOutput(true);
-  setValveOpen(false);
+  setValveOpen(true);
 }
 
 static bool isDigitChar(char c)
