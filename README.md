@@ -9,7 +9,8 @@ Dieses Projekt laeuft auf ESP8266/ESP-12F und steuert Pumpen, Ventil, OTA und di
 
 ## Build
 
-- PlatformIO Environment: `esp12f`
+- PlatformIO Environment: `vacubear`
+- Kompatibilitaetsalias: `esp12f`
 - Board: `esp12e` (kompatibel zu ESP-12F)
 - Standard-OTA-Manifest: `http://ota.kingbear.de/vacubear/manifest.json`
 - Aktive Produktvariante: `variants/vacubear/variant.h`

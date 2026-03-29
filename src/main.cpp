@@ -11,6 +11,7 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include "pins.h"
+#include "show_variant.h"
 #include "variant_config.h"
 #if LED_COUNT > 0
 extern "C"
@@ -162,38 +163,6 @@ struct AppConfig
   }
 };
 
-// Laufzeitstatus der Show.
-//
-// Begriffe:
-// - now < fadeInDoneAt -> "FadeIn"      (nur Licht blendet ein)
-// - fadeInDoneAt .. endAt        -> "Vakuumieren" (Pumpen AN, Ventil geschlossen)
-// - endAt .. openValveAt         -> "Haltezeit"   (Pumpen AUS, Ventil geschlossen)
-// - openValveAt .. finishAt      -> "FadeOut"     (Ventil offen, Licht blendet aus)
-class ShowStatus
-{
-public:
-  bool isRunning;
-  unsigned long fadeInDoneAt;
-  unsigned long endAt;
-  unsigned long openValveAt;
-  unsigned long finishAt;
-  bool shouldStart;
-  unsigned long showDuration;
-  unsigned long showNachlauf;
-
-  ShowStatus()
-      : isRunning(false),
-        fadeInDoneAt(0),
-        endAt(0),
-        openValveAt(0),
-        finishAt(0),
-        shouldStart(false),
-        showDuration(DEFAULT_SHOW_LENGTH_MS),
-        showNachlauf(DEFAULT_SHOW_NACHLAUF_MS)
-  {
-  }
-};
-
 // Softstart/Softstop-Regelung fuer Pumpen per PWM.
 struct PumpSoftControl
 {
@@ -325,7 +294,7 @@ struct ParsedHttpUrl
 // Globale Laufzeitobjekte
 // -----------------------------------------------------------------------------
 Button button(PIN_TASTER, 25, true);
-ShowStatus showStatus;
+ShowStatus showStatus(DEFAULT_SHOW_LENGTH_MS, DEFAULT_SHOW_NACHLAUF_MS);
 AppConfig config;
 ESP8266WebServer server(80);
 DNSServer dnsServer;
@@ -472,6 +441,7 @@ bool isLegacyDefaultMqttTopic(const String &topic);
 String defaultApSsid(void);
 String defaultDeviceId(void);
 String rgbToHex(uint8_t r, uint8_t g, uint8_t b);
+void setValveOpen(bool open);
 void sanitizeConfig(void);
 void applyConfigToRuntime(bool wifiChanged, bool mqttChanged, bool publishStates = true);
 void buildLightStatusJson(JsonDocument &doc);
@@ -967,7 +937,7 @@ void startShow()
     return;
   }
   LOGI("startShow requested");
-  showStatus.shouldStart = true;
+  requestShowStart(showStatus);
 }
 
 void stopShow()
@@ -979,13 +949,8 @@ void stopShow()
     return;
   }
   LOGI("stopShow requested");
-  unsigned long stopAt = millis() + 10;
   unsigned long fadeOutMs = (HAS_LED_OUTPUT && config.lightEnabled) ? LED_FADE_OUT_MS : 0UL;
-  showStatus.fadeInDoneAt = stopAt;
-  showStatus.endAt = stopAt;
-  showStatus.openValveAt = stopAt;
-  showStatus.finishAt = stopAt + fadeOutMs;
-  lightControl.onUntilAt = showStatus.openValveAt;
+  requestShowStop(showStatus, millis(), HAS_LED_OUTPUT && config.lightEnabled, fadeOutMs, lightControl.onUntilAt);
   LOGD("Show stop transitions: openValveAt=%lu finishAt=%lu", showStatus.openValveAt, showStatus.finishAt);
 }
 
@@ -993,61 +958,41 @@ void handleShow()
 {
   // Zentrale Show-Statemachine, die in jedem loop()-Durchlauf getaktet wird.
   // Alle Aktoren werden hier konsistent aus "Zeitfenster + Status" abgeleitet.
-  if (showStatus.shouldStart)
+  unsigned long now = millis();
+  bool wasRunning = showStatus.isRunning;
+  bool startPending = showStatus.shouldStart;
+  ShowOutputs outputs;
+
+  tickVacubearShow(showStatus,
+                   now,
+                   HAS_LED_OUTPUT && config.lightEnabled,
+                   LED_FADE_IN_MS,
+                   LED_FADE_OUT_MS,
+                   LIGHT_LEVEL_MAX,
+                   lightControl.onUntilAt,
+                   outputs);
+
+  if (outputs.applyLightTarget)
   {
-    unsigned long now = millis();
+    setLightTargetLevel(outputs.lightTargetLevel);
+  }
+  setPumpTarget(outputs.pumpEnabled);
+  setValveOpen(outputs.valveOpen);
+
+  if (startPending && showStatus.isRunning)
+  {
+#if ENABLE_SERIAL_LOG
     unsigned long fadeInMs = (HAS_LED_OUTPUT && config.lightEnabled) ? LED_FADE_IN_MS : 0UL;
     unsigned long fadeOutMs = (HAS_LED_OUTPUT && config.lightEnabled) ? LED_FADE_OUT_MS : 0UL;
-    showStatus.fadeInDoneAt = now + fadeInMs;
-    showStatus.endAt = showStatus.fadeInDoneAt + showStatus.showDuration;
-    showStatus.openValveAt = showStatus.endAt + showStatus.showNachlauf;
-    showStatus.finishAt = showStatus.openValveAt + fadeOutMs;
-    showStatus.shouldStart = false;
-    showStatus.isRunning = true;
-    lightControl.onUntilAt = showStatus.openValveAt;
-    setLightTargetLevel(LIGHT_LEVEL_MAX);
     LOGI("Show started: FadeIn=%lu ms, Vakuumieren=%lu ms, Haltezeit=%lu ms, FadeOut=%lu ms",
          fadeInMs, showStatus.showDuration, showStatus.showNachlauf, fadeOutMs);
     LOGD("Show timeline: fadeInDoneAt=%lu endAt=%lu openValveAt=%lu finishAt=%lu",
          showStatus.fadeInDoneAt, showStatus.endAt, showStatus.openValveAt, showStatus.finishAt);
+#endif
   }
-
-  if (showStatus.isRunning)
+  else if (wasRunning && !showStatus.isRunning)
   {
-    unsigned long now = millis();
-    if (now < showStatus.fadeInDoneAt)
-    {
-      setPumpTarget(false);
-      digitalWrite(PIN_VENTIL, LOW);
-    }
-    else if (now < showStatus.endAt)
-    {
-      setPumpTarget(true);
-      digitalWrite(PIN_VENTIL, HIGH);
-    }
-    else if (now < showStatus.openValveAt)
-    {
-      setPumpTarget(false);
-      digitalWrite(PIN_VENTIL, HIGH);
-    }
-    else if (now < showStatus.finishAt)
-    {
-      setPumpTarget(false);
-      digitalWrite(PIN_VENTIL, LOW);
-    }
-    else
-    {
-      setPumpTarget(false);
-      digitalWrite(PIN_VENTIL, LOW);
-      showStatus.isRunning = false;
-      LOGI("Show finished");
-    }
-  }
-  else
-  {
-    setPumpTarget(false);
-    digitalWrite(PIN_VENTIL, LOW);
-    showStatus.isRunning = false;
+    LOGI("Show finished");
   }
 }
 
@@ -1126,6 +1071,11 @@ void applyPumpPwm(uint16_t pwm)
 {
   analogWrite(PIN_PUMPE1, pwm);
   analogWrite(PIN_PUMPE2, pwm);
+}
+
+void setValveOpen(bool open)
+{
+  digitalWrite(PIN_VENTIL, open ? HIGH : LOW);
 }
 
 #if LED_COUNT > 0
@@ -1507,12 +1457,7 @@ void setSafeOutputState()
   // Wird z. B. vor OTA aufgerufen, um alle Aktoren in sicheren Zustand
   // zu bringen (Pumpen AUS, Ventil definiert, Licht AUS).
   bootIndicatorActive = false;
-  showStatus.shouldStart = false;
-  showStatus.isRunning = false;
-  showStatus.fadeInDoneAt = 0;
-  showStatus.endAt = 0;
-  showStatus.openValveAt = 0;
-  showStatus.finishAt = 0;
+  resetShowState(showStatus);
   setPumpTarget(false);
   pumpControl.currentPwm = 0;
   applyPumpPwm(0);
@@ -2997,29 +2942,7 @@ void publishSensorDiscovery()
 const char *getShowPhase()
 {
   // Menschlich lesbare Show-Phase fuer Telemetrie/UI.
-  unsigned long now = millis();
-  if (showStatus.isRunning)
-  {
-    if (now < showStatus.fadeInDoneAt)
-    {
-      return "FadeIn";
-    }
-    if (now < showStatus.endAt)
-    {
-      return "Vakuumieren";
-    }
-    if (now < showStatus.openValveAt)
-    {
-      return "Haltezeit";
-    }
-    return "FadeOut";
-  }
-
-  if (showStatus.finishAt > 0 && (now - showStatus.finishAt) < 2000UL)
-  {
-    return "FadeOut";
-  }
-  return "Pause";
+  return getVacubearShowPhase(showStatus, millis());
 }
 
 void publishTelemetry(bool force)
