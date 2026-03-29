@@ -83,6 +83,7 @@ static const uint32_t OTA_RESTART_DELAY_MS = 2000UL;
 static const uint32_t SHOW_LENGTH_MIN_S = 10UL;
 static const uint32_t SHOW_LENGTH_MAX_S = 60UL;
 static const uint32_t SHOW_NACHLAUF_MIN_S = 5UL;
+static const uint32_t SHOW_INFLATE_MIN_S = 0UL;
 static const uint32_t SHOW_LENGTH_MIN_MS = SHOW_LENGTH_MIN_S * 1000UL;
 static const uint32_t SHOW_LENGTH_MAX_MS = SHOW_LENGTH_MAX_S * 1000UL;
 static const uint32_t SHOW_NACHLAUF_MIN_MS = SHOW_NACHLAUF_MIN_S * 1000UL;
@@ -123,6 +124,7 @@ static const bool HAS_LED_OUTPUT = true;
 #else
 static const bool HAS_LED_OUTPUT = false;
 #endif
+static const bool SUPPORTS_INFLATION = ProductVariant::kSupportsInflation;
 
 // Persistente Anwender-Konfiguration (LittleFS JSON).
 struct AppConfig
@@ -137,6 +139,7 @@ struct AppConfig
   String otaManifestUrl;
   uint32_t showLengthMs;
   uint32_t showNachlaufMs;
+  uint32_t showInflateMs;
   bool lightEnabled;
   uint8_t lightR;
   uint8_t lightG;
@@ -154,6 +157,7 @@ struct AppConfig
         otaManifestUrl(DEFAULT_OTA_MANIFEST_URL),
         showLengthMs(DEFAULT_SHOW_LENGTH_MS),
         showNachlaufMs(DEFAULT_SHOW_NACHLAUF_MS),
+        showInflateMs((ProductVariant::kSupportsInflation && DEFAULT_SHOW_LENGTH_MS > 0) ? ((DEFAULT_SHOW_LENGTH_MS * 2UL) / 3UL) : 0UL),
         lightEnabled(true),
         lightR(255),
         lightG(255),
@@ -169,9 +173,11 @@ struct PumpSoftControl
   uint16_t currentPwm;
   uint16_t targetPwm;
   unsigned long lastUpdateAt;
+  PumpMode activeMode;
+  PumpMode requestedMode;
 
   PumpSoftControl()
-      : currentPwm(0), targetPwm(0), lastUpdateAt(0)
+      : currentPwm(0), targetPwm(0), lastUpdateAt(0), activeMode(PUMP_MODE_OFF), requestedMode(PUMP_MODE_OFF)
   {
   }
 };
@@ -294,7 +300,9 @@ struct ParsedHttpUrl
 // Globale Laufzeitobjekte
 // -----------------------------------------------------------------------------
 Button button(PIN_TASTER, 25, true);
-ShowStatus showStatus(DEFAULT_SHOW_LENGTH_MS, DEFAULT_SHOW_NACHLAUF_MS);
+ShowStatus showStatus(DEFAULT_SHOW_LENGTH_MS,
+                      DEFAULT_SHOW_NACHLAUF_MS,
+                      (ProductVariant::kSupportsInflation && DEFAULT_SHOW_LENGTH_MS > 0) ? ((DEFAULT_SHOW_LENGTH_MS * 2UL) / 3UL) : 0UL);
 AppConfig config;
 ESP8266WebServer server(80);
 DNSServer dnsServer;
@@ -325,6 +333,8 @@ String topicCfgShowLengthSet;
 String topicCfgShowLengthState;
 String topicCfgNachlaufSet;
 String topicCfgNachlaufState;
+String topicCfgInflateSet;
+String topicCfgInflateState;
 String topicOtaInstall;
 String topicOtaState;
 String topicAvailability;
@@ -358,9 +368,11 @@ void stopShow(void);
 void handleButtonInput(void);
 void handleShow(void);
 void setupPumpControl(void);
-void setPumpTarget(bool enabled);
+void setPumpTarget(PumpMode mode);
 void updatePumpControl(void);
 void applyPumpPwm(uint16_t pwm);
+uint32_t defaultInflateDurationMs(uint32_t showLengthMs);
+uint32_t clampInflateDurationMs(uint32_t valueMs, uint32_t showLengthMs);
 void setupLightControl(void);
 void updateLightControl(void);
 void setLightTargetLevel(uint16_t level);
@@ -483,12 +495,14 @@ void sanitizeConfig()
 
   config.showLengthMs = clampU32(config.showLengthMs, SHOW_LENGTH_MIN_MS, SHOW_LENGTH_MAX_MS);
   config.showNachlaufMs = clampMinU32(config.showNachlaufMs, SHOW_NACHLAUF_MIN_MS);
+  config.showInflateMs = clampInflateDurationMs(config.showInflateMs, config.showLengthMs);
 }
 
 void applyConfigToRuntime(bool wifiChanged, bool mqttChanged, bool publishStates)
 {
   showStatus.showDuration = config.showLengthMs;
   showStatus.showNachlauf = config.showNachlaufMs;
+  showStatus.showInflate = config.showInflateMs;
 
   if (wifiChanged)
   {
@@ -535,6 +549,10 @@ void applyConfigToRuntime(bool wifiChanged, bool mqttChanged, bool publishStates
 
 void buildLightStatusJson(JsonDocument &doc)
 {
+  if (!HAS_LED_OUTPUT)
+  {
+    return;
+  }
   unsigned long now = millis();
   doc["enabled"] = config.lightEnabled;
   doc["preview_remaining_ms"] = isLightPreviewActive(now) ? (uint32_t)(lightControl.previewUntilAt - now) : 0;
@@ -555,8 +573,13 @@ void buildStatusJson(JsonDocument &status)
   status["show_running"] = showStatus.isRunning;
   status["show_length"] = config.showLengthMs;
   status["show_nachlauf"] = config.showNachlaufMs;
+  if (SUPPORTS_INFLATION)
+  {
+    status["show_inflate"] = config.showInflateMs;
+  }
   status["pump_pwm"] = pumpControl.currentPwm;
   status["pump_target_pwm"] = pumpControl.targetPwm;
+  status["pump_mode"] = (int)pumpControl.activeMode;
   if (HAS_LED_OUTPUT)
   {
     unsigned long now = millis();
@@ -669,13 +692,21 @@ void buildConfigJson(JsonObject root)
   show["nachlauf_ms"] = config.showNachlaufMs;
   show["length_s"] = msToSec(config.showLengthMs);
   show["nachlauf_s"] = msToSec(config.showNachlaufMs);
+  if (SUPPORTS_INFLATION)
+  {
+    show["inflate_ms"] = config.showInflateMs;
+    show["inflate_s"] = msToSec(config.showInflateMs);
+  }
 
-  JsonObject light = root["light"].to<JsonObject>();
-  light["enabled"] = config.lightEnabled;
-  light["r"] = config.lightR;
-  light["g"] = config.lightG;
-  light["b"] = config.lightB;
-  light["w"] = config.lightW;
+  if (HAS_LED_OUTPUT)
+  {
+    JsonObject light = root["light"].to<JsonObject>();
+    light["enabled"] = config.lightEnabled;
+    light["r"] = config.lightR;
+    light["g"] = config.lightG;
+    light["b"] = config.lightB;
+    light["w"] = config.lightW;
+  }
 }
 
 bool parseJsonBody(JsonDocument &doc, String &errorText)
@@ -976,7 +1007,7 @@ void handleShow()
   {
     setLightTargetLevel(outputs.lightTargetLevel);
   }
-  setPumpTarget(outputs.pumpEnabled);
+  setPumpTarget(outputs.pumpMode);
   setValveOpen(outputs.valveOpen);
 
   if (startPending && showStatus.isRunning)
@@ -984,10 +1015,20 @@ void handleShow()
 #if ENABLE_SERIAL_LOG
     unsigned long fadeInMs = (HAS_LED_OUTPUT && config.lightEnabled) ? LED_FADE_IN_MS : 0UL;
     unsigned long fadeOutMs = (HAS_LED_OUTPUT && config.lightEnabled) ? LED_FADE_OUT_MS : 0UL;
-    LOGI("Show started: FadeIn=%lu ms, Vakuumieren=%lu ms, Haltezeit=%lu ms, FadeOut=%lu ms",
-         fadeInMs, showStatus.showDuration, showStatus.showNachlauf, fadeOutMs);
-    LOGD("Show timeline: fadeInDoneAt=%lu endAt=%lu openValveAt=%lu finishAt=%lu",
-         showStatus.fadeInDoneAt, showStatus.endAt, showStatus.openValveAt, showStatus.finishAt);
+    if (SUPPORTS_INFLATION)
+    {
+      LOGI("Show started: Vakuumieren=%lu ms, Haltezeit=%lu ms, Aufblasen=%lu ms",
+           showStatus.showDuration, showStatus.showNachlauf, showStatus.showInflate);
+      LOGD("Show timeline: vacuumEndAt=%lu holdEndAt=%lu openValveAt=%lu finishAt=%lu",
+           showStatus.vacuumEndAt, showStatus.holdEndAt, showStatus.openValveAt, showStatus.finishAt);
+    }
+    else
+    {
+      LOGI("Show started: FadeIn=%lu ms, Vakuumieren=%lu ms, Haltezeit=%lu ms, FadeOut=%lu ms",
+           fadeInMs, showStatus.showDuration, showStatus.showNachlauf, fadeOutMs);
+      LOGD("Show timeline: fadeInDoneAt=%lu vacuumEndAt=%lu holdEndAt=%lu openValveAt=%lu finishAt=%lu",
+           showStatus.fadeInDoneAt, showStatus.vacuumEndAt, showStatus.holdEndAt, showStatus.openValveAt, showStatus.finishAt);
+    }
 #endif
   }
   else if (wasRunning && !showStatus.isRunning)
@@ -1001,17 +1042,20 @@ void setupPumpControl()
   // Einheitliche PWM-Konfiguration fuer beide Pumpen.
   analogWriteRange(PUMP_PWM_MAX);
   analogWriteFreq(PUMP_PWM_FREQ_HZ);
+  pumpControl.currentPwm = 0;
+  pumpControl.targetPwm = 0;
+  pumpControl.activeMode = PUMP_MODE_OFF;
+  pumpControl.requestedMode = PUMP_MODE_OFF;
   applyPumpPwm(0);
   LOGI("Pump PWM configured: range=%u freq=%u", PUMP_PWM_MAX, PUMP_PWM_FREQ_HZ);
 }
 
-void setPumpTarget(bool enabled)
+void setPumpTarget(PumpMode mode)
 {
-  uint16_t newTarget = enabled ? PUMP_PWM_MAX : 0;
-  if (newTarget != pumpControl.targetPwm)
+  if (pumpControl.requestedMode != mode)
   {
-    pumpControl.targetPwm = newTarget;
-    LOGD("Pump target PWM -> %u", pumpControl.targetPwm);
+    pumpControl.requestedMode = mode;
+    LOGD("Pump target mode -> %u", (unsigned int)pumpControl.requestedMode);
   }
 }
 
@@ -1028,8 +1072,27 @@ void updatePumpControl()
   }
   pumpControl.lastUpdateAt = now;
 
+  PumpMode effectiveMode = pumpControl.activeMode;
+  uint16_t effectiveTargetPwm = 0;
+  if (pumpControl.activeMode != pumpControl.requestedMode)
+  {
+    effectiveTargetPwm = 0;
+    if (pumpControl.currentPwm == 0)
+    {
+      pumpControl.activeMode = pumpControl.requestedMode;
+      effectiveMode = pumpControl.activeMode;
+      effectiveTargetPwm = (effectiveMode == PUMP_MODE_OFF) ? 0 : PUMP_PWM_MAX;
+    }
+  }
+  else
+  {
+    effectiveTargetPwm = (effectiveMode == PUMP_MODE_OFF) ? 0 : PUMP_PWM_MAX;
+  }
+
+  pumpControl.targetPwm = effectiveTargetPwm;
   if (pumpControl.currentPwm == pumpControl.targetPwm)
   {
+    applyPumpPwm(pumpControl.currentPwm);
     return;
   }
 
@@ -1069,8 +1132,21 @@ void updatePumpControl()
 
 void applyPumpPwm(uint16_t pwm)
 {
-  analogWrite(PIN_PUMPE1, pwm);
-  analogWrite(PIN_PUMPE2, pwm);
+  if (pumpControl.activeMode == PUMP_MODE_PRIMARY)
+  {
+    analogWrite(PIN_PUMPE1, pwm);
+    analogWrite(PIN_PUMPE2, 0);
+  }
+  else if (pumpControl.activeMode == PUMP_MODE_SECONDARY)
+  {
+    analogWrite(PIN_PUMPE1, 0);
+    analogWrite(PIN_PUMPE2, pwm);
+  }
+  else
+  {
+    analogWrite(PIN_PUMPE1, 0);
+    analogWrite(PIN_PUMPE2, 0);
+  }
 }
 
 void setValveOpen(bool open)
@@ -1458,8 +1534,11 @@ void setSafeOutputState()
   // zu bringen (Pumpen AUS, Ventil definiert, Licht AUS).
   bootIndicatorActive = false;
   resetShowState(showStatus);
-  setPumpTarget(false);
+  setPumpTarget(PUMP_MODE_OFF);
   pumpControl.currentPwm = 0;
+  pumpControl.targetPwm = 0;
+  pumpControl.activeMode = PUMP_MODE_OFF;
+  pumpControl.requestedMode = PUMP_MODE_OFF;
   applyPumpPwm(0);
   lightControl.onUntilAt = 0;
   lightControl.previewUntilAt = 0;
@@ -2204,6 +2283,10 @@ void clearStaleCommandTopics()
   }
   mqttClient.publish(topicCfgShowLengthSet.c_str(), "", true);
   mqttClient.publish(topicCfgNachlaufSet.c_str(), "", true);
+  if (SUPPORTS_INFLATION)
+  {
+    mqttClient.publish(topicCfgInflateSet.c_str(), "", true);
+  }
   mqttClient.publish(topicOtaInstall.c_str(), "", true);
 }
 
@@ -2264,6 +2347,10 @@ void mqttEnsureConnected()
   }
   mqttClient.subscribe(topicCfgShowLengthSet.c_str());
   mqttClient.subscribe(topicCfgNachlaufSet.c_str());
+  if (SUPPORTS_INFLATION)
+  {
+    mqttClient.subscribe(topicCfgInflateSet.c_str());
+  }
   mqttClient.subscribe(topicOtaInstall.c_str());
   publishAvailability("online", true);
   publishDiscovery();
@@ -2491,6 +2578,8 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
     uint32_t clampedSec = clampU32((uint32_t)valueSec, SHOW_LENGTH_MIN_S, SHOW_LENGTH_MAX_S);
     config.showLengthMs = secToMs(clampedSec);
     showStatus.showDuration = config.showLengthMs;
+    config.showInflateMs = clampInflateDurationMs(config.showInflateMs, config.showLengthMs);
+    showStatus.showInflate = config.showInflateMs;
     LOGI("Show length updated via MQTT: %u s (%u ms)", clampedSec, config.showLengthMs);
     scheduleConfigSave();
     publishConfigState(true);
@@ -2511,6 +2600,24 @@ void mqttCallback(char *topic, byte *payload, unsigned int length)
     config.showNachlaufMs = secToMs(minClampedSec);
     showStatus.showNachlauf = config.showNachlaufMs;
     LOGI("Nachlauf updated via MQTT: %u s (%u ms)", minClampedSec, config.showNachlaufMs);
+    scheduleConfigSave();
+    publishConfigState(true);
+    publishTelemetry(true);
+    return;
+  }
+
+  if (SUPPORTS_INFLATION && topicStr == topicCfgInflateSet)
+  {
+    long valueSec = payloadStr.toInt();
+    if (valueSec < 0)
+    {
+      LOGW("Invalid inflate payload: %s", payloadStr.c_str());
+      return;
+    }
+
+    config.showInflateMs = clampInflateDurationMs(secToMs((uint32_t)valueSec), config.showLengthMs);
+    showStatus.showInflate = config.showInflateMs;
+    LOGI("Inflate duration updated via MQTT: %ld s (%u ms)", valueSec, config.showInflateMs);
     scheduleConfigSave();
     publishConfigState(true);
     publishTelemetry(true);
@@ -2595,7 +2702,16 @@ void publishConfigState(bool retained)
   String nachlaufSec = String(msToSec(config.showNachlaufMs));
   mqttClient.publish(topicCfgShowLengthState.c_str(), showSec.c_str(), retained);
   mqttClient.publish(topicCfgNachlaufState.c_str(), nachlaufSec.c_str(), retained);
-  LOGD("MQTT TX config show=%s s nachlauf=%s s", showSec.c_str(), nachlaufSec.c_str());
+  if (SUPPORTS_INFLATION)
+  {
+    String inflateSec = String(msToSec(config.showInflateMs));
+    mqttClient.publish(topicCfgInflateState.c_str(), inflateSec.c_str(), retained);
+    LOGD("MQTT TX config show=%s s nachlauf=%s s aufblasen=%s s", showSec.c_str(), nachlaufSec.c_str(), inflateSec.c_str());
+  }
+  else
+  {
+    LOGD("MQTT TX config show=%s s nachlauf=%s s", showSec.c_str(), nachlaufSec.c_str());
+  }
 }
 
 void publishDiscovery()
@@ -2619,7 +2735,7 @@ void publishDiscovery()
   swIds.add(deviceId);
   swDevice["name"] = ProductVariant::kDisplayName;
   swDevice["manufacturer"] = "KingBEAR";
-  swDevice["model"] = "Frame-25";
+  swDevice["model"] = ProductVariant::kDeviceModel;
 
   String switchPayload;
   serializeJson(switchCfg, switchPayload);
@@ -2649,7 +2765,7 @@ void publishDiscovery()
     lightIds.add(deviceId);
     lightDevice["name"] = ProductVariant::kDisplayName;
     lightDevice["manufacturer"] = "KingBEAR";
-    lightDevice["model"] = "Frame-25";
+    lightDevice["model"] = ProductVariant::kDeviceModel;
 
     if (lightCfg.overflowed())
     {
@@ -2665,6 +2781,7 @@ void publishDiscovery()
   {
     mqttClient.publish(lightDiscoveryTopic.c_str(), "", true);
     mqttClient.publish(topicLightState.c_str(), "", true);
+    mqttClient.publish(topicLightRgbState.c_str(), "", true);
     mqttClient.publish(topicLightRgbwState.c_str(), "", true);
     LOGI("Light discovery removed (LED_COUNT=0)");
   }
@@ -2692,7 +2809,7 @@ void publishUpdateDiscovery()
   ids.add(deviceId);
   dev["name"] = ProductVariant::kDisplayName;
   dev["manufacturer"] = "KingBEAR";
-  dev["model"] = "Frame-25";
+  dev["model"] = ProductVariant::kDeviceModel;
 
   String payload;
   serializeJson(cfg, payload);
@@ -2709,7 +2826,7 @@ void publishSensorDiscovery()
     ids.add(deviceId);
     dev["name"] = ProductVariant::kDisplayName;
     dev["manufacturer"] = "KingBEAR";
-    dev["model"] = "Frame-25";
+    dev["model"] = ProductVariant::kDeviceModel;
   };
 
   {
@@ -2885,6 +3002,26 @@ void publishSensorDiscovery()
     mqttClient.publish((String("homeassistant/number/") + deviceId + "/nachlaufzeit_setzen/config").c_str(), payload.c_str(), true);
   }
 
+  if (SUPPORTS_INFLATION)
+  {
+    JsonDocument cfg;
+    cfg["name"] = "Aufblas-Zeit";
+    cfg["object_id"] = "aufblaszeit_setzen";
+    cfg["unique_id"] = deviceId + "-aufblaszeit-setzen";
+    cfg["command_topic"] = topicCfgInflateSet;
+    cfg["state_topic"] = topicCfgInflateState;
+    cfg["unit_of_measurement"] = "s";
+    cfg["min"] = SHOW_INFLATE_MIN_S;
+    cfg["max"] = SHOW_LENGTH_MAX_S;
+    cfg["step"] = 1;
+    cfg["mode"] = "box";
+    cfg["availability_topic"] = topicAvailability;
+    addDevice(cfg.as<JsonObject>());
+    String payload;
+    serializeJson(cfg, payload);
+    mqttClient.publish((String("homeassistant/number/") + deviceId + "/aufblaszeit_setzen/config").c_str(), payload.c_str(), true);
+  }
+
   {
     JsonDocument cfg;
     cfg["name"] = "Firmware Version";
@@ -2977,16 +3114,24 @@ void publishTelemetry(bool force)
   show["Phase"] = getShowPhase();
   show["LaengeMs"] = config.showLengthMs;
   show["NachlaufMs"] = config.showNachlaufMs;
+  if (SUPPORTS_INFLATION)
+  {
+    show["AufblasenMs"] = config.showInflateMs;
+    show["AufblasenS"] = msToSec(config.showInflateMs);
+  }
   show["LaengeS"] = msToSec(config.showLengthMs);
   show["NachlaufS"] = msToSec(config.showNachlaufMs);
   show["FadeInDoneAt"] = showStatus.fadeInDoneAt;
-  show["EndAt"] = showStatus.endAt;
+  show["VacuumEndAt"] = showStatus.vacuumEndAt;
+  show["HoldEndAt"] = showStatus.holdEndAt;
   show["OpenValveAt"] = showStatus.openValveAt;
   show["FinishAt"] = showStatus.finishAt;
 
   JsonObject pumpen = doc["Pumpen"].to<JsonObject>();
   pumpen["PWM"] = pumpControl.currentPwm;
   pumpen["TargetPWM"] = pumpControl.targetPwm;
+  pumpen["Modus"] = (pumpControl.activeMode == PUMP_MODE_PRIMARY) ? "Vakuum" : (pumpControl.activeMode == PUMP_MODE_SECONDARY) ? "Aufblasen"
+                                                                                                                      : "Aus";
 
   if (HAS_LED_OUTPUT)
   {
@@ -3060,6 +3205,8 @@ void updateMqttTopics()
   topicCfgShowLengthState = topicBase + "/config/show_length_s/state";
   topicCfgNachlaufSet = topicBase + "/config/nachlauf_s/set";
   topicCfgNachlaufState = topicBase + "/config/nachlauf_s/state";
+  topicCfgInflateSet = topicBase + "/config/inflate_s/set";
+  topicCfgInflateState = topicBase + "/config/inflate_s/state";
   topicOtaInstall = topicBase + "/ota/update/install";
   topicOtaState = topicBase + "/ota/update/state";
   topicAvailability = topicBase + "/availability";
@@ -3168,8 +3315,11 @@ void setupWebServer()
   server.on("/api/config", HTTP_POST, handleApiConfigPost);
   server.on("/api/show", HTTP_GET, handleApiShowGet);
   server.on("/api/show", HTTP_POST, handleApiShowPost);
-  server.on("/api/light", HTTP_GET, handleApiLightGet);
-  server.on("/api/light", HTTP_POST, handleLightConfig);
+  if (HAS_LED_OUTPUT)
+  {
+    server.on("/api/light", HTTP_GET, handleApiLightGet);
+    server.on("/api/light", HTTP_POST, handleLightConfig);
+  }
   server.on("/api/ota/status", HTTP_GET, handleOtaStatus);
   server.on("/api/ota/check", HTTP_POST, handleOtaCheck);
   server.on("/api/ota/update", HTTP_POST, handleOtaUpdate);
@@ -3734,6 +3884,10 @@ void handleSave()
   {
     config.showNachlaufMs = clampMinU32((uint32_t)server.arg("show_nachlauf").toInt(), SHOW_NACHLAUF_MIN_MS);
   }
+  if (SUPPORTS_INFLATION && server.hasArg("show_inflate"))
+  {
+    config.showInflateMs = clampInflateDurationMs((uint32_t)server.arg("show_inflate").toInt(), config.showLengthMs);
+  }
   if (HAS_LED_OUTPUT)
   {
     config.lightEnabled = server.hasArg("light_enabled") && server.arg("light_enabled") != "0";
@@ -3926,6 +4080,18 @@ void handleApiConfigPost()
     {
       config.showNachlaufMs = clampMinU32(secToMs(show["nachlauf_s"].as<unsigned long>()), SHOW_NACHLAUF_MIN_MS);
     }
+
+    if (SUPPORTS_INFLATION)
+    {
+      if (!show["inflate_ms"].isNull())
+      {
+        config.showInflateMs = clampInflateDurationMs(show["inflate_ms"].as<unsigned long>(), config.showLengthMs);
+      }
+      else if (!show["inflate_s"].isNull())
+      {
+        config.showInflateMs = clampInflateDurationMs(secToMs(show["inflate_s"].as<unsigned long>()), config.showLengthMs);
+      }
+    }
   }
 
   if (HAS_LED_OUTPUT && doc["light"].is<JsonObject>())
@@ -4017,8 +4183,13 @@ void handleApiShowGet()
   doc["phase"] = getShowPhase();
   doc["length_ms"] = config.showLengthMs;
   doc["nachlauf_ms"] = config.showNachlaufMs;
+  if (SUPPORTS_INFLATION)
+  {
+    doc["inflate_ms"] = config.showInflateMs;
+  }
   doc["fade_in_done_at_ms"] = showStatus.fadeInDoneAt;
-  doc["end_at_ms"] = showStatus.endAt;
+  doc["vacuum_end_at_ms"] = showStatus.vacuumEndAt;
+  doc["hold_end_at_ms"] = showStatus.holdEndAt;
   doc["open_valve_at_ms"] = showStatus.openValveAt;
   doc["finish_at_ms"] = showStatus.finishAt;
   sendJsonDocument(200, doc);
@@ -4060,7 +4231,8 @@ void handleApiShowPost()
   response["running"] = showStatus.isRunning;
   response["phase"] = getShowPhase();
   response["fade_in_done_at_ms"] = showStatus.fadeInDoneAt;
-  response["end_at_ms"] = showStatus.endAt;
+  response["vacuum_end_at_ms"] = showStatus.vacuumEndAt;
+  response["hold_end_at_ms"] = showStatus.holdEndAt;
   response["open_valve_at_ms"] = showStatus.openValveAt;
   response["finish_at_ms"] = showStatus.finishAt;
   sendJsonDocument(202, response);
@@ -4481,6 +4653,7 @@ void loadConfig()
     saveConfig();
     showStatus.showDuration = config.showLengthMs;
     showStatus.showNachlauf = config.showNachlaufMs;
+    showStatus.showInflate = config.showInflateMs;
     return;
   }
 
@@ -4503,6 +4676,7 @@ void loadConfig()
     saveConfig();
     showStatus.showDuration = config.showLengthMs;
     showStatus.showNachlauf = config.showNachlaufMs;
+    showStatus.showInflate = config.showInflateMs;
     return;
   }
 
@@ -4522,11 +4696,18 @@ void loadConfig()
       config.otaManifestUrl = doc["ota"]["manifest_url"] | config.otaManifestUrl;
       config.showLengthMs = doc["show"]["length_ms"] | config.showLengthMs;
       config.showNachlaufMs = doc["show"]["nachlauf_ms"] | config.showNachlaufMs;
-      config.lightEnabled = doc["light"]["enabled"] | config.lightEnabled;
-      config.lightR = doc["light"]["r"] | config.lightR;
-      config.lightG = doc["light"]["g"] | config.lightG;
-      config.lightB = doc["light"]["b"] | config.lightB;
-      config.lightW = doc["light"]["w"] | config.lightW;
+      if (SUPPORTS_INFLATION)
+      {
+        config.showInflateMs = doc["show"]["inflate_ms"] | config.showInflateMs;
+      }
+      if (HAS_LED_OUTPUT)
+      {
+        config.lightEnabled = doc["light"]["enabled"] | config.lightEnabled;
+        config.lightR = doc["light"]["r"] | config.lightR;
+        config.lightG = doc["light"]["g"] | config.lightG;
+        config.lightB = doc["light"]["b"] | config.lightB;
+        config.lightW = doc["light"]["w"] | config.lightW;
+      }
     }
     else
     {
@@ -4542,6 +4723,7 @@ void loadConfig()
   sanitizeConfig();
   showStatus.showDuration = config.showLengthMs;
   showStatus.showNachlauf = config.showNachlaufMs;
+  showStatus.showInflate = config.showInflateMs;
 }
 
 void loadLegacyConfig(const String &raw)
@@ -4588,16 +4770,22 @@ void loadLegacyConfig(const String &raw)
     config.showLengthMs = (uint32_t)lines[7].toInt();
   if (count > 8)
     config.showNachlaufMs = (uint32_t)lines[8].toInt();
-  if (count > 9)
-    config.lightEnabled = lines[9] != "0";
-  if (count > 10)
-    config.lightR = clampU8(lines[10].toInt());
-  if (count > 11)
-    config.lightG = clampU8(lines[11].toInt());
-  if (count > 12)
-    config.lightB = clampU8(lines[12].toInt());
-  if (count > 13)
-    config.lightW = clampU8(lines[13].toInt());
+  int lightOffset = 0;
+  if (SUPPORTS_INFLATION && count > 9)
+  {
+    config.showInflateMs = (uint32_t)lines[9].toInt();
+    lightOffset = 1;
+  }
+  if (count > 9 + lightOffset)
+    config.lightEnabled = lines[9 + lightOffset] != "0";
+  if (count > 10 + lightOffset)
+    config.lightR = clampU8(lines[10 + lightOffset].toInt());
+  if (count > 11 + lightOffset)
+    config.lightG = clampU8(lines[11 + lightOffset].toInt());
+  if (count > 12 + lightOffset)
+    config.lightB = clampU8(lines[12 + lightOffset].toInt());
+  if (count > 13 + lightOffset)
+    config.lightW = clampU8(lines[13 + lightOffset].toInt());
 }
 
 bool saveConfig()
@@ -4622,13 +4810,20 @@ bool saveConfig()
   JsonObject show = doc["show"].to<JsonObject>();
   show["length_ms"] = config.showLengthMs;
   show["nachlauf_ms"] = config.showNachlaufMs;
+  if (SUPPORTS_INFLATION)
+  {
+    show["inflate_ms"] = config.showInflateMs;
+  }
 
-  JsonObject light = doc["light"].to<JsonObject>();
-  light["enabled"] = config.lightEnabled;
-  light["r"] = config.lightR;
-  light["g"] = config.lightG;
-  light["b"] = config.lightB;
-  light["w"] = config.lightW;
+  if (HAS_LED_OUTPUT)
+  {
+    JsonObject light = doc["light"].to<JsonObject>();
+    light["enabled"] = config.lightEnabled;
+    light["r"] = config.lightR;
+    light["g"] = config.lightG;
+    light["b"] = config.lightB;
+    light["w"] = config.lightW;
+  }
 
   File f = LittleFS.open(CONFIG_FILE, "w");
   if (!f)
@@ -4665,7 +4860,9 @@ bool isLegacyOtaManifestUrl(const String &url)
   return normalized.endsWith("/releases/latest/download/manifest.json") ||
          normalized.indexOf(ProductVariant::kLegacyGitHubPathToken) >= 0 ||
          normalized.indexOf(ProductVariant::kLegacyOtaHostToken) >= 0 ||
-         normalized.indexOf(ProductVariant::kLegacyMasterPathToken) >= 0;
+         normalized.indexOf("ota.kingbear.de/") >= 0 ||
+         normalized.indexOf(ProductVariant::kLegacyMasterPathToken) >= 0 ||
+         (ProductVariant::kLegacyVariantPathToken[0] != '\0' && normalized.indexOf(ProductVariant::kLegacyVariantPathToken) >= 0);
 }
 
 bool isLegacyDefaultMqttTopic(const String &topic)
@@ -4676,7 +4873,22 @@ bool isLegacyDefaultMqttTopic(const String &topic)
 
   String base = ProductVariant::kId;
   base.toLowerCase();
-  return normalized == base || normalized.startsWith(base + "/");
+  if (normalized == base || normalized.startsWith(base + "/"))
+  {
+    return true;
+  }
+
+  if (ProductVariant::kLegacyVariantId[0] != '\0')
+  {
+    String legacy = ProductVariant::kLegacyVariantId;
+    legacy.toLowerCase();
+    if (normalized == legacy || normalized.startsWith(legacy + "/"))
+    {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 String defaultApSsid()
@@ -4730,6 +4942,24 @@ uint32_t clampU32(uint32_t value, uint32_t minValue, uint32_t maxValue)
   if (value > maxValue)
     return maxValue;
   return value;
+}
+
+uint32_t defaultInflateDurationMs(uint32_t showLengthMs)
+{
+  if (!SUPPORTS_INFLATION || showLengthMs == 0)
+    return 0;
+  return (showLengthMs * 2UL) / 3UL;
+}
+
+uint32_t clampInflateDurationMs(uint32_t valueMs, uint32_t showLengthMs)
+{
+  if (!SUPPORTS_INFLATION)
+    return 0;
+
+  uint32_t clampedMs = clampMinU32(valueMs, SHOW_INFLATE_MIN_S * 1000UL);
+  if (clampedMs > showLengthMs)
+    clampedMs = showLengthMs;
+  return clampedMs;
 }
 
 uint32_t clampMinU32(uint32_t value, uint32_t minValue)
@@ -4898,9 +5128,14 @@ String buildHtmlPage(const String &message)
   html += "<label>MQTT User</label><input name='mqtt_user' value='" + htmlEscape(config.mqttUser) + "'>";
   html += "<label>MQTT Passwort</label><input name='mqtt_password' type='password' value='" + htmlEscape(config.mqttPassword) + "'>";
   html += "<label>MQTT Basis-Topic</label><input name='mqtt_topic' value='" + htmlEscape(config.mqttTopic) + "'>";
-  html += "<label>OTA Manifest URL</label><input name='ota_manifest_url' value='" + htmlEscape(config.otaManifestUrl) + "' placeholder='https://.../manifest.json'>";
-  html += "<label>Laenge der Show (ms)</label><input name='show_length' type='number' min='" + String(SHOW_LENGTH_MIN_MS) + "' max='" + String(SHOW_LENGTH_MAX_MS) + "' value='" + String(config.showLengthMs) + "'>";
+  html += "<label>OTA Manifest URL</label><input name='ota_manifest_url' value='" + htmlEscape(config.otaManifestUrl) + "' placeholder='http://.../manifest.json'>";
+  html += "<label>" + String(SUPPORTS_INFLATION ? "Vakuumierzeit (ms)" : "Laenge der Show (ms)") + "</label><input name='show_length' type='number' min='" + String(SHOW_LENGTH_MIN_MS) + "' max='" + String(SHOW_LENGTH_MAX_MS) + "' value='" + String(config.showLengthMs) + "'>";
   html += "<label>Nachlaufzeit (ms)</label><input name='show_nachlauf' type='number' min='" + String(SHOW_NACHLAUF_MIN_MS) + "' value='" + String(config.showNachlaufMs) + "'>";
+  if (SUPPORTS_INFLATION)
+  {
+    html += "<label>Aufblaszeit (ms)</label><input name='show_inflate' type='number' min='0' max='" + String(config.showLengthMs) + "' value='" + String(config.showInflateMs) + "'>";
+    html += "<div class='small'>Die Aufblaszeit wird automatisch auf die letzte Vakuumierzeit begrenzt, damit beide Pumpen niemals gleichzeitig laufen und die Hardware geschuetzt bleibt.</div>";
+  }
   if (HAS_LED_OUTPUT)
   {
     html += "<hr><h3>Beleuchtung</h3>";

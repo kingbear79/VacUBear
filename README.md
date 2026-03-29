@@ -10,26 +10,26 @@ Dieses Projekt laeuft auf ESP8266/ESP-12F und steuert Pumpen, Ventil, OTA und di
 ## Build
 
 - PlatformIO Environment: `vacubear`
-- Vorbereitete zweite Variante: `ableger`
+- Zweite Produktvariante: `squeezebear`
 - Kompatibilitaetsalias: `esp12f`
 - Board: `esp12e` (kompatibel zu ESP-12F)
-- Standard-OTA-Manifest: `http://ota.kingbear.de/vacubear/manifest.json`
+- Standard-OTA-Manifest: `http://ota.kinkbear.de/vacubear/manifest.json`
 - Aktive Produktvariante: `variants/vacubear/variant.h`
 
 ### Variantenstruktur
 
 - `variants/vacubear/`
   Produktkonstanten und Show-Implementierung fuer VacUBear
-- `variants/ableger/`
-  vorbereitete zweite Variante als Platzhalter fuer den kuenftigen Ableger
+- `variants/squeezebear/`
+  zweite Produktvariante mit eigenem OTA-Pfad, Modell `Cube-10`, aktiver Aufblas-Phase und ohne LED-Pfad
 - `src/show/show_variant.cpp`
   bindet die jeweilige Show-Implementierung ueber den Include-Pfad der aktiven Variante ein
 
 Aktueller Stand:
 
 - `vacubear` ist funktional der produktive Stand
-- `ableger` ist ein Build-Skelett mit eigener Variante, eigenem OTA-Pfad und deaktivierter LED-Ausgabe
-- die konkrete Ableger-Show und die finalen Benennungen koennen darauf jetzt separat aufgebaut werden
+- `squeezebear` ist die zweite Produktvariante mit eigener Show-Logik, eigener MQTT-/OTA-Identitaet und deaktivierter LED-Ausgabe
+- gemeinsamer Core fuer WiFi, MQTT, REST, OTA und Webinterface bleibt fuer beide Varianten identisch
 
 ## FT232RL Programmieradapter
 
@@ -69,8 +69,8 @@ Benoetigte lokale Variablen:
 - `OTA_DEPLOY_HOST`: Hostname des OTA-Servers
 - `OTA_DEPLOY_PORT`: SSH-Port, meist `22`
 - `OTA_DEPLOY_USER`: SSH-Benutzer
-- `OTA_DEPLOY_BASE`: Basisverzeichnis auf dem Server, z. B. `/var/www/ota.kingbear.de`
-- `OTA_DEPLOY_PROJECT`: optionales Projektverzeichnis, Standard ist `vacubear`
+- `OTA_DEPLOY_BASE`: Basisverzeichnis auf dem Server, z. B. `/var/www/ota.kinkbear.de`
+- `OTA_DEPLOY_PROJECT`: optionales Projektverzeichnis; wird standardmaessig aus `dist/ota/latest/manifest.json` abgeleitet
 - `OTA_DEPLOY_SSH_KEY`: optionaler Pfad zu einem SSH-Key, Standard ist `~/.ssh/id_ed25519_ota`, falls vorhanden
 
 Die Variablen koennen direkt in der Shell oder in einer lokalen `.ota-deploy.env` stehen. Diese Datei ist in `.gitignore` hinterlegt und wird nicht versioniert.
@@ -78,19 +78,19 @@ Die Variablen koennen direkt in der Shell oder in einer lokalen `.ota-deploy.env
 Beispiel:
 
 ```bash
-OTA_DEPLOY_HOST=ota.kingbear.de
+OTA_DEPLOY_HOST=ota.kinkbear.de
 OTA_DEPLOY_PORT=22
 OTA_DEPLOY_USER=deploy
-OTA_DEPLOY_BASE=/var/www/ota.kingbear.de
+OTA_DEPLOY_BASE=/var/www/ota.kinkbear.de
 OTA_DEPLOY_PROJECT=vacubear
 OTA_DEPLOY_SSH_KEY=/Users/christianschweden/.ssh/id_ed25519_ota
 ```
 
 Das Skript deployed fuer dieses Projekt standardmaessig nach:
 
-- `http://ota.kingbear.de/vacubear/manifest.json`
-- `http://ota.kingbear.de/vacubear/firmware.bin`
-- `http://ota.kingbear.de/vacubear/index.html`
+- `http://ota.kinkbear.de/vacubear/manifest.json`
+- `http://ota.kinkbear.de/vacubear/firmware.bin`
+- `http://ota.kinkbear.de/vacubear/index.html`
 
 ### Release Notes in `manifest.json`
 
@@ -156,8 +156,8 @@ Rahmenbedingungen:
 | `/api/config` | `POST` | Teilweises Aktualisieren der Konfiguration |
 | `/api/show` | `GET` | Aktueller Show-Status |
 | `/api/show` | `POST` | Show starten oder stoppen |
-| `/api/light` | `GET` | Aktueller Beleuchtungsstatus |
-| `/api/light` | `POST` | Beleuchtung konfigurieren und optional Vorschau ausloesen |
+| `/api/light` | `GET` | Aktueller Beleuchtungsstatus, nur bei Varianten mit LEDs |
+| `/api/light` | `POST` | Beleuchtung konfigurieren und optional Vorschau ausloesen, nur bei Varianten mit LEDs |
 | `/api/ota/status` | `GET` | OTA-Status und letzter Update-Check |
 | `/api/ota/check` | `POST` | OTA-Manifest-Pruefung anstossen |
 | `/api/ota/update` | `POST` | OTA-Installation starten, wenn ein Update verfuegbar ist |
@@ -174,8 +174,10 @@ Wichtige Felder:
 - `show_running`
 - `show_length`
 - `show_nachlauf`
+- `show_inflate` bei Varianten mit aktiver Aufblas-Phase
 - `pump_pwm`
 - `pump_target_pwm`
+- `pump_mode`
 - `light_enabled`
 - `light_level`
 - `light_target_level`
@@ -191,9 +193,9 @@ Beispiel:
   "show_running": false,
   "show_length": 10000,
   "show_nachlauf": 20000,
+  "show_inflate": 6666,
   "pump_pwm": 0,
-  "light_enabled": true,
-  "light": {"r": 255, "g": 180, "b": 60, "w": 20},
+  "pump_mode": 0,
   "ota": {
     "current_version": "0.1.0-passionate_gimp",
     "latest_version": "0.1.0-passionate_gimp",
@@ -223,20 +225,14 @@ Beispiel:
     "topic": "vacubear-AABBCCDDEEFF"
   },
   "ota": {
-    "manifest_url": "http://ota.kingbear.de/vacubear/manifest.json"
+    "manifest_url": "http://ota.kinkbear.de/vacubear/manifest.json"
   },
   "show": {
     "length_ms": 10000,
     "nachlauf_ms": 20000,
     "length_s": 10,
-    "nachlauf_s": 20
-  },
-  "light": {
-    "enabled": true,
-    "r": 255,
-    "g": 255,
-    "b": 255,
-    "w": 0
+    "nachlauf_s": 20,
+    "inflate_s": 6
   }
 }
 ```
@@ -257,11 +253,8 @@ Unterstuetzte Bloecke:
 - `ota.manifest_url`
 - `show.length_ms` oder `show.length_s`
 - `show.nachlauf_ms` oder `show.nachlauf_s`
-- `light.enabled`
-- `light.r`
-- `light.g`
-- `light.b`
-- `light.w`
+- `show.inflate_ms` oder `show.inflate_s` bei Varianten mit aktiver Aufblas-Phase
+- `light.enabled`, `light.r`, `light.g`, `light.b`, `light.w` nur bei Varianten mit LEDs
 
 Wirkung zur Laufzeit:
 
@@ -281,14 +274,8 @@ Beispiel-Request:
   },
   "show": {
     "length_s": 12,
-    "nachlauf_s": 25
-  },
-  "light": {
-    "enabled": true,
-    "r": 255,
-    "g": 120,
-    "b": 40,
-    "w": 30
+    "nachlauf_s": 25,
+    "inflate_s": 8
   }
 }
 ```
@@ -317,8 +304,10 @@ Wichtige Felder:
 - `phase`
 - `length_ms`
 - `nachlauf_ms`
+- `inflate_ms` bei Varianten mit aktiver Aufblas-Phase
 - `fade_in_done_at_ms`
-- `end_at_ms`
+- `vacuum_end_at_ms`
+- `hold_end_at_ms`
 - `open_valve_at_ms`
 - `finish_at_ms`
 
@@ -343,6 +332,8 @@ Hinweis: Der Start ist intern asynchron. Die Firmware setzt ein Start-Flag und u
 
 ### `GET /api/light`
 
+Nur bei Varianten mit LEDs verfuegbar.
+
 Liefert den aktuellen Beleuchtungsstatus.
 
 Wichtige Felder:
@@ -356,6 +347,8 @@ Wichtige Felder:
 - `color.w`
 
 ### `POST /api/light`
+
+Nur bei Varianten mit LEDs verfuegbar.
 
 Unterstuetzt sowohl `application/json` als auch `application/x-www-form-urlencoded`, damit derselbe Endpunkt vom Webinterface und von externen Clients genutzt werden kann.
 
@@ -471,16 +464,18 @@ Voraussetzungen:
 | --- | --- | --- | --- |
 | `<base>/show/set` | zu Geraet | `ON`, `OFF` | Startet oder stoppt die Show |
 | `<base>/show/state` | vom Geraet | `ON`, `OFF` | Aktueller Show-Zustand |
-| `<base>/light/set` | zu Geraet | `ON`, `OFF` oder JSON | Aktiviert oder deaktiviert die Show-Beleuchtung; JSON kann `state`, `color` und `white_value` enthalten |
-| `<base>/light/state` | vom Geraet | `ON`, `OFF` | Gespeicherter Freigabe-Zustand der Show-Beleuchtung |
-| `<base>/light/rgb/set` | zu Geraet | `r,g,b` | Setzt die RGB-Farbwerte direkt; wird von Home Assistant fuer die Lichtfarbe verwendet |
-| `<base>/light/rgb/state` | vom Geraet | `r,g,b` | Aktuell gespeicherte RGB-Farbwerte |
-| `<base>/light/rgbw/set` | zu Geraet | `r,g,b,w` | Setzt die RGBW-Farbwerte direkt |
-| `<base>/light/rgbw/state` | vom Geraet | `r,g,b,w` | Aktuell gespeicherte RGBW-Farbwerte |
+| `<base>/light/set` | zu Geraet | `ON`, `OFF` oder JSON | Nur bei Varianten mit LEDs: aktiviert oder deaktiviert die Show-Beleuchtung; JSON kann `state`, `color` und `white_value` enthalten |
+| `<base>/light/state` | vom Geraet | `ON`, `OFF` | Nur bei Varianten mit LEDs: gespeicherter Freigabe-Zustand der Show-Beleuchtung |
+| `<base>/light/rgb/set` | zu Geraet | `r,g,b` | Nur bei Varianten mit LEDs: setzt die RGB-Farbwerte direkt |
+| `<base>/light/rgb/state` | vom Geraet | `r,g,b` | Nur bei Varianten mit LEDs: aktuell gespeicherte RGB-Farbwerte |
+| `<base>/light/rgbw/set` | zu Geraet | `r,g,b,w` | Nur bei Varianten mit LEDs: setzt die RGBW-Farbwerte direkt |
+| `<base>/light/rgbw/state` | vom Geraet | `r,g,b,w` | Nur bei Varianten mit LEDs: aktuell gespeicherte RGBW-Farbwerte |
 | `<base>/config/show_length_s/set` | zu Geraet | Ganzzahl in Sekunden | Setzt die Show-Laenge |
 | `<base>/config/show_length_s/state` | vom Geraet | Ganzzahl in Sekunden | Aktuell gespeicherte Show-Laenge |
 | `<base>/config/nachlauf_s/set` | zu Geraet | Ganzzahl in Sekunden | Setzt die Nachlaufzeit |
 | `<base>/config/nachlauf_s/state` | vom Geraet | Ganzzahl in Sekunden | Aktuell gespeicherte Nachlaufzeit |
+| `<base>/config/inflate_s/set` | zu Geraet | Ganzzahl in Sekunden | Nur bei Varianten mit aktiver Aufblas-Phase: setzt die Aufblas-Zeit; die Firmware begrenzt sie auf die Vakuumierzeit |
+| `<base>/config/inflate_s/state` | vom Geraet | Ganzzahl in Sekunden | Nur bei Varianten mit aktiver Aufblas-Phase: aktuell gespeicherte Aufblas-Zeit |
 | `<base>/ota/update/install` | zu Geraet | `install` | Startet ein OTA-Update, wenn bereits ein Update gefunden wurde |
 | `<base>/ota/update/state` | vom Geraet | JSON | Retainter OTA-Zustand fuer Home Assistant (`installed_version`, `latest_version`, `in_progress`, `update_percentage`) |
 | `<base>/availability` | vom Geraet | `online`, `offline` | MQTT-Verfuegbarkeit des Moduls |
@@ -517,7 +512,7 @@ Top-Level-Felder:
 - `WiFi`: WLAN-Statusblock
 - `Show`: Show-Statusblock
 - `Pumpen`: Pumpen-Statusblock
-- `Lichtfarbe`: Farb- und Preview-Statusblock
+- `Lichtfarbe`: Farb- und Preview-Statusblock, nur bei Varianten mit LEDs
 - `LED`: interner LED-Ausgabestatus
 - `OTA`: OTA-Statusblock
 
@@ -579,7 +574,7 @@ Diese Topics werden von der Firmware aktiv veroeffentlicht und muessen nicht man
 | Topic | Komponente | Zweck |
 | --- | --- | --- |
 | `homeassistant/switch/<deviceId>/show/config` | `switch` | Show starten und stoppen |
-| `homeassistant/light/<deviceId>/light/config` | `light` | Entitaet `Beleuchtung` fuer Freigabe und RGB-Farbe; Weiss bleibt separat |
+| `homeassistant/light/<deviceId>/light/config` | `light` | Nur bei Varianten mit LEDs: Entitaet `Beleuchtung` fuer Freigabe und RGB-Farbe |
 | `homeassistant/update/<deviceId>/firmware/config` | `update` | Firmware-Update in HA |
 | `homeassistant/binary_sensor/<deviceId>/show_aktiv/config` | `binary_sensor` | Diagnosesensor fuer Show aktiv, standardmaessig deaktiviert |
 | `homeassistant/sensor/<deviceId>/show_phase/config` | `sensor` | Diagnosesensor fuer Show-Phase, standardmaessig deaktiviert |
@@ -591,6 +586,7 @@ Diese Topics werden von der Firmware aktiv veroeffentlicht und muessen nicht man
 | `homeassistant/sensor/<deviceId>/nachlaufzeit/config` | `sensor` | Diagnosesensor fuer Nachlaufzeit, standardmaessig deaktiviert |
 | `homeassistant/number/<deviceId>/show_laenge_setzen/config` | `number` | Eingabe fuer die Show-Laenge in Sekunden |
 | `homeassistant/number/<deviceId>/nachlaufzeit_setzen/config` | `number` | Eingabe fuer die Nachlaufzeit in Sekunden |
+| `homeassistant/number/<deviceId>/aufblaszeit_setzen/config` | `number` | Nur bei Varianten mit aktiver Aufblas-Phase: Eingabe fuer die Aufblas-Zeit in Sekunden |
 | `homeassistant/sensor/<deviceId>/firmware_version/config` | `sensor` | Diagnosesensor fuer installierte Firmware-Version, standardmaessig deaktiviert |
 | `homeassistant/sensor/<deviceId>/firmware_verfuegbar/config` | `sensor` | Diagnosesensor fuer im Manifest gefundene Version, standardmaessig deaktiviert |
 | `homeassistant/binary_sensor/<deviceId>/update_verfuegbar/config` | `binary_sensor` | Zeigt an, ob ein Update verfuegbar ist |

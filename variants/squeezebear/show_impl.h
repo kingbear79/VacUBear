@@ -2,10 +2,6 @@
 
 #include "show_variant.h"
 
-// Platzhalter fuer den kuenftigen Ableger:
-// - identische Ablaufsteuerung wie VacUBear
-// - keine LED-Ausgabe im zugehoerigen Build-Environment
-// - Timings/Namen/weitere Pumpen koennen spaeter hier abweichen
 namespace ShowVariantImpl
 {
 inline void requestShowStart(ShowStatus &status)
@@ -19,18 +15,20 @@ inline void requestShowStart(ShowStatus &status)
 
 inline bool requestShowStop(ShowStatus &status, unsigned long now, bool lightingActive, uint32_t fadeOutMs, unsigned long &lightOnUntilAt)
 {
+  (void)lightingActive;
+  (void)fadeOutMs;
+  (void)lightOnUntilAt;
   if (!status.isRunning)
   {
     return false;
   }
 
   unsigned long stopAt = now + 10UL;
-  unsigned long effectiveFadeOutMs = lightingActive ? fadeOutMs : 0UL;
   status.fadeInDoneAt = stopAt;
-  status.endAt = stopAt;
+  status.vacuumEndAt = stopAt;
+  status.holdEndAt = stopAt;
   status.openValveAt = stopAt;
-  status.finishAt = stopAt + effectiveFadeOutMs;
-  lightOnUntilAt = status.openValveAt;
+  status.finishAt = stopAt;
   return true;
 }
 
@@ -43,46 +41,47 @@ inline void tickShow(ShowStatus &status,
                      unsigned long &lightOnUntilAt,
                      ShowOutputs &outputs)
 {
+  (void)lightingActive;
+  (void)fadeInMs;
+  (void)fadeOutMs;
+  (void)lightLevelMax;
+  (void)lightOnUntilAt;
   outputs = ShowOutputs();
 
   if (status.shouldStart)
   {
-    unsigned long effectiveFadeInMs = lightingActive ? fadeInMs : 0UL;
-    unsigned long effectiveFadeOutMs = lightingActive ? fadeOutMs : 0UL;
-    status.fadeInDoneAt = now + effectiveFadeInMs;
-    status.endAt = status.fadeInDoneAt + status.showDuration;
-    status.openValveAt = status.endAt + status.showNachlauf;
-    status.finishAt = status.openValveAt + effectiveFadeOutMs;
+    status.fadeInDoneAt = now;
+    status.vacuumEndAt = status.fadeInDoneAt + status.showDuration;
+    status.holdEndAt = status.vacuumEndAt + status.showNachlauf;
+    status.openValveAt = status.holdEndAt + status.showInflate;
+    status.finishAt = status.openValveAt;
     status.shouldStart = false;
     status.isRunning = true;
-    lightOnUntilAt = status.openValveAt;
-    outputs.applyLightTarget = true;
-    outputs.lightTargetLevel = lightLevelMax;
   }
 
   if (status.isRunning)
   {
-    if (now < status.fadeInDoneAt)
+    if (now < status.vacuumEndAt)
     {
-      outputs.pumpEnabled = false;
-      outputs.valveOpen = false;
+      outputs.pumpMode = PUMP_MODE_PRIMARY;
+      outputs.valveOpen = true;
       return;
     }
-    if (now < status.endAt)
+    if (now < status.holdEndAt)
     {
-      outputs.pumpEnabled = true;
+      outputs.pumpMode = PUMP_MODE_OFF;
       outputs.valveOpen = true;
       return;
     }
     if (now < status.openValveAt)
     {
-      outputs.pumpEnabled = false;
+      outputs.pumpMode = PUMP_MODE_SECONDARY;
       outputs.valveOpen = true;
       return;
     }
     if (now < status.finishAt)
     {
-      outputs.pumpEnabled = false;
+      outputs.pumpMode = PUMP_MODE_OFF;
       outputs.valveOpen = false;
       return;
     }
@@ -90,7 +89,7 @@ inline void tickShow(ShowStatus &status,
     status.isRunning = false;
   }
 
-  outputs.pumpEnabled = false;
+  outputs.pumpMode = PUMP_MODE_OFF;
   outputs.valveOpen = false;
 }
 
@@ -98,24 +97,24 @@ inline const char *getShowPhase(const ShowStatus &status, unsigned long now)
 {
   if (status.isRunning)
   {
-    if (now < status.fadeInDoneAt)
-    {
-      return "FadeIn";
-    }
-    if (now < status.endAt)
+    if (now < status.vacuumEndAt)
     {
       return "Vakuumieren";
     }
-    if (now < status.openValveAt)
+    if (now < status.holdEndAt)
     {
       return "Haltezeit";
     }
-    return "FadeOut";
+    if (now < status.openValveAt)
+    {
+      return "Aufblasen";
+    }
+    return "Belueften";
   }
 
   if (status.finishAt > 0 && (now - status.finishAt) < 2000UL)
   {
-    return "FadeOut";
+    return "Belueften";
   }
 
   return "Pause";
@@ -126,7 +125,8 @@ inline void resetShowState(ShowStatus &status)
   status.shouldStart = false;
   status.isRunning = false;
   status.fadeInDoneAt = 0;
-  status.endAt = 0;
+  status.vacuumEndAt = 0;
+  status.holdEndAt = 0;
   status.openValveAt = 0;
   status.finishAt = 0;
 }

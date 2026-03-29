@@ -2,39 +2,52 @@
 
 #include <Arduino.h>
 
+#include <stdint.h>
+
+enum PumpMode : uint8_t
+{
+  PUMP_MODE_OFF = 0,
+  PUMP_MODE_PRIMARY = 1,
+  PUMP_MODE_SECONDARY = 2,
+};
+
 struct ShowStatus
 {
   bool isRunning;
   unsigned long fadeInDoneAt;
-  unsigned long endAt;
+  unsigned long vacuumEndAt;
+  unsigned long holdEndAt;
   unsigned long openValveAt;
   unsigned long finishAt;
   bool shouldStart;
   unsigned long showDuration;
   unsigned long showNachlauf;
+  unsigned long showInflate;
 
-  ShowStatus(unsigned long defaultDuration = 0, unsigned long defaultNachlauf = 0)
+  ShowStatus(unsigned long defaultDuration = 0, unsigned long defaultNachlauf = 0, unsigned long defaultInflate = 0)
       : isRunning(false),
         fadeInDoneAt(0),
-        endAt(0),
+        vacuumEndAt(0),
+        holdEndAt(0),
         openValveAt(0),
         finishAt(0),
         shouldStart(false),
         showDuration(defaultDuration),
-        showNachlauf(defaultNachlauf)
+        showNachlauf(defaultNachlauf),
+        showInflate(defaultInflate)
   {
   }
 };
 
 struct ShowOutputs
 {
-  bool pumpEnabled;
+  PumpMode pumpMode;
   bool valveOpen;
   bool applyLightTarget;
   uint16_t lightTargetLevel;
 
   ShowOutputs()
-      : pumpEnabled(false),
+      : pumpMode(PUMP_MODE_OFF),
         valveOpen(false),
         applyLightTarget(false),
         lightTargetLevel(0)
