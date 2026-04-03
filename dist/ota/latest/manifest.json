@@ -1,5 +1,5 @@
 {
-  "version": "0.1.5-passionate_gimp",
-  "firmware_url": "http://ota.kinkbear.de/squeezebear/firmware.bin",
-  "notes": "Aenderungen seit Version 0.1.5-passionate_gimp:\n- Adjust SqueezeBear valve and inflation timing\n- Keep valve polarity shared across variants\n- Fix shared valve polarity\n- Add SqueezeBear boot inflation safeguard\n- Joggle SqueezeBear valve before inflation\n- Strengthen SqueezeBear valve release phase\n- Restore shared valve polarity high-open\n- Restore low-open valve semantics\n- Delay SqueezeBear inflation after valve open\n- Increase SqueezeBear valve-open delay\n- Allow unrestricted SqueezeBear inflate time"
+  "version": "0.0.0-legacy-migrator",
+  "firmware_url": "https://raw.githubusercontent.com/kingbear79/VacUBear/master/dist/ota/latest/firmware.bin",
+  "notes": "VacUBear Legacy-Migrator\n\nDiese Zwischen-Firmware ist nur fuer alte VacUBear-Geraete gedacht, die noch den frueheren GitHub-OTA-Pfad verwenden und nicht direkt auf den aktuellen Stand wechseln koennen.\n\nFunktion:\n- nutzt die vorhandene WLAN-Konfiguration des Geraets\n- verbindet sich mit dem WLAN\n- prueft anschliessend http://ota.kinkbear.de/vacubear/manifest.json\n- installiert die dort hinterlegte aktuelle VacUBear-Firmware\n- startet danach automatisch neu\n\nDiese Firmware enthaelt absichtlich keine normale Produktfunktionalitaet."
 }

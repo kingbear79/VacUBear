@@ -16,10 +16,11 @@ if ! command -v pio >/dev/null 2>&1; then
   exit 1
 fi
 
-extract_fw_version_from_content() {
-  local content line
+extract_define_value_from_content() {
+  local content macro_name line
   content="${1}"
-  line="$(printf '%s\n' "${content}" | grep -E '^[[:space:]]*-DFW_VERSION=' | head -n1 || true)"
+  macro_name="${2}"
+  line="$(printf '%s\n' "${content}" | grep -E "^[[:space:]]*-D${macro_name}=" | head -n1 || true)"
   if [[ -z "${line}" ]]; then
     return 1
   fi
@@ -31,15 +32,6 @@ extract_fw_version_from_content() {
     return 1
   fi
   printf '%s' "${line}"
-}
-
-extract_fw_version() {
-  local content
-  content="$(cat "${PLATFORMIO_INI}")"
-  if ! extract_fw_version_from_content "${content}"; then
-    echo "Fehler: FW_VERSION konnte in platformio.ini nicht gefunden werden."
-    exit 1
-  fi
 }
 
 extract_default_env() {
@@ -54,27 +46,18 @@ extract_default_env() {
   printf '%s' "${env_name}"
 }
 
-extract_repo_slug() {
-  local remote slug
-  remote="$(git -C "${PROJECT_DIR}" remote get-url origin 2>/dev/null || true)"
-  if [[ "${remote}" =~ github\.com[:/]([^/]+/[^/.]+)(\.git)?$ ]]; then
-    slug="${BASH_REMATCH[1]}"
-    printf '%s' "${slug}"
-    return 0
-  fi
-  return 1
-}
+extract_build_flag_value() {
+  local macro_name value line
+  macro_name="${1}"
 
-extract_ota_manifest_url() {
-  local value line
-
-  if value="$(python3 - "${PROJECT_DIR}" "${PIO_ENV}" <<'PY'
+  if value="$(python3 - "${PROJECT_DIR}" "${PIO_ENV}" "${macro_name}" <<'PY'
 import json
 import subprocess
 import sys
 
 project_dir = sys.argv[1]
 env_name = sys.argv[2]
+macro_name = sys.argv[3]
 
 try:
     output = subprocess.check_output(
@@ -86,6 +69,7 @@ except Exception:
     sys.exit(1)
 
 target_section = f"env:{env_name}"
+needle = f"-D{macro_name}="
 for section_name, entries in config:
     if section_name != target_section:
         continue
@@ -96,7 +80,7 @@ for section_name, entries in config:
         for flag in flags:
             if not isinstance(flag, str):
                 continue
-            if flag.startswith("-DOTA_MANIFEST_URL="):
+            if flag.startswith(needle):
                 resolved = flag.split("=", 1)[1].replace('\\"', '"').strip('"')
                 print(resolved)
                 sys.exit(0)
@@ -111,7 +95,7 @@ PY
     fi
   fi
 
-  line="$(grep -E '^[[:space:]]*-DOTA_MANIFEST_URL=' "${PLATFORMIO_INI}" | head -n1 || true)"
+  line="$(grep -E "^[[:space:]]*-D${macro_name}=" "${PLATFORMIO_INI}" | head -n1 || true)"
   if [[ -z "${line}" ]]; then
     return 1
   fi
@@ -125,13 +109,35 @@ PY
   printf '%s' "${line}"
 }
 
+extract_fw_version() {
+  if ! extract_build_flag_value "FW_VERSION"; then
+    echo "Fehler: FW_VERSION konnte in platformio.ini nicht gefunden werden."
+    exit 1
+  fi
+}
+
+extract_repo_slug() {
+  local remote slug
+  remote="$(git -C "${PROJECT_DIR}" remote get-url origin 2>/dev/null || true)"
+  if [[ "${remote}" =~ github\.com[:/]([^/]+/[^/.]+)(\.git)?$ ]]; then
+    slug="${BASH_REMATCH[1]}"
+    printf '%s' "${slug}"
+    return 0
+  fi
+  return 1
+}
+
+extract_ota_manifest_url() {
+  extract_build_flag_value "OTA_MANIFEST_URL"
+}
+
 extract_fw_version_at_ref() {
   local ref content
   content="$(git -C "${PROJECT_DIR}" show "${ref}:${PLATFORMIO_INI_REL}" 2>/dev/null || true)"
   if [[ -z "${content}" ]]; then
     return 1
   fi
-  extract_fw_version_from_content "${content}"
+  extract_define_value_from_content "${content}" "FW_VERSION"
 }
 
 find_release_notes_file() {
