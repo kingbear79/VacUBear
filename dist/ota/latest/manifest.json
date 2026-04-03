@@ -1,5 +1,5 @@
 {
   "version": "0.0.9-legacy-migrator",
   "firmware_url": "https://raw.githubusercontent.com/kingbear79/VacUBear/master/dist/ota/latest/firmware.bin",
-  "notes": "Aenderungen seit Version 0.1.5-passionate_gimp:\n- Adjust SqueezeBear valve and inflation timing\n- Keep valve polarity shared across variants\n- Fix shared valve polarity\n- Add SqueezeBear boot inflation safeguard\n- Joggle SqueezeBear valve before inflation\n- Strengthen SqueezeBear valve release phase\n- Restore shared valve polarity high-open\n- Restore low-open valve semantics\n- Delay SqueezeBear inflation after valve open\n- Increase SqueezeBear valve-open delay\n- Allow unrestricted SqueezeBear inflate time\n- general Update\n- Add VacUBear legacy OTA migrator\n- Updated Versioning fpr legacy migrator"
+  "notes": "Migrations-Firmware: behebt Probleme beim OTA-Firmware-Upload"
 }
